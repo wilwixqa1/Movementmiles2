@@ -532,9 +532,10 @@
   }
 
   // ══════════════════════════════════════════════════════════
-  // NELLY \u2014 now calls Railway backend (API key safe on server)
+  // NELLY v2.0 \u2014 Railway backend + conversation history
   // ══════════════════════════════════════════════════════════
   const NELLY_API = 'https://movementmiles-backend-production.up.railway.app/api/chat';
+  const nellyHistory = [];
 
   async function sendMsg() {
     const input = document.getElementById('nelly-input');
@@ -550,6 +551,8 @@
     input.value = '';
     msgs.scrollTop = msgs.scrollHeight;
 
+    nellyHistory.push({ role: 'user', content: text });
+
     typing.classList.add('show');
     msgs.scrollTop = msgs.scrollHeight;
 
@@ -557,16 +560,19 @@
       const res = await fetch(NELLY_API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
+        body: JSON.stringify({ message: text, history: nellyHistory.slice(0, -1) })
       });
       typing.classList.remove('show');
 
       if (!res.ok) throw new Error('Server error: ' + res.status);
 
       const data = await res.json();
+      const reply = data.reply || "Sorry, couldn't connect right now. Try again!";
+      nellyHistory.push({ role: 'assistant', content: reply });
+
       const b = document.createElement('div');
       b.className = 'nmsg bot';
-      b.textContent = data.reply || "Sorry, couldn't connect right now. Try again!";
+      b.textContent = reply;
       msgs.appendChild(b);
       msgs.scrollTop = msgs.scrollHeight;
     } catch(err) {
