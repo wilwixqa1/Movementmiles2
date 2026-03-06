@@ -206,6 +206,11 @@
 
   .fade-in { opacity:0; transform:translateY(20px); transition:opacity .55s ease,transform .55s ease; }
   .fade-in.visible { opacity:1; transform:translateY(0); }
+
+  /* Quick-reply buttons */
+  .nelly-buttons { display:flex; flex-wrap:wrap; gap:6px; align-self:flex-start; max-width:90%; margin-top:2px; }
+  .nelly-qr { background:var(--white); border:1.5px solid var(--navy); color:var(--navy); padding:7px 14px; border-radius:18px; font-family:"Urbanist",sans-serif; font-size:.78rem; font-weight:600; cursor:pointer; transition:all .2s; line-height:1.3; }
+  .nelly-qr:hover { background:var(--navy); color:var(--white); transform:translateY(-1px); }
 </style>
 </head>
 <body>
@@ -535,45 +540,69 @@
   var NELLY_API = 'https://movementmiles-backend-production.up.railway.app/api/chat';
   var nellyHistory = [];
 
-  async function sendMsg() {
-    var input = document.getElementById('nelly-input');
+  function parseButtons(text) {
+    var match = text.match(/\[([^\]]+)\]\s*$/);
+    if (!match) return { text: text, buttons: [] };
+    var cleanText = text.replace(/\[([^\]]+)\]\s*$/, '').trim();
+    var buttons = match[1].split('|').map(function(b) { return b.trim(); });
+    return { text: cleanText, buttons: buttons };
+  }
+
+  function addBotMessage(text) {
+    var msgs = document.getElementById('nelly-msgs');
+    var parsed = parseButtons(text);
+
+    var b = document.createElement('div');
+    b.className = 'nmsg bot';
+    b.textContent = parsed.text;
+    msgs.appendChild(b);
+
+    if (parsed.buttons.length > 0) {
+      var btnRow = document.createElement('div');
+      btnRow.className = 'nelly-buttons';
+      parsed.buttons.forEach(function(label) {
+        var btn = document.createElement('button');
+        btn.className = 'nelly-qr';
+        btn.textContent = label;
+        btn.onclick = function() {
+          btnRow.remove();
+          sendMsgText(label);
+        };
+        btnRow.appendChild(btn);
+      });
+      msgs.appendChild(btnRow);
+    }
+
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function sendMsgText(text) {
     var msgs = document.getElementById('nelly-msgs');
     var typing = document.getElementById('nelly-typing');
-    var text = input.value.trim();
-    if (!text) return;
 
     var u = document.createElement('div');
     u.className = 'nmsg user';
     u.textContent = text;
     msgs.appendChild(u);
-    input.value = '';
     msgs.scrollTop = msgs.scrollHeight;
 
     nellyHistory.push({ role: 'user', content: text });
-
     typing.classList.add('show');
     msgs.scrollTop = msgs.scrollHeight;
 
-    try {
-      var res = await fetch(NELLY_API, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, history: nellyHistory.slice(0, -1) })
-      });
+    fetch(NELLY_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: nellyHistory.slice(0, -1) })
+    }).then(function(res) {
       typing.classList.remove('show');
-
       if (!res.ok) throw new Error('Server error: ' + res.status);
-
-      var data = await res.json();
+      return res.json();
+    }).then(function(data) {
       var reply = data.reply || "Sorry, couldn't connect right now. Try again!";
       nellyHistory.push({ role: 'assistant', content: reply });
-
-      var b = document.createElement('div');
-      b.className = 'nmsg bot';
-      b.textContent = reply;
-      msgs.appendChild(b);
-      msgs.scrollTop = msgs.scrollHeight;
-    } catch(err) {
+      addBotMessage(reply);
+    }).catch(function(err) {
       typing.classList.remove('show');
       var b = document.createElement('div');
       b.className = 'nmsg bot';
@@ -581,7 +610,15 @@
       msgs.appendChild(b);
       msgs.scrollTop = msgs.scrollHeight;
       console.error('Nelly error:', err);
-    }
+    });
+  }
+
+  function sendMsg() {
+    var input = document.getElementById('nelly-input');
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sendMsgText(text);
   }
 
   function initFadeIns() {
