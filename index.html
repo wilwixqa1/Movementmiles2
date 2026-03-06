@@ -211,6 +211,8 @@
   .nelly-buttons { display:flex; flex-wrap:wrap; gap:6px; align-self:flex-start; max-width:90%; margin-top:2px; }
   .nelly-qr { background:var(--white); border:1.5px solid var(--navy); color:var(--navy); padding:7px 14px; border-radius:18px; font-family:"Urbanist",sans-serif; font-size:.78rem; font-weight:600; cursor:pointer; transition:all .2s; line-height:1.3; }
   .nelly-qr:hover { background:var(--navy); color:var(--white); transform:translateY(-1px); }
+  .nelly-link { color:var(--navy-mid); font-weight:600; text-decoration:underline; text-underline-offset:2px; cursor:pointer; transition:color .2s; }
+  .nelly-link:hover { color:var(--navy); }
 </style>
 </head>
 <body>
@@ -540,11 +542,46 @@
   var NELLY_API = 'https://movementmiles-backend-production.up.railway.app/api/chat';
   var nellyHistory = [];
 
+  var pageMap = {
+    'training programs': 'training',
+    'training': 'training',
+    'race plans': 'race',
+    'race': 'race',
+    'store': 'store',
+    'home': 'home'
+  };
+
+  function renderBotText(text, container) {
+    var parts = text.split(/\[\[page:([^\]]+)\]\]/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) container.appendChild(document.createTextNode(parts[i]));
+      } else {
+        var pageName = parts[i];
+        var pageKey = pageMap[pageName.toLowerCase()] || 'home';
+        var a = document.createElement('a');
+        a.textContent = pageName;
+        a.href = '#';
+        a.className = 'nelly-link';
+        a.setAttribute('data-page', pageKey);
+        a.onclick = function(e) {
+          e.preventDefault();
+          var pg = this.getAttribute('data-page');
+          toggleNelly();
+          showPage(pg);
+        };
+        container.appendChild(a);
+      }
+    }
+  }
+
   function parseButtons(text) {
     var match = text.match(/\[([^\]]+)\]\s*$/);
     if (!match) return { text: text, buttons: [] };
     var cleanText = text.replace(/\[([^\]]+)\]\s*$/, '').trim();
-    var buttons = match[1].split('|').map(function(b) { return b.trim(); });
+    var inner = match[1];
+    if (inner.indexOf('|') === -1) return { text: text, buttons: [] };
+    var buttons = inner.split('|').map(function(b) { return b.trim(); });
     return { text: cleanText, buttons: buttons };
   }
 
@@ -554,7 +591,7 @@
 
     var b = document.createElement('div');
     b.className = 'nmsg bot';
-    b.textContent = parsed.text;
+    renderBotText(parsed.text, b);
     msgs.appendChild(b);
 
     if (parsed.buttons.length > 0) {
