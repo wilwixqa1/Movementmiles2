@@ -85,6 +85,8 @@
   .date-bar button:hover{background:#2a3a5c}
   .date-bar .quick-btn{background:var(--white);color:var(--navy);border:1px solid var(--border);padding:6px 14px;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer}
   .date-bar .quick-btn:hover{border-color:var(--navy-mid);background:var(--bg)}
+  .date-bar .quick-btn.active{background:var(--navy);color:var(--white);border-color:var(--navy)}
+  .date-range-label{font-size:.78rem;color:var(--navy-mid);font-weight:500;margin-left:8px}
 
   .divider{border:none;border-top:1px solid var(--border);margin:32px 0 20px}
 
@@ -128,10 +130,11 @@
       <span style="color:var(--navy-mid);font-size:.84rem">to</span>
       <input type="date" id="date-to" />
       <button onclick="applyDateFilter()">Apply</button>
-      <button class="quick-btn" onclick="setQuickRange(7)">7d</button>
-      <button class="quick-btn" onclick="setQuickRange(30)">30d</button>
-      <button class="quick-btn" onclick="setQuickRange(90)">90d</button>
-      <button class="quick-btn" onclick="clearDateFilter()">All Time</button>
+      <button class="quick-btn" id="qb-7" onclick="setQuickRange(7)">7d</button>
+      <button class="quick-btn" id="qb-30" onclick="setQuickRange(30)">30d</button>
+      <button class="quick-btn" id="qb-90" onclick="setQuickRange(90)">90d</button>
+      <button class="quick-btn active" id="qb-all" onclick="clearDateFilter()">All Time</button>
+      <span class="date-range-label" id="range-label">Showing: All Time</span>
     </div>
 
     <!-- Revenue Section -->
@@ -334,9 +337,25 @@ function doLogin() {
 var activeFrom = '';
 var activeTo = '';
 
+function highlightBtn(activeId, labelText) {
+  var btns = document.querySelectorAll('.date-bar .quick-btn');
+  btns.forEach(function(b) { b.classList.remove('active'); });
+  if (activeId) {
+    var el = document.getElementById(activeId);
+    if (el) el.classList.add('active');
+  }
+  var lbl = document.getElementById('range-label');
+  if (lbl) lbl.textContent = 'Showing: ' + (labelText || 'All Time');
+}
+
 function applyDateFilter() {
   activeFrom = document.getElementById('date-from').value;
   activeTo = document.getElementById('date-to').value;
+  var label = 'Custom';
+  if (activeFrom && activeTo) label = activeFrom + ' to ' + activeTo;
+  else if (activeFrom) label = 'From ' + activeFrom;
+  else if (activeTo) label = 'Until ' + activeTo;
+  highlightBtn(null, label);
   loadStats();
 }
 
@@ -346,7 +365,10 @@ function setQuickRange(days) {
   from.setDate(from.getDate() - days);
   document.getElementById('date-from').value = from.toISOString().slice(0, 10);
   document.getElementById('date-to').value = to.toISOString().slice(0, 10);
-  applyDateFilter();
+  activeFrom = document.getElementById('date-from').value;
+  activeTo = document.getElementById('date-to').value;
+  highlightBtn('qb-' + days, 'Last ' + days + ' days');
+  loadStats();
 }
 
 function clearDateFilter() {
@@ -354,6 +376,7 @@ function clearDateFilter() {
   document.getElementById('date-to').value = '';
   activeFrom = '';
   activeTo = '';
+  highlightBtn('qb-all', 'All Time');
   loadStats();
 }
 
