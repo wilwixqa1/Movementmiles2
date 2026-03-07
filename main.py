@@ -838,21 +838,30 @@ async def backfill_stripe(request: Request):
         for sub in subs_iter.auto_paging_iter():
             try:
                 sub_id = sub.id
-                customer_id = sub.customer.id if hasattr(sub.customer, "id") else str(sub.customer)
+                cust_obj = sub.get("customer") if isinstance(sub, dict) else sub.customer
+                customer_id = cust_obj.get("id", str(cust_obj)) if isinstance(cust_obj, dict) else (cust_obj.id if hasattr(cust_obj, "id") else str(cust_obj))
                 status = sub.status
 
                 plan_amount = 0
                 plan_interval = ""
-                if sub.items and sub.items.data:
-                    price = sub.items.data[0].price
-                    plan_amount = price.unit_amount or 0
-                    if price.recurring:
-                        plan_interval = price.recurring.interval or ""
+                try:
+                    items_data = sub["items"]["data"]
+                    if items_data:
+                        price = items_data[0]["price"]
+                        plan_amount = price.get("unit_amount", 0) or 0
+                        recurring = price.get("recurring")
+                        if recurring:
+                            plan_interval = recurring.get("interval", "") or ""
+                except Exception:
+                    pass
 
                 email = ""
                 try:
-                    if hasattr(sub.customer, "email"):
-                        email = sub.customer.email or ""
+                    cust = sub.get("customer")
+                    if isinstance(cust, dict):
+                        email = cust.get("email", "") or ""
+                    elif hasattr(cust, "email"):
+                        email = cust.email or ""
                 except Exception:
                     pass
 
