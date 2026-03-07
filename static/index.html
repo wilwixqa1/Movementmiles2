@@ -215,12 +215,48 @@
   .detail-cta-box h3 { color:var(--white); font-weight:400; font-size:1.2rem; margin-bottom:6px; }
   .detail-cta-box p { color:rgba(247,247,247,.65); font-size:.88rem; margin-bottom:18px; }
 
+  /* ── GET STARTED / ONBOARDING PAGE ── */
+  .gs-wrapper { min-height:calc(100vh - 70px); display:flex; flex-direction:column; align-items:center; justify-content:center; background:linear-gradient(170deg, var(--navy) 0%, #2a3a5c 50%, var(--navy-mid) 100%); padding:40px 20px; }
+  .gs-back { position:absolute; top:90px; left:32px; color:rgba(255,255,255,.6); font-size:.88rem; font-weight:500; cursor:pointer; text-decoration:none; transition:color .2s; z-index:10; }
+  .gs-back:hover { color:var(--white); }
+  .gs-chat-container { width:100%; max-width:520px; background:var(--white); border-radius:20px; overflow:hidden; box-shadow:0 24px 80px rgba(0,0,0,.25); display:flex; flex-direction:column; max-height:calc(100vh - 150px); }
+  .gs-header { background:var(--navy); padding:24px 28px; display:flex; align-items:center; gap:16px; }
+  .gs-avatar { width:52px; height:52px; border-radius:50%; background:var(--btn); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:1.3rem; color:var(--white); flex-shrink:0; }
+  .gs-header-info { flex:1; }
+  .gs-header-name { font-weight:600; font-size:1.05rem; color:var(--white); }
+  .gs-header-sub { font-size:.78rem; color:rgba(247,247,247,.55); margin-top:2px; }
+  .gs-msgs { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; background:var(--bg); min-height:300px; }
+  .gs-msgs .nmsg { max-width:88%; font-size:.88rem; }
+  .gs-msgs .nmsg.bot { background:var(--white); border:1px solid var(--border); color:var(--text); align-self:flex-start; border-radius:4px 14px 14px 14px; padding:12px 16px; }
+  .gs-msgs .nmsg.user { background:var(--navy); color:var(--white); align-self:flex-end; border-radius:14px 4px 14px 14px; padding:12px 16px; }
+  .gs-typing { display:none; align-self:flex-start; background:var(--white); border:1px solid var(--border); border-radius:4px 14px 14px 14px; padding:12px 18px; gap:5px; align-items:center; }
+  .gs-typing.show { display:flex; }
+  .gs-input-row { display:flex; gap:10px; padding:14px 18px; border-top:1px solid var(--border); background:var(--white); }
+  .gs-input { flex:1; border:1px solid var(--border); border-radius:10px; padding:12px 16px; font-family:'Urbanist',sans-serif; font-size:.88rem; color:var(--text); outline:none; background:var(--bg); transition:border-color .2s; }
+  .gs-input:focus { border-color:var(--navy-mid); }
+  .gs-input::placeholder { color:var(--muted); }
+  .gs-send { background:var(--navy); color:var(--white); border:none; border-radius:10px; padding:12px 18px; font-size:.9rem; cursor:pointer; transition:background .2s; font-weight:600; }
+  .gs-send:hover { background:var(--btn-hover); }
+  .gs-powered { text-align:center; font-size:.68rem; color:var(--muted); padding:8px; background:var(--white); letter-spacing:.04em; }
+  .gs-buttons { display:flex; flex-wrap:wrap; gap:8px; align-self:flex-start; max-width:92%; margin-top:4px; }
+  .gs-qr { background:var(--white); border:1.5px solid var(--navy); color:var(--navy); padding:9px 16px; border-radius:20px; font-family:"Urbanist",sans-serif; font-size:.82rem; font-weight:600; cursor:pointer; transition:all .2s; line-height:1.3; }
+  .gs-qr:hover { background:var(--navy); color:var(--white); transform:translateY(-1px); }
+  /* Thank you state */
+  .gs-thank-you { text-align:center; padding:60px 40px; }
+  .gs-thank-you h2 { font-size:1.6rem; font-weight:500; color:var(--navy); margin-bottom:12px; letter-spacing:-.02em; }
+  .gs-thank-you p { font-size:.92rem; color:var(--muted); line-height:1.7; margin-bottom:24px; }
+  .gs-thank-you .btn-primary { font-size:1rem; padding:16px 48px; }
+
   @media(max-width:768px) {
     .about-hero, .detail-hero { grid-template-columns:1fr; gap:30px; padding:40px 24px; }
     .detail-back { padding:16px 24px 0; }
     .site-nav { padding:0 16px; }
     .nav-links { display:none; }
     .race-grid { grid-template-columns:1fr; padding:30px 24px; }
+    .gs-wrapper { padding:20px 12px; }
+    .gs-chat-container { max-height:calc(100vh - 110px); border-radius:16px; }
+    .gs-header { padding:18px 20px; }
+    .gs-back { top:80px; left:16px; }
   }
 </style>
 </head>
@@ -239,17 +275,18 @@
   </ul>
   <div class="nav-right">
     <span class="nav-cart">🛒 0</span>
-    <button class="nav-get-started">Get Started</button>
+    <button class="nav-get-started" onclick="showPage('get-started')">Get Started</button>
   </div>
 </nav>
 
+<!-- ════════════════════ HOME ════════════════════ -->
 <div id="page-home" class="page active">
   <section class="hero">
     <div class="hero-bg"></div>
     <div class="hero-overlay"></div>
     <div class="hero-content">
       <h1 class="hero-title">Move. Run. Live.</h1>
-      <button class="btn-primary" style="padding:16px 52px">Start Your Free Trial</button>
+      <button class="btn-primary" style="padding:16px 52px" onclick="showPage('get-started')">Start Your Free Trial</button>
     </div>
     <div class="hero-phones">
       <img src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/c72e8684-9bad-454f-a4fd-4c4e3dc9f01f/Group_images.png" alt="App Screenshots" />
@@ -286,7 +323,7 @@
           <div class="how-step"><span class="how-step-num">2)</span><span>Choose Your Training Plan, Workout for the Day, or even get Nutrition inspo</span></div>
           <div class="how-step"><span class="how-step-num">3)</span><span>Train Anywhere, Anytime<br><small style="opacity:.55">(On demand, downloadable workouts.)</small></span></div>
         </div>
-        <a class="how-cta">Get Started!</a>
+        <a class="how-cta" onclick="showPage('get-started')">Get Started!</a>
       </div>
       <div style="display:flex;justify-content:center">
         <img class="how-app-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/6548950d-9d8b-4be9-bbf6-6ac7c487a367/pexels-goumbik-669584.jpg" alt="Runner" />
@@ -340,6 +377,7 @@
   </footer>
 </div>
 
+<!-- ════════════════════ ABOUT MEG ════════════════════ -->
 <div id="page-about" class="page">
   <div class="about-hero">
     <img class="about-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/9f593b9b-c3ca-4504-88ef-0673a444f243/Screenshot+2025-09-16+at+2.07.49+PM.png" alt="Meg" />
@@ -374,6 +412,7 @@
   </footer>
 </div>
 
+<!-- ════════════════════ TRAINING ════════════════════ -->
 <div id="page-training" class="page">
   <div class="page-hero">
     <h1>Monthly Training<br>Programs:</h1>
@@ -394,7 +433,7 @@
       <div class="program-card"><div class="program-card-img-placeholder">🏆</div><div class="program-card-body"><div class="program-card-title">Peak Endurance & Power</div><div class="program-card-meta"><span><span class="tag tag-advanced">Advanced</span></span><span>⏱ 6 weeks</span><span>5 runs, 2 strength, 1–2 mobility workouts/week</span></div><button class="btn-outline" onclick="showDetail('advanced-treadmill-outdoor-running')">Learn More</button></div></div>
     </div>
   </div>
-  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary">Get Started</button></div>
+  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary" onclick="showPage('get-started')">Get Started</button></div>
   <div class="program-section">
     <h2 class="program-section-title">Strength Training Programs:</h2>
     <div class="program-grid">
@@ -417,7 +456,7 @@
       <div class="program-card"><div class="program-card-img-placeholder">✨</div><div class="program-card-body"><div class="program-card-title">The Ultimate Mobility Plan</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>⏱ 4 weeks</span><span>3 mobility + flexibility/week</span></div><button class="btn-outline" onclick="showDetail('the-ultimate-mobility-plan')">Learn More</button></div></div>
     </div>
   </div>
-  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary">Get Started</button></div>
+  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary" onclick="showPage('get-started')">Get Started</button></div>
   <footer>
     <div class="footer-copy">&copy;2026 Movement & Miles. All rights reserved.</div>
     <ul class="footer-links">
@@ -428,6 +467,7 @@
   </footer>
 </div>
 
+<!-- ════════════════════ RACE PLANS ════════════════════ -->
 <div id="page-race" class="page">
   <div class="race-page-header">
     <h1>Race Programs</h1>
@@ -446,7 +486,7 @@
     <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🦅</div><div class="race-card-body"><div class="race-card-title">50k Race Plan</div><div><span class="tag tag-intermediate">Intermediate – Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 16 weeks · Experience in marathons or 25+ mi/week required</div><a class="btn-outline" href="https://movementandmiles.com/50k-race-plan" target="_blank">Learn More</a></div></div>
     <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🎯</div><div class="race-card-body"><div class="race-card-title">7 Weeks To 10 Miles Plan</div><div><span class="tag tag-advanced">Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 7 weeks · Outdoor running, strength & mobility</div><a class="btn-outline" href="https://movementandmiles.com/7-weeks-to-10-miles" target="_blank">Learn More</a></div></div>
   </div>
-  <div class="sign-up-banner"><h3>Sign Up for your free month</h3><button class="btn-primary">Get Started</button></div>
+  <div class="sign-up-banner"><h3>Sign Up for your free month</h3><button class="btn-primary" onclick="showPage('get-started')">Get Started</button></div>
   <section class="newsletter-section">
     <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
     <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies delivered to your inbox.</p>
@@ -462,6 +502,7 @@
   </footer>
 </div>
 
+<!-- ════════════════════ STORE ════════════════════ -->
 <div id="page-store" class="page">
   <div class="store-header">
     <h1>Explore Our Fitness Store</h1>
@@ -494,6 +535,7 @@
   </footer>
 </div>
 
+<!-- ════════════════════ PROGRAM DETAIL ════════════════════ -->
 <div id="page-detail" class="page">
   <a class="detail-back" onclick="showPage('training')">← Back to Training Programs</a>
   <div class="detail-hero">
@@ -510,7 +552,7 @@
       <div class="detail-cta-box">
         <h3>Join Movement &amp; Miles</h3>
         <p>First Month is Free!</p>
-        <a class="btn-primary" href="https://movementandmiles.ymove.app/p" target="_blank" style="background:var(--white);color:var(--navy);font-weight:600">Sign Up Today</a>
+        <button class="btn-primary" onclick="showPage('get-started')" style="background:var(--white);color:var(--navy);font-weight:600">Sign Up Today</button>
       </div>
     </div>
   </div>
@@ -529,6 +571,34 @@
   </footer>
 </div>
 
+<!-- ════════════════════ GET STARTED (ONBOARDING) ════════════════════ -->
+<div id="page-get-started" class="page">
+  <a class="gs-back" onclick="showPage('home')">← Back to Home</a>
+  <div class="gs-wrapper">
+    <div class="gs-chat-container" id="gs-chat-container">
+      <div class="gs-header">
+        <div class="gs-avatar">N</div>
+        <div class="gs-header-info">
+          <div class="gs-header-name">Nelly</div>
+          <div class="gs-header-sub">Your M&M Coaching Assistant</div>
+        </div>
+      </div>
+      <div class="gs-msgs" id="gs-msgs">
+        <div class="nmsg bot">Hey! I'm Nelly, your M&M coaching assistant. I'm going to help you find the perfect training plan — it'll only take a minute! First off, what's your name?</div>
+      </div>
+      <div class="gs-typing" id="gs-typing">
+        <div class="tdot"></div><div class="tdot"></div><div class="tdot"></div>
+      </div>
+      <div class="gs-input-row">
+        <input class="gs-input" id="gs-input" placeholder="Type your answer..." onkeydown="if(event.key==='Enter')gsSendMsg()" />
+        <button class="gs-send" id="gs-send" onclick="gsSendMsg()">→</button>
+      </div>
+      <div class="gs-powered">Powered by Claude AI</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ NELLY WIDGET (all pages except get-started) ════════════════════ -->
 <div id="nelly-widget">
   <div id="nelly-panel">
     <div class="nelly-header">
@@ -555,12 +625,16 @@
 </div>
 
 <script>
+  /* ══════════════════════════════════════════════
+     ROUTING
+     ══════════════════════════════════════════════ */
   var PAGE_PATHS = {
     home: '/',
     about: '/about-meg',
     training: '/training-programs',
     race: '/race-plans',
     store: '/store',
+    'get-started': '/get-started',
     detail: null
   };
 
@@ -572,11 +646,21 @@
     if (link) link.classList.add('active');
     window.scrollTo(0, 0);
     initFadeIns();
+    // Hide Nelly widget on get-started page (it has its own full-page chat)
+    var widget = document.getElementById('nelly-widget');
+    if (name === 'get-started') {
+      widget.style.display = 'none';
+    } else {
+      widget.style.display = 'flex';
+    }
     if (!skipPush && PAGE_PATHS[name] !== undefined && PAGE_PATHS[name] !== null) {
       history.pushState({page: name}, '', PAGE_PATHS[name]);
     }
   }
 
+  /* ══════════════════════════════════════════════
+     ACCORDION
+     ══════════════════════════════════════════════ */
   function toggleAcc(header) {
     var item = header.parentElement;
     var wasOpen = item.classList.contains('open');
@@ -584,6 +668,9 @@
     if (!wasOpen) item.classList.add('open');
   }
 
+  /* ══════════════════════════════════════════════
+     NELLY WIDGET (existing — unchanged)
+     ══════════════════════════════════════════════ */
   function toggleNelly() {
     document.getElementById('nelly-panel').classList.toggle('open');
     document.querySelector('.bubble-ping').style.display = 'none';
@@ -702,6 +789,145 @@
     sendMsgText(text);
   }
 
+  /* ══════════════════════════════════════════════
+     GET STARTED — ONBOARDING NELLY
+     ══════════════════════════════════════════════ */
+  var GS_API = '/api/onboard-chat';
+  var gsHistory = [];
+  var gsLeadSaved = false;
+
+  function gsParseButtons(text) {
+    var match = text.match(/\[([^\]]+)\]\s*$/);
+    if (!match) return { text: text, buttons: [] };
+    var cleanText = text.replace(/\[([^\]]+)\]\s*$/, '').trim();
+    var inner = match[1];
+    if (inner.indexOf('|') === -1) return { text: text, buttons: [] };
+    var buttons = inner.split('|').map(function(b) { return b.trim(); });
+    return { text: cleanText, buttons: buttons };
+  }
+
+  function gsStripLeadTag(text) {
+    // Extract [[LEAD:{...}]] and return {cleanText, leadData}
+    var match = text.match(/\[\[LEAD:([\s\S]*?)\]\]/);
+    if (!match) return { cleanText: text, leadData: null };
+    var cleanText = text.replace(/\[\[LEAD:[\s\S]*?\]\]/, '').trim();
+    try {
+      var leadData = JSON.parse(match[1]);
+      return { cleanText: cleanText, leadData: leadData };
+    } catch(e) {
+      console.error('Failed to parse lead JSON:', e);
+      return { cleanText: cleanText, leadData: null };
+    }
+  }
+
+  function gsSaveLead(leadData) {
+    if (gsLeadSaved) return;
+    gsLeadSaved = true;
+    fetch('/api/lead', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(leadData)
+    }).then(function(res) {
+      if (!res.ok) throw new Error('Lead save failed');
+      return res.json();
+    }).then(function(data) {
+      console.log('Lead saved:', data);
+      // Show thank you after a brief delay
+      setTimeout(gsShowThankYou, 2500);
+    }).catch(function(err) {
+      console.error('Lead save error:', err);
+      // Still show thank you even if save fails
+      setTimeout(gsShowThankYou, 2500);
+    });
+  }
+
+  function gsShowThankYou() {
+    var container = document.getElementById('gs-chat-container');
+    container.innerHTML = '<div class="gs-header"><div class="gs-avatar">N</div><div class="gs-header-info"><div class="gs-header-name">Nelly</div><div class="gs-header-sub">Your M&M Coaching Assistant</div></div></div>' +
+      '<div class="gs-thank-you">' +
+      '<h2>You\'re all set! 🎉</h2>' +
+      '<p>Your personalized plan is waiting for you. Download the app, create your account, and start your <strong>free month</strong> today!</p>' +
+      '<a class="btn-primary" href="https://movementandmiles.ymove.app/p" target="_blank">Download the App</a>' +
+      '<p style="margin-top:20px;font-size:.82rem;color:var(--muted)">Or <a href="#" onclick="showPage(\'home\');return false;" style="color:var(--navy-mid);font-weight:600;text-decoration:underline">go back to browsing</a></p>' +
+      '</div>';
+  }
+
+  function gsAddBotMessage(text) {
+    var msgs = document.getElementById('gs-msgs');
+    var parsed = gsParseButtons(text);
+    var b = document.createElement('div');
+    b.className = 'nmsg bot';
+    b.textContent = parsed.text;
+    msgs.appendChild(b);
+    if (parsed.buttons.length > 0) {
+      var btnRow = document.createElement('div');
+      btnRow.className = 'gs-buttons';
+      parsed.buttons.forEach(function(label) {
+        var btn = document.createElement('button');
+        btn.className = 'gs-qr';
+        btn.textContent = label;
+        btn.onclick = function() {
+          btnRow.remove();
+          gsSendMsgText(label);
+        };
+        btnRow.appendChild(btn);
+      });
+      msgs.appendChild(btnRow);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function gsSendMsgText(text) {
+    var msgs = document.getElementById('gs-msgs');
+    var typing = document.getElementById('gs-typing');
+    var u = document.createElement('div');
+    u.className = 'nmsg user';
+    u.textContent = text;
+    msgs.appendChild(u);
+    msgs.scrollTop = msgs.scrollHeight;
+    gsHistory.push({ role: 'user', content: text });
+    typing.classList.add('show');
+    msgs.scrollTop = msgs.scrollHeight;
+    fetch(GS_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: gsHistory.slice(0, -1) })
+    }).then(function(res) {
+      typing.classList.remove('show');
+      if (!res.ok) throw new Error('Server error: ' + res.status);
+      return res.json();
+    }).then(function(data) {
+      var reply = data.reply || "Sorry, couldn't connect right now. Try again!";
+      // Check for [[LEAD:{...}]] tag
+      var result = gsStripLeadTag(reply);
+      gsHistory.push({ role: 'assistant', content: reply });
+      gsAddBotMessage(result.cleanText);
+      // If lead data was found, save it
+      if (result.leadData) {
+        gsSaveLead(result.leadData);
+      }
+    }).catch(function(err) {
+      typing.classList.remove('show');
+      var b = document.createElement('div');
+      b.className = 'nmsg bot';
+      b.textContent = 'Having trouble connecting right now. Try again in a moment!';
+      msgs.appendChild(b);
+      msgs.scrollTop = msgs.scrollHeight;
+      console.error('Onboard error:', err);
+    });
+  }
+
+  function gsSendMsg() {
+    var input = document.getElementById('gs-input');
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    gsSendMsgText(text);
+  }
+
+  /* ══════════════════════════════════════════════
+     FADE-INS
+     ══════════════════════════════════════════════ */
   function initFadeIns() {
     var obs = new IntersectionObserver(function(entries) {
       entries.forEach(function(e) { if (e.isIntersecting) e.target.classList.add('visible'); });
@@ -710,6 +936,9 @@
   }
   initFadeIns();
 
+  /* ══════════════════════════════════════════════
+     PROGRAMS DATA
+     ══════════════════════════════════════════════ */
   var PROGRAMS = [
     {slug:"3-week-beginner-walk-to-run", title:"Walk To Run: Part 1", level:"Beginner", duration:"3 weeks", weekly:"4 run/walk workouts, 1 mobility workout, and 2 bodyweight strength training workouts each week.", desc:"This program is a great soft-launch into running. I would recommend this plan for a novice runner, or a completely new runner. The workouts are all walk/run interval style and gradually progress, in terms of running duration, throughout the 3 weeks. Each week is planned out for you and includes bodyweight strength training, mobility and strength training to help you improve your range of motion, strength, flexibility, and stability.", equip:"Running shoes, a mat, foam roller, resistance bands, and a box or bench.", img:"https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/024074f3-1790-45e0-ae72-a273547c894a/app+pics+6.jpg", section:"running"},
     {slug:"6-week-beginner-walk-to-run", title:"Walk To Run: Part 2", level:"Beginner", duration:"6 weeks", weekly:"4 run/walk workouts, 1 mobility workout, and 2 strength training workouts (weights and bodyweight) each week.", desc:"This program picks up where Part 1 left off. You will continue building running endurance with walk/run intervals that gradually increase in running duration. Strength training now incorporates weights alongside bodyweight exercises to build a stronger foundation.", equip:"Running shoes, 10lb+ dumbbell or kettlebell, mini resistance bands, a mat, foam roller, and a box or bench.", img:"https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/15e0db8f-33c4-4a58-b325-aed10e9d6c54/pexels-magda-ehlers-pexels-4065511.jpg", section:"running"},
@@ -745,6 +974,9 @@
     {slug:"trail-road-prehab", title:"Trail/Road Running Prehab Essentials", level:"All Levels", duration:"6 weeks", weekly:"2 strength/prehab workouts and 1 mobility workout each week.", desc:"Essential prehab for both trail and road runners. Builds the stability, strength, and mobility needed to handle varied terrain and high mileage.", equip:"Mini resistance bands, foam roller, and a mat.", img:"", section:"mobility"}
   ];
 
+  /* ══════════════════════════════════════════════
+     PROGRAM DETAIL
+     ══════════════════════════════════════════════ */
   function showDetail(slug, skipPush) {
     var p = PROGRAMS.find(function(x) { return x.slug === slug; });
     if (!p) return;
@@ -764,26 +996,27 @@
     if (!skipPush) history.pushState({page: 'detail', slug: slug}, '', '/' + slug);
   }
 
-  // URL-based routing on page load
+  /* ══════════════════════════════════════════════
+     URL ROUTING
+     ══════════════════════════════════════════════ */
   (function() {
     var path = window.location.pathname.replace(/^\/+|\/+$/g, '');
-    if (!path || path === 'home') return; // already showing home
+    if (!path || path === 'home') return;
     var pathToPage = {
       'about-meg': 'about',
       'training-programs': 'training',
       'race-plans': 'race',
-      'store': 'store'
+      'store': 'store',
+      'get-started': 'get-started'
     };
     if (pathToPage[path]) {
       showPage(pathToPage[path], true);
     } else {
-      // Try matching a program slug
       var prog = PROGRAMS.find(function(p) { return p.slug === path; });
       if (prog) showDetail(path, true);
     }
   })();
 
-  // Back/forward button support
   window.addEventListener('popstate', function(e) {
     if (e.state && e.state.page) {
       if (e.state.page === 'detail' && e.state.slug) {
