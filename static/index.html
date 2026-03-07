@@ -26,6 +26,7 @@
   </div>
 </nav>
 
+<!-- ═══════════════════════ HOME ═══════════════════════ -->
 <div id="page-home" class="page active">
   <section class="hero">
     <div class="hero-bg"></div>
@@ -123,6 +124,7 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ ABOUT MEG ═══════════════════════ -->
 <div id="page-about" class="page">
   <div class="about-hero">
     <img class="about-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/9f593b9b-c3ca-4504-88ef-0673a444f243/Screenshot+2025-09-16+at+2.07.49+PM.png" alt="Meg" />
@@ -157,6 +159,7 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ TRAINING PROGRAMS ═══════════════════════ -->
 <div id="page-training" class="page">
   <div class="page-hero">
     <h1>Monthly Training<br>Programs:</h1>
@@ -211,6 +214,7 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ RACE PLANS ═══════════════════════ -->
 <div id="page-race" class="page">
   <div class="race-page-header">
     <h1>Race Programs</h1>
@@ -245,6 +249,7 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ STORE ═══════════════════════ -->
 <div id="page-store" class="page">
   <div class="store-header">
     <h1>Explore Our Fitness Store</h1>
@@ -277,6 +282,7 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ PROGRAM DETAIL ═══════════════════════ -->
 <div id="page-detail" class="page">
   <a class="detail-back" onclick="showPage('training')">← Back to Training Programs</a>
   <div class="detail-hero">
@@ -312,16 +318,17 @@
   </footer>
 </div>
 
+<!-- ═══════════════════════ GET STARTED (ONBOARDING) ═══════════════════════ -->
 <div id="page-get-started" class="page">
   <div class="gs-wrapper">
     <div class="gs-container">
       <div class="gs-header">
-        <h1>Let's Find Your Plan</h1>
-        <p>Chat with Nelly to get a personalized recommendation</p>
+        <h1>Let's Get You Started</h1>
+        <p>Chat with Nelly to find your perfect training plan</p>
       </div>
       <div class="gs-chat">
-        <div id="gs-msgs" class="gs-msgs">
-          <div class="gs-msg bot">Hey! I'm Nelly, and I'm here to help you find the perfect training plan. Let's start with the basics — what's your first name?</div>
+        <div class="gs-msgs" id="gs-msgs">
+          <div class="gs-msg bot">Hey! I'm Nelly, your Movement & Miles guide. I'm going to ask you a few quick questions to find the perfect plan for you. First things first — what's your name?</div>
         </div>
         <div id="gs-typing">
           <div class="tdot"></div><div class="tdot"></div><div class="tdot"></div>
@@ -336,6 +343,7 @@
   </div>
 </div>
 
+<!-- ═══════════════════════ NELLY WIDGET ═══════════════════════ -->
 <div id="nelly-widget">
   <div id="nelly-panel">
     <div class="nelly-header">
@@ -361,10 +369,237 @@
   <div id="nelly-bubble" onclick="toggleNelly()">Nelly<div class="bubble-ping"></div></div>
 </div>
 
-<!-- JS: order matters — programs.js before app.js (app.js references PROGRAMS) -->
+<!-- ═══════════════════════ PROGRAMS DATA ═══════════════════════ -->
 <script src="/static/js/programs.js"></script>
-<script src="/static/js/app.js"></script>
-<script src="/static/js/nelly-widget.js"></script>
+
+<!-- ═══════════════════════ CORE APP JS ═══════════════════════ -->
+<script>
+  var PAGE_PATHS = {
+    home: '/',
+    about: '/about-meg',
+    training: '/training-programs',
+    race: '/race-plans',
+    store: '/store',
+    'get-started': '/get-started',
+    detail: null
+  };
+
+  // --- Page View Tracking ---
+  function trackPageView(pageName) {
+    var path = PAGE_PATHS[pageName] || ('/' + pageName);
+    fetch('/api/page-view', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page: pageName, path: path, referrer: document.referrer })
+    }).catch(function() {}); // fire-and-forget
+  }
+
+  function showPage(name, skipPush) {
+    document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+    document.querySelectorAll('.nav-links a').forEach(function(a) { a.classList.remove('active'); });
+    document.getElementById('page-' + name).classList.add('active');
+    var link = document.querySelector('.nav-links a[data-page="' + name + '"]');
+    if (link) link.classList.add('active');
+    window.scrollTo(0, 0);
+    initFadeIns();
+    // Auto-hide Nelly widget on get-started page
+    var nellyW = document.getElementById('nelly-widget');
+    if (nellyW) nellyW.style.display = (name === 'get-started') ? 'none' : 'flex';
+    if (!skipPush && PAGE_PATHS[name] !== undefined && PAGE_PATHS[name] !== null) {
+      history.pushState({page: name}, '', PAGE_PATHS[name]);
+    }
+    // Track page view
+    trackPageView(name);
+  }
+
+  function showDetail(slug, skipPush) {
+    var p = PROGRAMS.find(function(x) { return x.slug === slug; });
+    if (!p) return;
+    var tagClass = p.level === 'Beginner' ? 'tag-beginner' : p.level === 'Intermediate' ? 'tag-intermediate' : p.level === 'Advanced' ? 'tag-advanced' : 'tag-all';
+    var imgEl = document.getElementById('detail-img');
+    if (p.img) { imgEl.src = p.img; imgEl.style.display = 'block'; }
+    else { imgEl.style.display = 'none'; }
+    document.getElementById('detail-title').textContent = p.title;
+    var tagEl = document.getElementById('detail-tag');
+    tagEl.textContent = p.level;
+    tagEl.className = 'tag ' + tagClass;
+    document.getElementById('detail-duration').textContent = p.duration;
+    document.getElementById('detail-weekly').innerHTML = '<strong>Each week has:</strong> ' + p.weekly;
+    document.getElementById('detail-desc').textContent = p.desc;
+    document.getElementById('detail-equip').innerHTML = '<strong>Equipment needed:</strong> ' + p.equip;
+    showPage('detail', true);
+    if (!skipPush) history.pushState({page: 'detail', slug: slug}, '', '/' + slug);
+    trackPageView('detail:' + slug);
+  }
+
+  function toggleAcc(header) {
+    var item = header.parentElement;
+    var wasOpen = item.classList.contains('open');
+    document.querySelectorAll('.accordion-item').forEach(function(i) { i.classList.remove('open'); });
+    if (!wasOpen) item.classList.add('open');
+  }
+
+  function toggleNelly() {
+    document.getElementById('nelly-panel').classList.toggle('open');
+    document.querySelector('.bubble-ping').style.display = 'none';
+  }
+
+  // --- Widget Nelly Chat ---
+  var NELLY_API = '/api/chat';
+  var nellyHistory = [];
+  var pageMap = {
+    'training programs': 'training',
+    'training': 'training',
+    'race plans': 'race',
+    'race': 'race',
+    'store': 'store',
+    'home': 'home'
+  };
+
+  function renderBotText(text, container) {
+    var parts = text.split(/\[\[page:([^\]]+)\]\]/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) container.appendChild(document.createTextNode(parts[i]));
+      } else {
+        var pageName = parts[i];
+        var pageKey = pageMap[pageName.toLowerCase()] || 'home';
+        var a = document.createElement('a');
+        a.textContent = pageName;
+        a.href = '#';
+        a.className = 'nelly-link';
+        a.setAttribute('data-page', pageKey);
+        a.onclick = function(e) {
+          e.preventDefault();
+          var pg = this.getAttribute('data-page');
+          toggleNelly();
+          showPage(pg);
+        };
+        container.appendChild(a);
+      }
+    }
+  }
+
+  function parseButtons(text) {
+    var match = text.match(/\[([^\]]+)\]\s*$/);
+    if (!match) return { text: text, buttons: [] };
+    var cleanText = text.replace(/\[([^\]]+)\]\s*$/, '').trim();
+    var inner = match[1];
+    if (inner.indexOf('|') === -1) return { text: text, buttons: [] };
+    var buttons = inner.split('|').map(function(b) { return b.trim(); });
+    return { text: cleanText, buttons: buttons };
+  }
+
+  function addBotMessage(text) {
+    var msgs = document.getElementById('nelly-msgs');
+    var parsed = parseButtons(text);
+    var b = document.createElement('div');
+    b.className = 'nmsg bot';
+    renderBotText(parsed.text, b);
+    msgs.appendChild(b);
+    if (parsed.buttons.length > 0) {
+      var btnRow = document.createElement('div');
+      btnRow.className = 'nelly-buttons';
+      parsed.buttons.forEach(function(label) {
+        var btn = document.createElement('button');
+        btn.className = 'nelly-qr';
+        btn.textContent = label;
+        btn.onclick = function() {
+          btnRow.remove();
+          sendMsgText(label);
+        };
+        btnRow.appendChild(btn);
+      });
+      msgs.appendChild(btnRow);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function sendMsgText(text) {
+    var msgs = document.getElementById('nelly-msgs');
+    var typing = document.getElementById('nelly-typing');
+    var u = document.createElement('div');
+    u.className = 'nmsg user';
+    u.textContent = text;
+    msgs.appendChild(u);
+    msgs.scrollTop = msgs.scrollHeight;
+    nellyHistory.push({ role: 'user', content: text });
+    typing.classList.add('show');
+    msgs.scrollTop = msgs.scrollHeight;
+    fetch(NELLY_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: nellyHistory.slice(0, -1) })
+    }).then(function(res) {
+      typing.classList.remove('show');
+      if (!res.ok) throw new Error('Server error: ' + res.status);
+      return res.json();
+    }).then(function(data) {
+      var reply = data.reply || "Sorry, couldn't connect right now. Try again!";
+      nellyHistory.push({ role: 'assistant', content: reply });
+      addBotMessage(reply);
+    }).catch(function(err) {
+      typing.classList.remove('show');
+      var b = document.createElement('div');
+      b.className = 'nmsg bot';
+      b.textContent = 'Having trouble connecting right now. Try again in a moment!';
+      msgs.appendChild(b);
+      msgs.scrollTop = msgs.scrollHeight;
+      console.error('Nelly error:', err);
+    });
+  }
+
+  function sendMsg() {
+    var input = document.getElementById('nelly-input');
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sendMsgText(text);
+  }
+
+  function initFadeIns() {
+    var obs = new IntersectionObserver(function(entries) {
+      entries.forEach(function(e) { if (e.isIntersecting) e.target.classList.add('visible'); });
+    }, { threshold: 0.08 });
+    document.querySelectorAll('.page.active .fade-in:not(.visible)').forEach(function(el) { obs.observe(el); });
+  }
+  initFadeIns();
+
+  // URL-based routing on page load
+  (function() {
+    var path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    if (!path || path === 'home') { trackPageView('home'); return; }
+    var pathToPage = {
+      'about-meg': 'about',
+      'training-programs': 'training',
+      'race-plans': 'race',
+      'store': 'store',
+      'get-started': 'get-started'
+    };
+    if (pathToPage[path]) {
+      showPage(pathToPage[path], true);
+    } else {
+      var prog = PROGRAMS.find(function(p) { return p.slug === path; });
+      if (prog) showDetail(path, true);
+    }
+  })();
+
+  // Back/forward button support
+  window.addEventListener('popstate', function(e) {
+    if (e.state && e.state.page) {
+      if (e.state.page === 'detail' && e.state.slug) {
+        showDetail(e.state.slug, true);
+      } else {
+        showPage(e.state.page, true);
+      }
+    } else {
+      showPage('home', true);
+    }
+  });
+</script>
+
+<!-- ═══════════════════════ ONBOARDING CHAT JS ═══════════════════════ -->
 <script src="/static/js/onboard.js"></script>
+
 </body>
 </html>
