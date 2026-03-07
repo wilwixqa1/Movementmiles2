@@ -63,6 +63,11 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                # Phase 5: UTM tracking columns on leads
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_source TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_medium TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_campaign TEXT DEFAULT ''")
+
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS chat_sessions (
                         id SERIAL PRIMARY KEY,
@@ -292,6 +297,9 @@ class LeadRequest(BaseModel):
     referral_source: str = ""
     recommended_plan: str = ""
     extra: str = ""
+    utm_source: str = ""
+    utm_medium: str = ""
+    utm_campaign: str = ""
 
 class PageViewRequest(BaseModel):
     page: str = ""
@@ -358,10 +366,11 @@ async def save_lead(lead: LeadRequest):
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra, utm_source, utm_medium, utm_campaign)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
                     lead.first_name, lead.email, lead.experience_level,
-                    lead.goals, lead.referral_source, lead.recommended_plan, lead.extra
+                    lead.goals, lead.referral_source, lead.recommended_plan, lead.extra,
+                    lead.utm_source, lead.utm_medium, lead.utm_campaign
                 )
             return {"status": "saved", "storage": "postgres"}
         except Exception as e:
@@ -844,6 +853,20 @@ async def admin_stats(request: Request):
             "SELECT session_type, COUNT(*) as count FROM chat_sessions GROUP BY session_type"
         )
 
+        # Phase 5: UTM attribution
+        leads_by_source = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source,''), 'direct') as channel, COUNT(*) as count
+               FROM leads GROUP BY channel ORDER BY count DESC"""
+        )
+        leads_by_medium = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_medium,''), 'none') as medium, COUNT(*) as count
+               FROM leads GROUP BY medium ORDER BY count DESC"""
+        )
+        leads_by_campaign = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_campaign,''), 'none') as campaign, COUNT(*) as count
+               FROM leads GROUP BY campaign ORDER BY count DESC LIMIT 10"""
+        )
+
         # Subscription stats (Phase 3)
         active_subs = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing')"
@@ -921,6 +944,9 @@ async def admin_stats(request: Request):
         "leads": {
             "total": total_leads,
             "recent": [dict(r) for r in recent_leads],
+            "by_source": [{"channel": r["channel"], "count": r["count"]} for r in leads_by_source],
+            "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in leads_by_medium],
+            "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in leads_by_campaign],
         },
         "page_views": {
             "total": total_views,
@@ -976,9 +1002,9 @@ async def admin_leads_csv(request: Request):
     import csv
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "first_name", "email", "experience_level", "goals", "referral_source", "recommended_plan", "extra", "created_at"])
+    writer.writerow(["id", "first_name", "email", "experience_level", "goals", "referral_source", "recommended_plan", "extra", "utm_source", "utm_medium", "utm_campaign", "created_at"])
     for r in rows:
-        writer.writerow([r["id"], r["first_name"], r["email"], r["experience_level"], r["goals"], r["referral_source"], r["recommended_plan"], r["extra"], str(r["created_at"])])
+        writer.writerow([r["id"], r["first_name"], r["email"], r["experience_level"], r["goals"], r["referral_source"], r["recommended_plan"], r["extra"], r.get("utm_source",""), r.get("utm_medium",""), r.get("utm_campaign",""), str(r["created_at"])])
 
     output.seek(0)
     return StreamingResponse(
@@ -995,7 +1021,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "7.1",
+        "version": "8.0",
         "database": db_status,
         "stripe": stripe_status,
     }
