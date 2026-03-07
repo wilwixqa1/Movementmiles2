@@ -962,6 +962,89 @@ async def import_leads_csv(request: Request, file: UploadFile = File(...)):
 
     return {"status": "ok", "imported": imported, "skipped": skipped}
 
+
+@app.post("/api/admin/import-subscribers-csv")
+async def import_subscribers_csv(request: Request, file: UploadFile = File(...)):
+    """Import Apple/Google subscribers from CSV into subscriptions table."""
+    import csv as csv_mod
+    import io as io_mod
+    import hashlib
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    contents = await file.read()
+    text = contents.decode("utf-8-sig")
+    reader = csv_mod.DictReader(io_mod.StringIO(text))
+
+    def find_col(row, options):
+        for opt in options:
+            for key in row:
+                if key.strip().lower() == opt.lower():
+                    return (row[key] or "").strip()
+        return ""
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetch("SELECT stripe_subscription_id FROM subscriptions")
+        existing_ids = set(r["stripe_subscription_id"] for r in existing)
+
+        imported = 0
+        skipped = 0
+        for row in reader:
+            email = find_col(row, ["email", "e-mail"])
+            if not email:
+                skipped += 1
+                continue
+
+            source_raw = find_col(row, ["source"]).lower()
+            if source_raw == "google":
+                source = "google"
+            else:
+                source = "apple"
+
+            email_hash = hashlib.md5(email.lower().encode()).hexdigest()[:16]
+            syn_id = f"import_{source}_{email_hash}"
+
+            if syn_id in existing_ids:
+                skipped += 1
+                continue
+
+            date_str = find_col(row, ["date", "sign up date", "signup_date"])
+            period_start = None
+            if date_str:
+                try:
+                    period_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+
+            plan_amount = 1999
+            plan_interval = "month"
+
+            try:
+                await conn.execute("""
+                    INSERT INTO subscriptions (
+                        stripe_customer_id, stripe_subscription_id, email, status,
+                        plan_interval, plan_amount, currency, source,
+                        current_period_start, updated_at
+                    ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', $5, $6, NOW())
+                    ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        status = EXCLUDED.status,
+                        updated_at = NOW()
+                """,
+                    syn_id, email, plan_interval, plan_amount, source, period_start
+                )
+                imported += 1
+                existing_ids.add(syn_id)
+            except Exception as e:
+                print(f"Subscriber import error: {e}")
+                skipped += 1
+
+    return {"status": "ok", "imported": imported, "skipped": skipped}
+
+
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
