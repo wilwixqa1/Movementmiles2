@@ -171,6 +171,37 @@
     <hr class="divider"/>
 
     <!-- Engagement Section -->
+    <div class="section-label">Channel Attribution (UTM)</div>
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Leads by Source</div>
+        <div id="chart-leads-source" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Leads by Medium</div>
+        <div id="chart-leads-medium" class="bar-chart"></div>
+      </div>
+    </div>
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Leads by Campaign (Top 10)</div>
+        <div id="chart-leads-campaign" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Channel Breakdown</div>
+        <div style="overflow-x:auto;max-height:220px;overflow-y:auto">
+          <table>
+            <thead><tr><th>Source</th><th>Leads</th><th>Share</th></tr></thead>
+            <tbody id="attribution-tbody">
+              <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
     <div class="section-label">Engagement & Leads</div>
     <div class="stat-cards">
       <div class="stat-card">
@@ -321,6 +352,31 @@ function loadStats() {
     renderBarChart('chart-by-day', d.page_views.by_day.map(function(r){
       return {label: r.day.slice(5), value: r.views, color: 'navy'};
     }));
+
+    // --- Channel Attribution charts ---
+    var srcColors = ['navy','green','orange','mid','red'];
+    renderBarChart('chart-leads-source', (d.leads.by_source || []).map(function(r, i) {
+      return {label: r.channel, value: r.count, color: srcColors[i % srcColors.length]};
+    }));
+    renderBarChart('chart-leads-medium', (d.leads.by_medium || []).map(function(r, i) {
+      return {label: r.medium, value: r.count, color: srcColors[i % srcColors.length]};
+    }));
+    renderBarChart('chart-leads-campaign', (d.leads.by_campaign || []).map(function(r, i) {
+      var lbl = r.campaign.length > 15 ? r.campaign.slice(0,14) + '...' : r.campaign;
+      return {label: lbl, value: r.count, color: srcColors[i % srcColors.length]};
+    }));
+    // Attribution breakdown table
+    var attrBody = document.getElementById('attribution-tbody');
+    var bySrc = d.leads.by_source || [];
+    var totalLeadsForPct = d.leads.total || 1;
+    if (bySrc.length === 0) {
+      attrBody.innerHTML = '<tr><td colspan="3" class="empty-msg">No UTM data yet. Add ?utm_source=... to your ad links.</td></tr>';
+    } else {
+      attrBody.innerHTML = bySrc.map(function(r) {
+        var pct = ((r.count / totalLeadsForPct) * 100).toFixed(1);
+        return '<tr><td><strong>' + r.channel + '</strong></td><td>' + r.count + '</td><td>' + pct + '%</td></tr>';
+      }).join('');
+    }
 
     // Leads table
     var tbody = document.getElementById('leads-tbody');
