@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -816,6 +816,152 @@ async def admin_login(req: LoginRequest):
     return {"status": "ok"}
 
 
+# --- Admin Data Tools ---
+
+
+@app.post("/api/admin/backfill-stripe")
+async def backfill_stripe(request: Request):
+    """Pull all Stripe subscriptions and upsert into DB."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    count = 0
+    errors = 0
+    try:
+        subs_iter = stripe.Subscription.list(
+            limit=100, status="all", expand=["data.customer"]
+        )
+        for sub in subs_iter.auto_paging_iter():
+            try:
+                sub_id = sub.id
+                customer_id = sub.customer.id if hasattr(sub.customer, "id") else str(sub.customer)
+                status = sub.status
+
+                plan_amount = 0
+                plan_interval = ""
+                if sub.items and sub.items.data:
+                    price = sub.items.data[0].price
+                    plan_amount = price.unit_amount or 0
+                    if price.recurring:
+                        plan_interval = price.recurring.interval or ""
+
+                email = ""
+                try:
+                    if hasattr(sub.customer, "email"):
+                        email = sub.customer.email or ""
+                except Exception:
+                    pass
+
+                def ts(v):
+                    if v:
+                        return datetime.fromtimestamp(v, tz=timezone.utc)
+                    return None
+
+                async with db_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO subscriptions (
+                            stripe_customer_id, stripe_subscription_id, email, status,
+                            plan_interval, plan_amount, currency, source,
+                            trial_start, trial_end,
+                            current_period_start, current_period_end,
+                            canceled_at, updated_at
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,NOW())
+                        ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            plan_interval = EXCLUDED.plan_interval,
+                            plan_amount = EXCLUDED.plan_amount,
+                            email = EXCLUDED.email,
+                            trial_start = EXCLUDED.trial_start,
+                            trial_end = EXCLUDED.trial_end,
+                            current_period_start = EXCLUDED.current_period_start,
+                            current_period_end = EXCLUDED.current_period_end,
+                            canceled_at = EXCLUDED.canceled_at,
+                            updated_at = NOW()
+                    """,
+                        customer_id, sub_id, email, status,
+                        plan_interval, plan_amount, sub.currency or "usd",
+                        ts(sub.trial_start), ts(sub.trial_end),
+                        ts(sub.current_period_start), ts(sub.current_period_end),
+                        ts(sub.canceled_at)
+                    )
+                count += 1
+            except Exception as e:
+                print(f"Backfill sub error: {e}")
+                errors += 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe API error: {str(e)}")
+
+    return {"status": "ok", "imported": count, "errors": errors}
+
+
+@app.post("/api/admin/reset-data")
+async def reset_data(request: Request):
+    """Wipe all tables. Requires confirm=RESET in body."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    body = await request.json()
+    if body.get("confirm") != "RESET":
+        raise HTTPException(status_code=400, detail="Must send confirm=RESET")
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("TRUNCATE leads, page_views, chat_sessions, subscriptions, subscription_events RESTART IDENTITY")
+
+    return {"status": "ok", "message": "All data cleared"}
+
+
+@app.post("/api/admin/import-leads-csv")
+async def import_leads_csv(request: Request, file: UploadFile = File(...)):
+    """Import leads from CSV file upload."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    import csv
+    import io
+
+    contents = await file.read()
+    text = contents.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+
+    def find_col(row, options):
+        for opt in options:
+            for key in row:
+                if key.strip().lower() == opt.lower():
+                    return (row[key] or "").strip()
+        return ""
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetch("SELECT DISTINCT lower(email) as em FROM leads WHERE email != ''")
+        existing_emails = set(r["em"] for r in existing)
+
+        imported = 0
+        skipped = 0
+        for row in reader:
+            email = find_col(row, ["email", "e-mail"])
+            if not email or email.lower() in existing_emails:
+                skipped += 1
+                continue
+            first_name = find_col(row, ["first_name", "first", "firstname", "first name"])
+            last_name = find_col(row, ["last_name", "last", "lastname", "last name"])
+            referral = find_col(row, ["source", "referral_source", "referral", "how_heard"])
+
+            await conn.execute(
+                """INSERT INTO leads (first_name, email, extra, referral_source)
+                   VALUES ($1, $2, $3, $4)""",
+                first_name, email, last_name, referral
+            )
+            imported += 1
+            existing_emails.add(email.lower())
+
+    return {"status": "ok", "imported": imported, "skipped": skipped}
+
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
@@ -1113,7 +1259,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "8.1.3",
+        "version": "9.0.0",
         "database": db_status,
         "stripe": stripe_status,
     }
