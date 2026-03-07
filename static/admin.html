@@ -326,7 +326,11 @@ function doLogin() {
     var err = document.getElementById('login-error');
     err.style.display = 'block';
     document.getElementById('admin-pw').value = '';
-    // --- Date range filter ---
+    document.getElementById('admin-pw').focus();
+  });
+}
+
+// --- Date range filter ---
 var activeFrom = '';
 var activeTo = '';
 
@@ -351,10 +355,6 @@ function clearDateFilter() {
   activeFrom = '';
   activeTo = '';
   loadStats();
-}
-
-document.getElementById('admin-pw').focus();
-  });
 }
 
 function loadStats() {
