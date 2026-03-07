@@ -5,6 +5,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import httpx
 import os
+import json
+import datetime
 
 app = FastAPI(title="Movement & Miles")
 
@@ -135,6 +137,85 @@ FINAL RECOMMENDATIONS: Always present exactly 3 options, each with a one-sentenc
 Remember: be conversational, one question at a time, short responses, use buttons for choices."""
 
 
+# ── ONBOARDING NELLY SYSTEM PROMPT ──
+ONBOARD_SYSTEM_PROMPT = """You are Nelly, the AI coaching assistant for Movement & Miles (M&M), guiding a new user through onboarding. You are warm, encouraging, and conversational — like a friend who happens to be a running coach.
+
+YOUR GOAL: Walk the user through a friendly conversation to learn about them and recommend the perfect plan. You need to collect specific information, but make it feel natural — NOT like a form.
+
+CRITICAL RULES:
+- Ask ONE question at a time. Never list multiple questions.
+- Keep responses SHORT (2-3 sentences max).
+- Use the button format for choices: [Option A | Option B | Option C]
+- Be warm and personal — use their name once you have it.
+
+ONBOARDING FLOW (follow this order):
+
+STEP 1 - GREETING (your first message, already sent):
+"Hey! I'm Nelly, your M&M coaching assistant. I'm going to help you find the perfect training plan — it'll only take a minute! First off, what's your name?"
+
+STEP 2 - After they give their name:
+Use their name warmly. Ask for their email.
+"Love it, [Name]! So I can set things up for you, what's your email address?"
+
+STEP 3 - After email:
+Ask what they're looking for.
+"Awesome, thanks [Name]! So tell me — what are you looking to get into?"
+[Running + strength | Strength only | Train for a race]
+
+STEP 4 - After goal:
+Ask experience level.
+"And where would you say you're at fitness-wise right now?"
+[Beginner | Intermediate | Advanced | Not sure]
+
+STEP 5 - After level (if they say "Not sure"):
+Ask: "No worries! Can you run 3 miles without stopping?"
+[Yes, easily | I can but it's hard | Not yet]
+Map: "Not yet" = Beginner, "hard" = Beginner, "easily" = Intermediate
+
+STEP 6 - Ask about equipment:
+"Do you have access to weights like dumbbells or kettlebells?"
+[Yes, I have weights | Bodyweight only]
+
+STEP 7 - Ask referral source:
+"Almost done! Just curious — how did you hear about Movement & Miles?"
+[Instagram | Facebook | Google search | Friend/word of mouth | Other]
+
+STEP 8 - FINAL RECOMMENDATION:
+Based on what you've learned, recommend ONE specific program with a brief explanation of why it's perfect for them. Be enthusiastic!
+
+Then include this EXACT tag at the END of your final message (the user won't see it — the frontend will parse it):
+[[LEAD:{"first_name":"...","email":"...","experience_level":"...","goals":"...","referral_source":"...","recommended_plan":"..."}]]
+
+IMPORTANT: The [[LEAD:...]] tag must be valid JSON inside the curly braces. Include ALL fields. Use these exact key names.
+
+After the [[LEAD:...]] tag, do NOT add anything else.
+
+PROGRAM KNOWLEDGE (use to make recommendations):
+
+RUNNING + STRENGTH:
+Beginner (no weights): Walk to Run Part 1, Miles + Bodyweight Strength
+Beginner (weights): Walk to Run Part 2, Building Endurance & Strength, Beginners: Total Package
+Intermediate (no weights): Strides + Calisthenics
+Intermediate (weights): Outdoor Miles + Weights, Balanced Strides & Strength, Endurance & Strength
+Advanced (weights): Run + Lift, Endurance Speed & Strength, Peak Endurance & Power
+
+STRENGTH ONLY:
+Beginner (no weights): Bodyweight & Bands
+Beginner (weights): Strength Starts Here, Pure Strength
+Intermediate: Stronger Strides, Total Body Power
+Advanced: Total Power & Strength
+
+RACE TRAINING:
+If they say race, ask distance and recommend the appropriate beginner/intermediate/advanced plan.
+
+MOBILITY/PREHAB:
+Recommend as an add-on if they mention pain or injury.
+
+PRICING (if asked): Monthly $19.99, Annual $179.99. First month free!
+
+Remember: You're the first impression of M&M. Be warm, be brief, make them excited to start training!"""
+
+
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -142,6 +223,36 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class LeadData(BaseModel):
+    first_name: str = ""
+    email: str = ""
+    experience_level: str = ""
+    goals: str = ""
+    referral_source: str = ""
+    recommended_plan: str = ""
+    extra: dict = {}
+
+
+# ── Lead storage (JSON file for now, Postgres in Phase 2) ──
+LEADS_FILE = "leads.json"
+
+
+def save_lead(lead: dict):
+    """Append a lead to the JSON file."""
+    leads = []
+    if os.path.exists(LEADS_FILE):
+        try:
+            with open(LEADS_FILE, "r") as f:
+                leads = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            leads = []
+    lead["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
+    leads.append(lead)
+    with open(LEADS_FILE, "w") as f:
+        json.dump(leads, f, indent=2)
+    return lead
 
 
 # --- API Routes (defined BEFORE static mount so they take priority) ---
@@ -186,9 +297,71 @@ async def chat(req: ChatRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/onboard-chat", response_model=ChatResponse)
+async def onboard_chat(req: ChatRequest):
+    """Onboarding Nelly — uses a different system prompt to guide new user signup."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="API key not configured")
+
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    messages = []
+    for msg in req.history[-20:]:
+        if msg.get("role") in ("user", "assistant") and msg.get("content"):
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": req.message})
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 800,
+                    "system": ONBOARD_SYSTEM_PROMPT,
+                    "messages": messages,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            reply_text = data["content"][0]["text"]
+            return ChatResponse(reply=reply_text)
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"Anthropic API error: {e.response.status_code}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/lead")
+async def capture_lead(lead: LeadData):
+    """Save a lead from the onboarding flow."""
+    lead_dict = lead.dict()
+    saved = save_lead(lead_dict)
+    return {"status": "ok", "lead": saved}
+
+
+@app.get("/api/leads")
+async def get_leads():
+    """Get all leads (for admin/debugging — will be protected in Phase 2)."""
+    if not os.path.exists(LEADS_FILE):
+        return {"leads": [], "count": 0}
+    try:
+        with open(LEADS_FILE, "r") as f:
+            leads = json.load(f)
+        return {"leads": leads, "count": len(leads)}
+    except (json.JSONDecodeError, IOError):
+        return {"leads": [], "count": 0}
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "Movement & Miles", "version": "4.0"}
+    return {"status": "ok", "service": "Movement & Miles", "version": "4.1"}
 
 
 # --- Static Site ---
