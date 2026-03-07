@@ -6,7 +6,7 @@
 <title>M&M Admin Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
-  :root { --navy:#182241; --navy-mid:#536c7c; --bg:#f7f7f7; --white:#fff; --border:#e0e0e0; --green:#2d6a2d; --orange:#b35a00; }
+  :root { --navy:#182241; --navy-mid:#536c7c; --bg:#f7f7f7; --white:#fff; --border:#e0e0e0; --green:#2d6a2d; --orange:#b35a00; --red:#c0392b; }
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:var(--bg);color:var(--navy);font-family:'Urbanist',sans-serif}
   .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(160deg,#182241,#536c7c)}
@@ -17,7 +17,7 @@
   .login-box input:focus{border-color:var(--navy-mid)}
   .login-box button{width:100%;background:var(--navy);color:var(--white);border:none;padding:13px;border-radius:8px;font-family:inherit;font-size:.9rem;font-weight:600;cursor:pointer}
   .login-box button:hover{background:#2a3a5c}
-  .login-error{color:#c0392b;font-size:.82rem;margin-bottom:12px;display:none}
+  .login-error{color:var(--red);font-size:.82rem;margin-bottom:12px;display:none}
 
   .dash{display:none}
   .dash.active{display:block}
@@ -28,10 +28,15 @@
   .dash-nav a:hover{color:var(--white)}
   .dash-body{max-width:1200px;margin:0 auto;padding:32px 40px}
 
-  .stat-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:36px}
+  .section-label{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--navy-mid);margin-bottom:12px;margin-top:8px}
+
+  .stat-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:12px}
   .stat-card{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:24px}
   .stat-card .label{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--navy-mid);margin-bottom:8px}
   .stat-card .value{font-size:2rem;font-weight:600;color:var(--navy)}
+  .stat-card .value.green{color:var(--green)}
+  .stat-card .value.orange{color:var(--orange)}
+  .stat-card .value.red{color:var(--red)}
   .stat-card .sub{font-size:.78rem;color:var(--navy-mid);margin-top:4px}
 
   .section-title{font-size:1.1rem;font-weight:600;margin-bottom:16px;color:var(--navy)}
@@ -45,8 +50,13 @@
 
   .bar-chart{display:flex;align-items:flex-end;gap:12px;height:160px;padding:16px 0}
   .bar-col{display:flex;flex-direction:column;align-items:center;gap:6px;flex:1}
-  .bar{background:var(--navy);border-radius:4px 4px 0 0;width:100%;min-height:4px;transition:height .3s}
-  .bar-label{font-size:.7rem;color:var(--navy-mid);font-weight:500}
+  .bar{border-radius:4px 4px 0 0;width:100%;min-height:4px;transition:height .3s}
+  .bar.navy{background:var(--navy)}
+  .bar.green{background:var(--green)}
+  .bar.orange{background:var(--orange)}
+  .bar.red{background:var(--red)}
+  .bar.mid{background:var(--navy-mid)}
+  .bar-label{font-size:.7rem;color:var(--navy-mid);font-weight:500;text-align:center}
   .bar-value{font-size:.75rem;font-weight:600;color:var(--navy)}
 
   .views-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:24px}
@@ -55,10 +65,16 @@
   .export-btn:hover{background:#2a3a5c}
 
   .tag{display:inline-block;font-size:.7rem;font-weight:600;padding:3px 8px;border-radius:12px}
+  .tag-active{background:#e8f4e8;color:#2d6a2d}
+  .tag-trialing{background:#e8eaf6;color:#3949ab}
+  .tag-canceled{background:#fde8e8;color:#c0392b}
+  .tag-past_due{background:#fff3e0;color:#b35a00}
   .tag-widget{background:#e8eaf6;color:#3949ab}
   .tag-onboard{background:#e8f4e8;color:#2d6a2d}
 
   .empty-msg{text-align:center;padding:40px;color:var(--navy-mid);font-size:.9rem}
+
+  .divider{border:none;border-top:1px solid var(--border);margin:32px 0 20px}
 
   @media(max-width:768px){
     .stat-cards{grid-template-columns:repeat(2,1fr)}
@@ -93,7 +109,54 @@
   </div>
   <div class="dash-body">
 
-    <!-- Stat Cards -->
+    <!-- Revenue Section -->
+    <div class="section-label">Revenue & Subscriptions</div>
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">MRR</div>
+        <div class="value green" id="s-mrr">—</div>
+        <div class="sub">Monthly Recurring Revenue</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Active Subscribers</div>
+        <div class="value" id="s-active-subs">—</div>
+        <div class="sub" id="s-active-sub-detail"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Trial → Paid</div>
+        <div class="value" id="s-conversion">—</div>
+        <div class="sub">Conversion rate</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">30-Day Churn</div>
+        <div class="value" id="s-churn">—</div>
+        <div class="sub" id="s-churn-detail"></div>
+      </div>
+    </div>
+
+    <!-- Subscription Charts -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Subscriptions by Status</div>
+        <div id="chart-sub-status" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Recent Subscription Events</div>
+        <div style="overflow-x:auto;max-height:200px;overflow-y:auto">
+          <table>
+            <thead><tr><th>Event</th><th>Customer</th><th>Time</th></tr></thead>
+            <tbody id="events-tbody">
+              <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
+    <!-- Engagement Section -->
+    <div class="section-label">Engagement & Leads</div>
     <div class="stat-cards">
       <div class="stat-card">
         <div class="label">Total Leads</div>
@@ -178,7 +241,43 @@ function loadStats() {
     if (!res.ok) throw new Error('Failed');
     return res.json();
   }).then(function(d) {
-    // Summary cards
+    // --- Revenue cards ---
+    var subs = d.subscriptions || {};
+    document.getElementById('s-mrr').textContent = subs.mrr_display || '$0.00';
+    document.getElementById('s-active-subs').textContent = subs.active || 0;
+
+    var trialText = (subs.trialing || 0) + ' trialing';
+    document.getElementById('s-active-sub-detail').textContent = trialText;
+
+    document.getElementById('s-conversion').textContent = (subs.trial_conversion_rate || 0) + '%';
+
+    var churnVal = subs.churn_rate_30d || 0;
+    var churnEl = document.getElementById('s-churn');
+    churnEl.textContent = churnVal + '%';
+    churnEl.className = 'value' + (churnVal > 10 ? ' red' : churnVal > 5 ? ' orange' : ' green');
+    document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d';
+
+    // Subscription status chart
+    var statusColors = {active:'green', trialing:'mid', canceled:'red', past_due:'orange', incomplete:'mid'};
+    renderBarChart('chart-sub-status', (subs.by_status || []).map(function(r) {
+      return {label: r.status, value: r.count, color: statusColors[r.status] || 'navy'};
+    }));
+
+    // Recent events table
+    var evtBody = document.getElementById('events-tbody');
+    var events = subs.recent_events || [];
+    if (events.length === 0) {
+      evtBody.innerHTML = '<tr><td colspan="3" class="empty-msg">No events yet. Connect Stripe to see activity.</td></tr>';
+    } else {
+      evtBody.innerHTML = events.map(function(e) {
+        var evtName = (e.event_type || '').replace('customer.subscription.', 'sub.');
+        var custShort = (e.customer || '').slice(-8) || '—';
+        var dt = e.created_at ? new Date(e.created_at).toLocaleString() : '—';
+        return '<tr><td><span class="tag tag-' + tagClass(e.event_type) + '">' + evtName + '</span></td><td>…' + custShort + '</td><td>' + dt + '</td></tr>';
+      }).join('');
+    }
+
+    // --- Engagement cards ---
     document.getElementById('s-leads').textContent = d.leads.total;
     document.getElementById('s-views-today').textContent = d.page_views.today;
     document.getElementById('s-views-total').textContent = d.page_views.total;
@@ -187,14 +286,12 @@ function loadStats() {
     var chatSub = d.chats.by_type.map(function(c){return c.session_type+': '+c.count}).join(', ');
     document.getElementById('s-chats-sub').textContent = chatSub || 'No sessions yet';
 
-    // Bar chart: views by page
+    // Bar charts
     renderBarChart('chart-by-page', d.page_views.by_page.map(function(r){
-      return {label: r.page, value: r.views};
+      return {label: r.page, value: r.views, color: 'navy'};
     }));
-
-    // Bar chart: views by day
     renderBarChart('chart-by-day', d.page_views.by_day.map(function(r){
-      return {label: r.day.slice(5), value: r.views};
+      return {label: r.day.slice(5), value: r.views, color: 'navy'};
     }));
 
     // Leads table
@@ -212,6 +309,13 @@ function loadStats() {
   });
 }
 
+function tagClass(eventType) {
+  if (eventType.indexOf('created') > -1) return 'trialing';
+  if (eventType.indexOf('updated') > -1) return 'active';
+  if (eventType.indexOf('deleted') > -1) return 'canceled';
+  return 'active';
+}
+
 function renderBarChart(containerId, data) {
   var el = document.getElementById(containerId);
   if (!data || data.length === 0) {
@@ -221,7 +325,8 @@ function renderBarChart(containerId, data) {
   var max = Math.max.apply(null, data.map(function(d){return d.value})) || 1;
   el.innerHTML = data.map(function(d) {
     var h = Math.max(4, (d.value / max) * 120);
-    return '<div class="bar-col"><div class="bar-value">'+d.value+'</div><div class="bar" style="height:'+h+'px"></div><div class="bar-label">'+d.label+'</div></div>';
+    var colorClass = d.color || 'navy';
+    return '<div class="bar-col"><div class="bar-value">'+d.value+'</div><div class="bar '+colorClass+'" style="height:'+h+'px"></div><div class="bar-label">'+d.label+'</div></div>';
   }).join('');
 }
 
@@ -244,7 +349,6 @@ function exportCSV() {
   });
 }
 
-// Auto-focus password field
 document.getElementById('admin-pw').focus();
 </script>
 </body>
