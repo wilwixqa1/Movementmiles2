@@ -71,6 +71,9 @@
   .tag-past_due{background:#fff3e0;color:#b35a00}
   .tag-widget{background:#e8eaf6;color:#3949ab}
   .tag-onboard{background:#e8f4e8;color:#2d6a2d}
+  .tag-src-stripe{background:#e8eaf6;color:#635bff}
+  .tag-src-apple{background:#f0f0f0;color:#333}
+  .tag-src-google{background:#e8f4e8;color:#0f9d58}
 
   .empty-msg{text-align:center;padding:40px;color:var(--navy-mid);font-size:.9rem}
 
@@ -134,19 +137,31 @@
       </div>
     </div>
 
-    <!-- Subscription Charts -->
+    <!-- Subscription Charts Row 1 -->
     <div class="views-grid">
       <div class="card">
         <div class="section-title">Subscriptions by Status</div>
         <div id="chart-sub-status" class="bar-chart"></div>
       </div>
       <div class="card">
+        <div class="section-title">Subscribers by Source</div>
+        <div id="chart-sub-source" class="bar-chart"></div>
+      </div>
+    </div>
+
+    <!-- Subscription Charts Row 2 -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">MRR by Source</div>
+        <div id="chart-mrr-source" class="bar-chart"></div>
+      </div>
+      <div class="card">
         <div class="section-title">Recent Subscription Events</div>
         <div style="overflow-x:auto;max-height:200px;overflow-y:auto">
           <table>
-            <thead><tr><th>Event</th><th>Customer</th><th>Time</th></tr></thead>
+            <thead><tr><th>Event</th><th>Source</th><th>Customer</th><th>Time</th></tr></thead>
             <tbody id="events-tbody">
-              <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
+              <tr><td colspan="4" class="empty-msg">Loading...</td></tr>
             </tbody>
           </table>
         </div>
@@ -263,17 +278,30 @@ function loadStats() {
       return {label: r.status, value: r.count, color: statusColors[r.status] || 'navy'};
     }));
 
+    // Subscribers by source chart
+    var sourceColors = {stripe:'navy', apple:'mid', google:'green'};
+    renderBarChart('chart-sub-source', (subs.by_source || []).map(function(r) {
+      return {label: r.source, value: r.active, color: sourceColors[r.source] || 'navy'};
+    }));
+
+    // MRR by source chart
+    renderBarChart('chart-mrr-source', (subs.mrr_by_source || []).map(function(r) {
+      var dollars = (r.mrr_cents / 100).toFixed(0);
+      return {label: r.source, value: r.mrr_cents, color: sourceColors[r.source] || 'navy', displayValue: '$' + dollars};
+    }));
+
     // Recent events table
     var evtBody = document.getElementById('events-tbody');
     var events = subs.recent_events || [];
     if (events.length === 0) {
-      evtBody.innerHTML = '<tr><td colspan="3" class="empty-msg">No events yet. Connect Stripe to see activity.</td></tr>';
+      evtBody.innerHTML = '<tr><td colspan="4" class="empty-msg">No events yet. Connect Stripe to see activity.</td></tr>';
     } else {
       evtBody.innerHTML = events.map(function(e) {
         var evtName = (e.event_type || '').replace('customer.subscription.', 'sub.');
-        var custShort = (e.customer || '').slice(-8) || '—';
-        var dt = e.created_at ? new Date(e.created_at).toLocaleString() : '—';
-        return '<tr><td><span class="tag tag-' + tagClass(e.event_type) + '">' + evtName + '</span></td><td>…' + custShort + '</td><td>' + dt + '</td></tr>';
+        var custShort = (e.customer || '').slice(-8) || '---';
+        var src = e.source || 'stripe';
+        var dt = e.created_at ? new Date(e.created_at).toLocaleString() : '---';
+        return '<tr><td><span class="tag tag-' + tagClass(e.event_type) + '">' + evtName + '</span></td><td><span class="tag tag-src-' + src + '">' + src + '</span></td><td>...' + custShort + '</td><td>' + dt + '</td></tr>';
       }).join('');
     }
 
@@ -326,7 +354,8 @@ function renderBarChart(containerId, data) {
   el.innerHTML = data.map(function(d) {
     var h = Math.max(4, (d.value / max) * 120);
     var colorClass = d.color || 'navy';
-    return '<div class="bar-col"><div class="bar-value">'+d.value+'</div><div class="bar '+colorClass+'" style="height:'+h+'px"></div><div class="bar-label">'+d.label+'</div></div>';
+    var display = d.displayValue || d.value;
+    return '<div class="bar-col"><div class="bar-value">'+display+'</div><div class="bar '+colorClass+'" style="height:'+h+'px"></div><div class="bar-label">'+d.label+'</div></div>';
   }).join('');
 }
 
