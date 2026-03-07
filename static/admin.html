@@ -77,6 +77,15 @@
 
   .empty-msg{text-align:center;padding:40px;color:var(--navy-mid);font-size:.9rem}
 
+  .date-bar{display:flex;align-items:center;gap:12px;margin-bottom:24px;flex-wrap:wrap}
+  .date-bar label{font-size:.78rem;font-weight:600;color:var(--navy-mid);text-transform:uppercase;letter-spacing:.06em}
+  .date-bar input[type=date]{background:var(--white);border:1px solid var(--border);padding:8px 12px;border-radius:6px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none}
+  .date-bar input[type=date]:focus{border-color:var(--navy-mid)}
+  .date-bar button{background:var(--navy);color:var(--white);border:none;padding:8px 18px;border-radius:6px;font-family:inherit;font-size:.82rem;font-weight:600;cursor:pointer}
+  .date-bar button:hover{background:#2a3a5c}
+  .date-bar .quick-btn{background:var(--white);color:var(--navy);border:1px solid var(--border);padding:6px 14px;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer}
+  .date-bar .quick-btn:hover{border-color:var(--navy-mid);background:var(--bg)}
+
   .divider{border:none;border-top:1px solid var(--border);margin:32px 0 20px}
 
   @media(max-width:768px){
@@ -112,6 +121,19 @@
   </div>
   <div class="dash-body">
 
+    <!-- Date Range Filter -->
+    <div class="date-bar">
+      <label>Date Range:</label>
+      <input type="date" id="date-from" />
+      <span style="color:var(--navy-mid);font-size:.84rem">to</span>
+      <input type="date" id="date-to" />
+      <button onclick="applyDateFilter()">Apply</button>
+      <button class="quick-btn" onclick="setQuickRange(7)">7d</button>
+      <button class="quick-btn" onclick="setQuickRange(30)">30d</button>
+      <button class="quick-btn" onclick="setQuickRange(90)">90d</button>
+      <button class="quick-btn" onclick="clearDateFilter()">All Time</button>
+    </div>
+
     <!-- Revenue Section -->
     <div class="section-label">Revenue & Subscriptions</div>
     <div class="stat-cards">
@@ -120,6 +142,23 @@
         <div class="value green" id="s-mrr">—</div>
         <div class="sub">Monthly Recurring Revenue</div>
       </div>
+      <div class="stat-card">
+        <div class="label">ARR</div>
+        <div class="value green" id="s-arr">—</div>
+        <div class="sub">Annual Recurring Revenue</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Est. LTV</div>
+        <div class="value" id="s-ltv">—</div>
+        <div class="sub" id="s-ltv-detail"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Avg Sub Age</div>
+        <div class="value" id="s-sub-age">—</div>
+        <div class="sub">days active</div>
+      </div>
+    </div>
+    <div class="stat-cards">
       <div class="stat-card">
         <div class="label">Active Subscribers</div>
         <div class="value" id="s-active-subs">—</div>
@@ -135,6 +174,11 @@
         <div class="value" id="s-churn">—</div>
         <div class="sub" id="s-churn-detail"></div>
       </div>
+      <div class="stat-card">
+        <div class="label">Total Subs</div>
+        <div class="value" id="s-total-subs">—</div>
+        <div class="sub">All time</div>
+      </div>
     </div>
 
     <!-- Subscription Charts Row 1 -->
@@ -147,6 +191,12 @@
         <div class="section-title">Subscribers by Source</div>
         <div id="chart-sub-source" class="bar-chart"></div>
       </div>
+    </div>
+
+    <!-- MRR Trend -->
+    <div class="card" style="margin-bottom:24px">
+      <div class="section-title">MRR Trend (Last 6 Months)</div>
+      <div id="chart-mrr-trend" class="bar-chart"></div>
     </div>
 
     <!-- Subscription Charts Row 2 -->
@@ -276,12 +326,44 @@ function doLogin() {
     var err = document.getElementById('login-error');
     err.style.display = 'block';
     document.getElementById('admin-pw').value = '';
-    document.getElementById('admin-pw').focus();
+    // --- Date range filter ---
+var activeFrom = '';
+var activeTo = '';
+
+function applyDateFilter() {
+  activeFrom = document.getElementById('date-from').value;
+  activeTo = document.getElementById('date-to').value;
+  loadStats();
+}
+
+function setQuickRange(days) {
+  var to = new Date();
+  var from = new Date();
+  from.setDate(from.getDate() - days);
+  document.getElementById('date-from').value = from.toISOString().slice(0, 10);
+  document.getElementById('date-to').value = to.toISOString().slice(0, 10);
+  applyDateFilter();
+}
+
+function clearDateFilter() {
+  document.getElementById('date-from').value = '';
+  document.getElementById('date-to').value = '';
+  activeFrom = '';
+  activeTo = '';
+  loadStats();
+}
+
+document.getElementById('admin-pw').focus();
   });
 }
 
 function loadStats() {
-  fetch('/api/admin/stats', {
+  var statsUrl = '/api/admin/stats';
+  var qp = [];
+  if (activeFrom) qp.push('from=' + activeFrom);
+  if (activeTo) qp.push('to=' + activeTo);
+  if (qp.length) statsUrl += '?' + qp.join('&');
+  fetch(statsUrl, {
     headers: {'X-Admin-Password': adminPw}
   }).then(function(res) {
     if (!res.ok) throw new Error('Failed');
@@ -290,6 +372,12 @@ function loadStats() {
     // --- Revenue cards ---
     var subs = d.subscriptions || {};
     document.getElementById('s-mrr').textContent = subs.mrr_display || '$0.00';
+    document.getElementById('s-arr').textContent = subs.arr_display || '$0.00';
+    document.getElementById('s-ltv').textContent = subs.est_ltv_display || '$0.00';
+    var ltv_months = ((subs.avg_sub_age_days || 30) / 30).toFixed(1);
+    document.getElementById('s-ltv-detail').textContent = 'Based on ~' + ltv_months + ' mo avg lifetime';
+    document.getElementById('s-sub-age').textContent = Math.round(subs.avg_sub_age_days || 0);
+    document.getElementById('s-total-subs').textContent = subs.total || 0;
     document.getElementById('s-active-subs').textContent = subs.active || 0;
 
     var trialText = (subs.trialing || 0) + ' trialing';
@@ -313,6 +401,12 @@ function loadStats() {
     var sourceColors = {stripe:'navy', apple:'mid', google:'green'};
     renderBarChart('chart-sub-source', (subs.by_source || []).map(function(r) {
       return {label: r.source, value: r.active, color: sourceColors[r.source] || 'navy'};
+    }));
+
+    // MRR trend chart
+    renderBarChart('chart-mrr-trend', (subs.mrr_trend || []).map(function(r) {
+      var dollars = (r.mrr_cents / 100).toFixed(0);
+      return {label: r.month.slice(5), value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
     }));
 
     // MRR by source chart
