@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Movement & Miles</title>
+<link href="https://fonts.googleapis.com/css2?family=Urbanist:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --navy: #182241;
+    --navy-mid: #536c7c;
+    --bg: #f7f7f7;
+    --bg-warm: #faf9f5;
+    --white: #ffffff;
+    --text: #182241;
+    --muted: #536c7c;
+    --btn: #536c7c;
+    --btn-hover: #3e5460;
+    --border: #e0e0e0;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { background:var(--bg); color:var(--text); font-family:'Urbanist',sans-serif; font-weight:400; overflow-x:hidden; }
+  .site-nav {
+    position:fixed; top:0; left:0; right:0; z-index:200;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:0 40px; height:70px;
+    background:rgba(247,247,247,0.96); backdrop-filter:blur(8px);
+    border-bottom:1px solid rgba(0,0,0,0.07);
+  }
+  .nav-logo img { height:36px; display:block; cursor:pointer; }
+  .nav-links { display:flex; align-items:center; gap:28px; list-style:none; }
+  .nav-links a { text-decoration:none; color:var(--text); font-size:0.875rem; font-weight:500; cursor:pointer; transition:color .2s; padding:4px 0; border-bottom:2px solid transparent; }
+  .nav-links a:hover, .nav-links a.active { color:var(--navy-mid); border-bottom-color:var(--navy-mid); }
+  .nav-right { display:flex; align-items:center; gap:20px; }
+  .nav-cart { font-size:.875rem; color:var(--text); cursor:pointer; }
+  .nav-get-started { background:transparent; border:none; font-family:'Urbanist',sans-serif; font-size:.875rem; font-weight:600; color:var(--text); cursor:pointer; text-decoration:underline; text-underline-offset:3px; }
+  .page { display:none; padding-top:70px; }
+  .page.active { display:block; }
+  .btn-primary { display:inline-block; background:var(--btn); color:var(--white); border:none; padding:14px 40px; font-family:'Urbanist',sans-serif; font-size:.95rem; font-weight:500; cursor:pointer; border-radius:10px; transition:background .2s; text-decoration:none; }
+  .btn-primary:hover { background:var(--btn-hover); }
+  .btn-outline { display:inline-block; background:transparent; color:var(--navy); border:1px solid var(--navy); padding:10px 28px; font-family:'Urbanist',sans-serif; font-size:.85rem; font-weight:500; cursor:pointer; border-radius:8px; transition:all .2s; text-decoration:none; }
+  .btn-outline:hover { background:var(--navy); color:var(--white); }
+  .section-heading { font-family:'Urbanist',sans-serif; font-weight:400; letter-spacing:-.02em; color:var(--navy); line-height:1.1; }
+  .tag { display:inline-block; font-size:.72rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase; padding:4px 10px; border-radius:20px; }
+  .tag-beginner { background:#e8f4e8; color:#2d6a2d; }
+  .tag-intermediate { background:#fff3e0; color:#b35a00; }
+  .tag-advanced { background:#fce4e4; color:#b33030; }
+  .tag-all { background:#e8eaf6; color:#3949ab; }
+  .hero { position:relative; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; overflow:hidden; }
+  .hero-bg { position:absolute; inset:0; background-image:url('https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/3ceddfcb-dece-4f51-a40f-10a068ba815c/IMG_9439.JPG'); background-size:cover; background-position:center top; }
+  .hero-overlay { position:absolute; inset:0; background:rgba(24,34,65,.32); }
+  .hero-content { position:relative; z-index:2; display:flex; flex-direction:column; align-items:center; gap:28px; padding-bottom:200px; }
+  .hero-title { font-size:clamp(52px,7vw,76px); font-weight:400; letter-spacing:-.02em; color:#f7f7f7; line-height:1.05; }
+  .hero-phones { position:absolute; bottom:0; left:50%; transform:translateX(-50%); z-index:2; }
+  .hero-phones img { width:500px; max-width:55vw; object-fit:contain; display:block; }
+  .subscription { background:var(--bg); padding:90px 60px; }
+  .subscription-inner { display:grid; grid-template-columns:1fr 1fr; gap:80px; align-items:start; max-width:1180px; margin:0 auto; }
+  .subscription-heading { font-size:clamp(28px,3.2vw,46px); font-weight:400; letter-spacing:-.02em; color:var(--navy); margin-bottom:32px; }
+  .garmin-promo { display:flex; align-items:center; gap:18px; }
+  .garmin-logo { width:86px; height:86px; object-fit:contain; border-radius:16px; }
+  .garmin-bubble { border:1px solid var(--border); border-radius:12px; padding:14px 18px; font-size:.88rem; color:var(--muted); max-width:220px; line-height:1.5; background:var(--white); }
+  .accordion-item { border-top:1px solid var(--navy); padding:18px 0; cursor:pointer; }
+  .accordion-item:last-child { border-bottom:1px solid var(--navy); }
+  .accordion-header { display:flex; justify-content:space-between; align-items:center; }
+  .accordion-title { font-size:1.05rem; font-weight:500; color:var(--navy); }
+  .accordion-icon { font-size:1.5rem; color:var(--navy); font-weight:300; transition:transform .25s; line-height:1; }
+  .accordion-body { display:none; padding-top:12px; font-size:.9rem; color:var(--muted); line-height:1.7; }
+  .accordion-item.open .accordion-icon { transform:rotate(45deg); }
+  .accordion-item.open .accordion-body { display:block; }
+  .how-section { background:var(--navy); padding:90px 60px; color:var(--white); }
+  .how-inner { max-width:1180px; margin:0 auto; display:grid; grid-template-columns:1fr 1fr; gap:80px; align-items:center; }
+  .how-heading { font-size:clamp(28px,3vw,44px); color:var(--white); font-weight:400; letter-spacing:-.02em; margin-bottom:20px; }
+  .how-desc { font-size:.95rem; color:rgba(247,247,247,.72); line-height:1.85; margin-bottom:36px; }
+  .how-step { display:flex; align-items:flex-start; gap:16px; padding:16px 0; border-bottom:1px solid rgba(255,255,255,.13); font-size:.95rem; color:rgba(247,247,247,.85); line-height:1.6; }
+  .how-step-num { font-size:1.3rem; font-weight:300; color:rgba(255,255,255,.3); min-width:28px; flex-shrink:0; }
+  .how-cta { display:inline-block; margin-top:32px; background:var(--white); color:var(--navy); padding:14px 40px; border-radius:10px; font-family:'Urbanist',sans-serif; font-size:.95rem; font-weight:600; cursor:pointer; border:none; text-decoration:none; transition:opacity .2s; }
+  .how-cta:hover { opacity:.88; }
+  .how-app-img { width:100%; max-width:420px; object-fit:cover; border-radius:16px; display:block; margin:0 auto; aspect-ratio:3/4; object-position:top; }
+  .avg-heading-bar { background:var(--navy); padding:60px; text-align:center; }
+  .avg-heading-bar h2 { font-size:clamp(26px,4vw,52px); color:var(--white); font-weight:400; letter-spacing:-.02em; }
+  .testimonials-grid { display:grid; grid-template-columns:repeat(2,1fr); }
+  .testimonial-card { padding:48px 52px; border-right:1px solid var(--border); border-bottom:1px solid var(--border); background:var(--white); }
+  .testimonial-card:nth-child(even) { border-right:none; background:var(--bg-warm); }
+  .testimonial-text { font-size:.9rem; line-height:1.85; color:var(--text); }
+  .contact-section { background:var(--bg-warm); padding:90px 60px; }
+  .contact-inner { max-width:1100px; margin:0 auto; display:grid; grid-template-columns:1fr 1fr; gap:80px; align-items:start; }
+  .contact-heading { font-size:clamp(22px,2.8vw,38px); font-weight:400; letter-spacing:-.02em; margin-bottom:16px; }
+  .contact-sub { font-size:.92rem; color:var(--muted); line-height:1.7; }
+  .contact-form { display:flex; flex-direction:column; gap:16px; }
+  .form-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .form-field { display:flex; flex-direction:column; gap:6px; }
+  .form-field label { font-size:.76rem; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:var(--navy); }
+  .form-field input, .form-field textarea { background:var(--white); border:1px solid #ccc; padding:11px 14px; font-family:'Urbanist',sans-serif; font-size:.9rem; color:var(--text); outline:none; border-radius:4px; transition:border-color .2s; }
+  .form-field input:focus, .form-field textarea:focus { border-color:var(--navy-mid); }
+  .form-field textarea { height:100px; resize:vertical; }
+  .form-submit { background:var(--btn); color:var(--white); border:none; padding:13px 30px; font-family:'Urbanist',sans-serif; font-size:.9rem; font-weight:600; cursor:pointer; border-radius:8px; align-self:flex-start; transition:background .2s; }
+  .form-submit:hover { background:var(--btn-hover); }
+  .newsletter-section { background:var(--navy); padding:80px 60px; text-align:center; }
+  .newsletter-heading { font-size:clamp(22px,3vw,36px); color:var(--white); font-weight:400; letter-spacing:-.02em; margin-bottom:12px; }
+  .newsletter-sub { font-size:.9rem; color:rgba(247,247,247,.68); max-width:520px; margin:0 auto 32px; line-height:1.75; }
+  .newsletter-form { display:flex; max-width:400px; margin:0 auto; }
+  .newsletter-input { flex:1; background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.22); border-right:none; padding:13px 18px; color:var(--white); font-family:'Urbanist',sans-serif; font-size:.9rem; outline:none; border-radius:6px 0 0 6px; }
+  .newsletter-input::placeholder { color:rgba(247,247,247,.45); }
+  .newsletter-btn { background:var(--white); color:var(--navy); border:none; padding:13px 22px; font-family:'Urbanist',sans-serif; font-size:.9rem; font-weight:600; cursor:pointer; border-radius:0 6px 6px 0; transition:opacity .2s; }
+  .newsletter-btn:hover { opacity:.88; }
+  .page-hero { background:var(--bg); padding:60px 60px 40px; border-bottom:1px solid var(--border); }
+  .page-hero h1 { font-size:clamp(36px,5vw,68px); font-weight:400; letter-spacing:-.02em; color:rgba(24,34,65,.18); line-height:1; }
+  .program-section { padding:60px; }
+  .program-section:nth-child(even) { background:var(--bg-warm); }
+  .program-section-title { font-size:clamp(22px,2.5vw,32px); font-weight:400; letter-spacing:-.02em; color:var(--navy); margin-bottom:36px; padding-bottom:16px; border-bottom:1px solid var(--border); }
+  .program-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:24px; }
+  .program-card { background:var(--white); border:1px solid var(--border); border-radius:12px; overflow:hidden; transition:transform .2s, box-shadow .2s; }
+  .program-card:hover { transform:translateY(-4px); box-shadow:0 12px 40px rgba(0,0,0,.1); }
+  .program-card-img { width:100%; height:180px; object-fit:cover; background:#eee; display:block; }
+  .program-card-img-placeholder { width:100%; height:180px; background:linear-gradient(135deg,#e8edf2 0%,#c8d4dc 100%); display:flex; align-items:center; justify-content:center; font-size:2rem; }
+  .program-card-body { padding:20px; }
+  .program-card-title { font-size:1rem; font-weight:600; color:var(--navy); margin-bottom:10px; line-height:1.3; }
+  .program-card-meta { display:flex; flex-direction:column; gap:4px; margin-bottom:14px; }
+  .program-card-meta span { font-size:.82rem; color:var(--muted); }
+  .program-card-footer { display:flex; justify-content:space-between; align-items:center; margin-top:14px; }
+  .sign-up-banner { background:var(--navy); color:var(--white); text-align:center; padding:48px 60px; }
+  .sign-up-banner h3 { font-size:clamp(20px,2.5vw,30px); font-weight:400; margin-bottom:20px; letter-spacing:-.01em; }
+  .race-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:28px; padding:60px; max-width:1300px; margin:0 auto; }
+  .race-card { background:var(--white); border:1px solid var(--border); border-radius:12px; overflow:hidden; transition:transform .2s,box-shadow .2s; }
+  .race-card:hover { transform:translateY(-4px); box-shadow:0 12px 40px rgba(0,0,0,.1); }
+  .race-card-img { width:100%; height:200px; object-fit:cover; display:block; }
+  .race-card-body { padding:20px 22px; }
+  .race-card-title { font-size:1rem; font-weight:600; color:var(--navy); margin-bottom:12px; line-height:1.3; }
+  .race-card-detail { font-size:.83rem; color:var(--muted); line-height:1.6; margin-bottom:16px; }
+  .race-page-header { padding:50px 60px 30px; border-bottom:1px solid var(--border); }
+  .race-page-header h1 { font-size:clamp(32px,4vw,52px); font-weight:400; letter-spacing:-.02em; color:var(--navy); margin-bottom:10px; }
+  .race-page-header p { font-size:.95rem; color:var(--muted); max-width:600px; line-height:1.7; }
+  .store-header { padding:50px 60px 30px; border-bottom:1px solid var(--border); }
+  .store-header h1 { font-size:clamp(28px,4vw,48px); font-weight:400; letter-spacing:-.02em; color:var(--navy); margin-bottom:8px; }
+  .store-header p { font-size:.95rem; color:var(--muted); max-width:600px; }
+  .store-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:32px; padding:60px; max-width:1300px; margin:0 auto; }
+  .store-card { background:var(--white); border:1px solid var(--border); border-radius:12px; overflow:hidden; transition:transform .2s,box-shadow .2s; }
+  .store-card:hover { transform:translateY(-4px); box-shadow:0 12px 40px rgba(0,0,0,.1); }
+  .store-card-img { width:100%; height:280px; object-fit:cover; display:block; background:#f0f0f0; }
+  .store-card-body { padding:24px; }
+  .store-card-title { font-size:1.05rem; font-weight:600; color:var(--navy); margin-bottom:8px; }
+  .store-card-price { font-size:1.1rem; font-weight:500; color:var(--navy-mid); margin-bottom:16px; }
+  .store-card-desc { font-size:.88rem; color:var(--muted); line-height:1.7; margin-bottom:20px; }
+  .add-to-cart { width:100%; background:var(--btn); color:var(--white); border:none; padding:13px; font-family:'Urbanist',sans-serif; font-size:.9rem; font-weight:600; cursor:pointer; border-radius:8px; transition:background .2s; }
+  .add-to-cart:hover { background:var(--btn-hover); }
+  footer { background:var(--bg); border-top:1px solid var(--border); padding:32px 60px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px; }
+  .footer-copy { font-size:.8rem; color:var(--muted); }
+  .footer-links { display:flex; gap:22px; list-style:none; flex-wrap:wrap; }
+  .footer-links a { font-size:.8rem; color:var(--muted); text-decoration:none; transition:color .2s; cursor:pointer; }
+  .footer-links a:hover { color:var(--navy); }
+  #nelly-widget { position:fixed; bottom:28px; right:28px; z-index:999; display:flex; flex-direction:column; align-items:flex-end; gap:12px; }
+  #nelly-panel { display:none; flex-direction:column; width:360px; max-height:520px; background:var(--white); border:1px solid var(--border); border-radius:16px; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.15); animation:popUp .22s ease; }
+  #nelly-panel.open { display:flex; }
+  @keyframes popUp { from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)} }
+  .nelly-header { background:var(--navy); padding:15px 18px; display:flex; align-items:center; gap:12px; }
+  .nelly-avatar { width:38px; height:38px; border-radius:50%; background:var(--btn); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:1rem; color:var(--white); flex-shrink:0; }
+  .nelly-info { flex:1; }
+  .nelly-name-t { font-weight:600; font-size:.9rem; color:var(--white); }
+  .nelly-status-t { font-size:.72rem; color:rgba(247,247,247,.6); }
+  .nelly-close { background:none; border:none; color:rgba(247,247,247,.55); font-size:1.1rem; cursor:pointer; padding:4px; transition:color .2s; }
+  .nelly-close:hover { color:var(--white); }
+  #nelly-msgs { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; background:var(--bg); }
+  .nmsg { max-width:86%; padding:10px 14px; border-radius:12px; font-size:.84rem; line-height:1.6; }
+  .nmsg.bot { background:var(--white); border:1px solid var(--border); color:var(--text); align-self:flex-start; border-radius:4px 12px 12px 12px; }
+  .nmsg.user { background:var(--navy); color:var(--white); align-self:flex-end; border-radius:12px 4px 12px 12px; }
+  #nelly-typing { display:none; align-self:flex-start; background:var(--white); border:1px solid var(--border); border-radius:4px 12px 12px 12px; padding:11px 16px; gap:4px; align-items:center; }
+  #nelly-typing.show { display:flex; }
+  .tdot { width:6px; height:6px; background:var(--muted); border-radius:50%; animation:tdot 1.2s infinite; }
+  .tdot:nth-child(2){animation-delay:.18s}.tdot:nth-child(3){animation-delay:.36s}
+  @keyframes tdot{0%,60%,100%{transform:translateY(0);opacity:.35}30%{transform:translateY(-5px);opacity:1}}
+  .nelly-input-row { display:flex; gap:8px; padding:11px 13px; border-top:1px solid var(--border); background:var(--white); }
+  #nelly-input { flex:1; border:1px solid var(--border); border-radius:8px; padding:9px 12px; font-family:'Urbanist',sans-serif; font-size:.84rem; color:var(--text); outline:none; background:var(--bg); transition:border-color .2s; }
+  #nelly-input:focus { border-color:var(--navy-mid); }
+  #nelly-input::placeholder { color:var(--muted); }
+  #nelly-send { background:var(--navy); color:var(--white); border:none; border-radius:8px; padding:9px 14px; font-size:.85rem; cursor:pointer; transition:background .2s; }
+  #nelly-send:hover { background:var(--btn-hover); }
+  .nelly-powered { text-align:center; font-size:.65rem; color:var(--muted); padding:6px; background:var(--white); letter-spacing:.04em; }
+  #nelly-bubble { width:60px; height:60px; background:var(--btn); border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 6px 24px rgba(83,108,124,.45); transition:transform .2s,box-shadow .2s; position:relative; font-weight:700; font-size:.78rem; color:var(--white); letter-spacing:.01em; text-align:center; line-height:1.2; }
+  #nelly-bubble:hover { transform:scale(1.07); box-shadow:0 10px 32px rgba(83,108,124,.6); }
+  .bubble-ping { position:absolute; top:2px; right:2px; width:13px; height:13px; background:#e05a3a; border-radius:50%; border:2px solid var(--white); animation:bping 2.5s ease-in-out infinite; }
+  @keyframes bping{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(1.2)}}
+  .fade-in { opacity:0; transform:translateY(20px); transition:opacity .55s ease,transform .55s ease; }
+  .fade-in.visible { opacity:1; transform:translateY(0); }
+  .nelly-buttons { display:flex; flex-wrap:wrap; gap:6px; align-self:flex-start; max-width:90%; margin-top:2px; }
+  .nelly-qr { background:var(--white); border:1.5px solid var(--navy); color:var(--navy); padding:7px 14px; border-radius:18px; font-family:"Urbanist",sans-serif; font-size:.78rem; font-weight:600; cursor:pointer; transition:all .2s; line-height:1.3; }
+  .nelly-qr:hover { background:var(--navy); color:var(--white); transform:translateY(-1px); }
+  .nelly-link { color:var(--navy-mid); font-weight:600; text-decoration:underline; text-underline-offset:2px; cursor:pointer; transition:color .2s; }
+  .nelly-link:hover { color:var(--navy); }
+</style>
+</head>
+<body>
+
+<nav class="site-nav">
+  <a class="nav-logo" onclick="showPage('home')">
+    <img src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/9419ffc3-05b5-47a3-9911-0bc1ba1a990b/MovementMiles_Logo-02.png?format=300w" alt="Movement & Miles" />
+  </a>
+  <ul class="nav-links">
+    <li><a onclick="showPage('home')" data-page="home">About Meg</a></li>
+    <li><a onclick="showPage('training')" data-page="training">Training Programs</a></li>
+    <li><a onclick="showPage('race')" data-page="race">Race Plans</a></li>
+    <li><a onclick="showPage('store')" data-page="store">Store</a></li>
+    <li><a onclick="showPage('home')" data-page="contact">Contact</a></li>
+  </ul>
+  <div class="nav-right">
+    <span class="nav-cart">🛒 0</span>
+    <button class="nav-get-started">Get Started</button>
+  </div>
+</nav>
+
+<div id="page-home" class="page active">
+  <section class="hero">
+    <div class="hero-bg"></div>
+    <div class="hero-overlay"></div>
+    <div class="hero-content">
+      <h1 class="hero-title">Move. Run. Live.</h1>
+      <button class="btn-primary" style="padding:16px 52px">Start Your Free Trial</button>
+    </div>
+    <div class="hero-phones">
+      <img src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/c72e8684-9bad-454f-a4fd-4c4e3dc9f01f/Group_images.png" alt="App Screenshots" />
+    </div>
+  </section>
+
+  <section class="subscription fade-in">
+    <div class="subscription-inner">
+      <div>
+        <h2 class="subscription-heading">Included in Your Subscription</h2>
+        <div class="garmin-promo">
+          <img class="garmin-logo" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/d3888f0f-c97f-4852-8d72-7172acf5c98e/Garmin_Connect_app_1024x1024-02.png" alt="Garmin" />
+          <div class="garmin-bubble">If you're a Garmin User, connect your training plans directly to your Garmin!</div>
+        </div>
+      </div>
+      <div>
+        <div class="accordion-item open"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Monthly Training Programs</span><span class="accordion-icon">+</span></div><div class="accordion-body">Monthly running programs to incorporate running, strength training, mobility, AND prehab.</div></div>
+        <div class="accordion-item"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Race Plans</span><span class="accordion-icon">+</span></div><div class="accordion-body">Beginner – Advanced Plans: 5k, 10k, Half Marathon, Marathon, 50k — built for every level.</div></div>
+        <div class="accordion-item"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Mobility Training</span><span class="accordion-icon">+</span></div><div class="accordion-body">Mobility workouts and programs to improve your movement capacity, joint strength, and prevent injuries.</div></div>
+        <div class="accordion-item"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Strength Training</span><span class="accordion-icon">+</span></div><div class="accordion-body">Video AND voice-guided workouts for beginner – advanced athletes.</div></div>
+        <div class="accordion-item"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Nutrition</span><span class="accordion-icon">+</span></div><div class="accordion-body">Choose a plan based on your goal: endurance, strength training, or weight loss.</div></div>
+        <div class="accordion-item"><div class="accordion-header" onclick="toggleAcc(this)"><span class="accordion-title">Community</span><span class="accordion-icon">+</span></div><div class="accordion-body">Join the Movement & Miles Community on Facebook. Exclusive offers, tips, and motivation.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="how-section fade-in">
+    <div class="how-inner">
+      <div>
+        <h2 class="how-heading">How it Works:</h2>
+        <p class="how-desc">M/M is one of the only running apps with a completely holistic, and customized approach to training: running, prehab, mobility, and strength training.<br><br>No PDF's or AI-generated programs.<br><br>Just REAL one on one coaching for any athlete, at any level.</p>
+        <div>
+          <div class="how-step"><span class="how-step-num">1)</span><span>Download &amp; Create an Account<br><small style="opacity:.55">(Apple Store &amp; Google Play store)</small></span></div>
+          <div class="how-step"><span class="how-step-num">2)</span><span>Choose Your Training Plan, Workout for the Day, or even get Nutrition inspo</span></div>
+          <div class="how-step"><span class="how-step-num">3)</span><span>Train Anywhere, Anytime<br><small style="opacity:.55">(On demand, downloadable workouts.)</small></span></div>
+        </div>
+        <a class="how-cta">Get Started!</a>
+      </div>
+      <div style="display:flex;justify-content:center">
+        <img class="how-app-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/6548950d-9d8b-4be9-bbf6-6ac7c487a367/pexels-goumbik-669584.jpg" alt="Runner" />
+      </div>
+    </div>
+  </section>
+
+  <div class="fade-in">
+    <div class="avg-heading-bar"><h2>Not Your "Average" Running App</h2></div>
+    <div class="testimonials-grid">
+      <div class="testimonial-card"><p class="testimonial-text">"The biggest benefit from this app for me has been training smarter as I get older. I played sports in high school, so I ran and lifted to be better on the court... I've tried a few other apps; this is by far the best platform for ease of use. Keep up the good work!"</p></div>
+      <div class="testimonial-card"><p class="testimonial-text">"So I have to message you because I am still just vibrating from how excited I am. I downloaded your app today, scrolled through all of the amazing programs and picked one to start. I went for one of your guided runs and I just LOVED it. I am so excited to do this program and then start the half program. There is such a need out there for programming for women that also include strength and I think you've nailed it."</p></div>
+      <div class="testimonial-card"><p class="testimonial-text">"I just wanted to say; I love your app/program - prehab for runners! such a great idea and easy to follow along 😄"</p></div>
+      <div class="testimonial-card"><p class="testimonial-text">"Your shin splint prevention/ankle strength exercises are saving my life right now. I have my first ever marathon coming up in December and I'm recovering from a bone spur removal surgery on my right foot. I've been following your app's plans for over a year now and I can say confidently they are the reason I'm coming back from surgery so quickly. 🙏"</p></div>
+    </div>
+  </div>
+
+  <section class="contact-section fade-in">
+    <div class="contact-inner">
+      <div>
+        <h2 class="contact-heading">Not Sure Which Plan is Right for You? Let's Chat.</h2>
+        <p class="contact-sub">It all begins with some guidance. If you're looking for a little extra spark, motivation, or clarity on what it is you need to achieve your next goal:</p>
+      </div>
+      <div class="contact-form">
+        <div class="form-row">
+          <div class="form-field"><label>First Name <span style="color:#999;font-size:.7rem;text-transform:none">(required)</span></label><input type="text" /></div>
+          <div class="form-field"><label>Last Name <span style="color:#999;font-size:.7rem;text-transform:none">(required)</span></label><input type="text" /></div>
+        </div>
+        <div class="form-field"><label>Email <span style="color:#999;font-size:.7rem;text-transform:none">(required)</span></label><input type="email" /></div>
+        <div class="form-field"><label>Message <span style="color:#999;font-size:.7rem;text-transform:none">(required)</span></label><textarea></textarea></div>
+        <button class="form-submit">Send</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="newsletter-section fade-in">
+    <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
+    <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies to help you run stronger, recover faster, and stay injury-free.</p>
+    <div class="newsletter-form">
+      <input class="newsletter-input" type="email" placeholder="Email Address" />
+      <button class="newsletter-btn">Sign Up</button>
+    </div>
+  </section>
+
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement & Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li><li><a>Accessibility statement</a></li>
+      <li><a onclick="showPage('training')">Training Programs</a></li><li><a>Manage Subscription</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="page-training" class="page">
+  <div class="page-hero">
+    <h1>Monthly Training<br>Programs:</h1>
+  </div>
+  <div class="program-section">
+    <h2 class="program-section-title">Running Programs:</h2>
+    <div class="program-grid">
+      <div class="program-card"><img class="program-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/fbf798a2-5b50-43bb-a1cc-5d69579c16c2/pexels-cottonbro-4753884.jpg" alt="Walk to Run" /><div class="program-card-body"><div class="program-card-title">Walk to Run: A Beginner's Guide to Starting Your Fitness Journey</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 3 weeks</span><span>4 run/walk, 1 mobility, 2 strength workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><img class="program-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/15e0db8f-33c4-4a58-b325-aed10e9d6c54/pexels-magda-ehlers-pexels-4065511.jpg" alt="Walk to Run Part 2" /><div class="program-card-body"><div class="program-card-title">Walk to Run: Part 2</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 6 weeks</span><span>4 run/walk, 1 mobility, 2 strength workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🏃‍♀️</div><div class="program-card-body"><div class="program-card-title">Miles + Bodyweight Strength</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 8 weeks</span><span>4–5 runs, 1–2 mobility, 2 bodyweight strength/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">💪</div><div class="program-card-body"><div class="program-card-title">Beginners: Total Package</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 8 weeks</span><span>4–5 runs, 1 mobility, 2 strength workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🏅</div><div class="program-card-body"><div class="program-card-title">Building Endurance & Strength</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 6 weeks</span><span>4 runs, 1 mobility, 2 strength workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">⚡</div><div class="program-card-body"><div class="program-card-title">Strides + Calisthenics</div><div class="program-card-meta"><span><span class="tag tag-intermediate">Intermediate</span></span><span>⏱ 6 weeks</span><span>4 runs, 2 bodyweight strength, 1–2 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🌿</div><div class="program-card-body"><div class="program-card-title">Outdoor Miles + Weights</div><div class="program-card-meta"><span><span class="tag tag-intermediate">Intermediate</span></span><span>⏱ 4 weeks</span><span>4 runs, 2 strength, 1–2 mobility workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🔥</div><div class="program-card-body"><div class="program-card-title">Endurance & Strength</div><div class="program-card-meta"><span><span class="tag tag-intermediate">Intermediate</span></span><span>⏱ 8 weeks</span><span>5 runs, 2 strength, 1–2 mobility workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🎯</div><div class="program-card-body"><div class="program-card-title">Run + Lift</div><div class="program-card-meta"><span><span class="tag tag-advanced">Advanced</span></span><span>⏱ 6 weeks</span><span>3 runs, 3 strength, 1–2 mobility workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🚀</div><div class="program-card-body"><div class="program-card-title">Endurance, Speed, and Strength</div><div class="program-card-meta"><span><span class="tag tag-advanced">Advanced</span></span><span>⏱ 6 weeks</span><span>2 speed, 2 endurance, 2 strength, 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🏆</div><div class="program-card-body"><div class="program-card-title">Peak Endurance & Power</div><div class="program-card-meta"><span><span class="tag tag-advanced">Advanced</span></span><span>⏱ 6 weeks</span><span>5 runs, 2 strength, 1–2 mobility workouts/week</span></div><button class="btn-outline">Learn More</button></div></div>
+    </div>
+  </div>
+  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary">Get Started</button></div>
+  <div class="program-section">
+    <h2 class="program-section-title">Strength Training Programs:</h2>
+    <div class="program-grid">
+      <div class="program-card"><div class="program-card-img-placeholder">💪</div><div class="program-card-body"><div class="program-card-title">Bodyweight & Bands</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 4 weeks</span><span>3 bodyweight strength + 2 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🏋️</div><div class="program-card-body"><div class="program-card-title">Strength Starts Here!</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 2 weeks</span><span>3 strength + 2 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">⚙️</div><div class="program-card-body"><div class="program-card-title">Pure Strength</div><div class="program-card-meta"><span><span class="tag tag-beginner">Beginner</span></span><span>⏱ 6 weeks</span><span>3 strength + 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🔩</div><div class="program-card-body"><div class="program-card-title">Stronger Strides</div><div class="program-card-meta"><span><span class="tag tag-intermediate">Intermediate</span></span><span>⏱ 6 weeks</span><span>2 strength + 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🏅</div><div class="program-card-body"><div class="program-card-title">Total Body Power</div><div class="program-card-meta"><span><span class="tag tag-intermediate">Intermediate</span></span><span>⏱ 6 weeks</span><span>4 strength + 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🔱</div><div class="program-card-body"><div class="program-card-title">Total Power & Strength</div><div class="program-card-meta"><span><span class="tag tag-advanced">Advanced</span></span><span>⏱ 6 weeks</span><span>3 strength + 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+    </div>
+  </div>
+  <div class="program-section" style="background:var(--bg-warm)">
+    <h2 class="program-section-title">Mobility & Prehab Programs:</h2>
+    <div class="program-grid">
+      <div class="program-card"><div class="program-card-img-placeholder">🧘</div><div class="program-card-body"><div class="program-card-title">Prehab: Knee/ITBS + Mobility</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>⏱ 4 weeks</span><span>2 mobility + 2 prehab/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🌀</div><div class="program-card-body"><div class="program-card-title">Mobility Master</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>⏱ 4 weeks</span><span>3 mobility + flexibility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🦵</div><div class="program-card-body"><div class="program-card-title">Trail/Road Running Prehab Essentials</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>⏱ 6 weeks</span><span>2 strength/prehab + 1 mobility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🦶</div><div class="program-card-body"><div class="program-card-title">Ankle, Foot, and Calf Strength</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>📚 10 modules</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">🩹</div><div class="program-card-body"><div class="program-card-title">ITBS/Knee Pain Workout Collection</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>📚 10 modules</span></div><button class="btn-outline">Learn More</button></div></div>
+      <div class="program-card"><div class="program-card-img-placeholder">✨</div><div class="program-card-body"><div class="program-card-title">The Ultimate Mobility Plan</div><div class="program-card-meta"><span><span class="tag tag-all">All Levels</span></span><span>⏱ 4 weeks</span><span>3 mobility + flexibility/week</span></div><button class="btn-outline">Learn More</button></div></div>
+    </div>
+  </div>
+  <div class="sign-up-banner"><h3>Sign Up For Your Free Month</h3><button class="btn-primary">Get Started</button></div>
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement & Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li>
+      <li><a onclick="showPage('home')">Home</a></li>
+      <li><a onclick="showPage('race')">Race Plans</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="page-race" class="page">
+  <div class="race-page-header">
+    <h1>Race Programs</h1>
+    <p>Beginner to advanced race plans for 5K, 10K, Half Marathon, Full Marathon, and 50K — each combining running, strength training, and mobility.</p>
+  </div>
+  <div class="race-grid">
+    <div class="race-card"><img class="race-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/5b0c54e8-42fd-4b33-bf2b-bc72c55dd06a/pexels-zeal-creative-studios-58866141-34043592.jpg" alt="5K Treadmill" /><div class="race-card-body"><div class="race-card-title">8-Week Beginner 5K Running Plan for Treadmill & Outdoor</div><div><span class="tag tag-beginner">Beginner</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 8 weeks · Treadmill & outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><img class="race-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/7dfcd387-1df0-4ec0-bb35-b181e6cdbc18/app+pics+17.jpg" alt="5K Outdoor" /><div class="race-card-body"><div class="race-card-title">Beginner 5k Plan (Outdoor)</div><div><span class="tag tag-beginner">Beginner</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 8 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><img class="race-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/eebdca4d-cee6-4b56-a210-092ad12ee4b4/pexels-mehedi-hasan-214983325-30704307.jpg" alt="10K Beginner" /><div class="race-card-body"><div class="race-card-title">Beginner 10k Plan</div><div><span class="tag tag-beginner">Beginner</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 8 weeks · Outdoor & treadmill, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><img class="race-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/79e9f849-1cb9-4a89-80c7-5be5b1e531e0/pexels-bohlemedia-2803158.jpg" alt="Half Marathon Beginner" /><div class="race-card-body"><div class="race-card-title">Beginner Half Marathon Plan</div><div><span class="tag tag-beginner">Beginner</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 20 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><img class="race-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/cfd5946f-d3d6-4818-b306-e6ac13138b1c/pexels-cottonbro-5319375.jpg" alt="Marathon Beginner" /><div class="race-card-body"><div class="race-card-title">Beginner Marathon Plan</div><div><span class="tag tag-beginner">Beginner</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 20 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🏃</div><div class="race-card-body"><div class="race-card-title">Intermediate 5k Plan (Outdoor)</div><div><span class="tag tag-intermediate">Intermediate</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 8 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">⚡</div><div class="race-card-body"><div class="race-card-title">Intermediate Half Marathon Plan (Outdoor)</div><div><span class="tag tag-intermediate">Intermediate</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 10 weeks · ~15 mi/week base required</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🏆</div><div class="race-card-body"><div class="race-card-title">Advanced Half Marathon</div><div><span class="tag tag-advanced">Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 12 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🌄</div><div class="race-card-body"><div class="race-card-title">Tread/Out Marathon Plan</div><div><span class="tag tag-intermediate">Intermediate – Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 16 weeks · Treadmill & outdoor, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🦅</div><div class="race-card-body"><div class="race-card-title">50k Race Plan</div><div><span class="tag tag-intermediate">Intermediate – Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 16 weeks · Experience in marathons or 25+ mi/week required</div><button class="btn-outline">Learn More</button></div></div>
+    <div class="race-card"><div style="width:100%;height:200px;background:linear-gradient(135deg,#e8edf2,#c8d4dc);display:flex;align-items:center;justify-content:center;font-size:3rem">🎯</div><div class="race-card-body"><div class="race-card-title">7 Weeks To 10 Miles Plan</div><div><span class="tag tag-advanced">Advanced</span></div><div class="race-card-detail" style="margin-top:10px">⏱ 7 weeks · Outdoor running, strength & mobility</div><button class="btn-outline">Learn More</button></div></div>
+  </div>
+  <div class="sign-up-banner"><h3>Sign Up for your free month</h3><button class="btn-primary">Get Started</button></div>
+  <section class="newsletter-section">
+    <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
+    <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies delivered to your inbox.</p>
+    <div class="newsletter-form"><input class="newsletter-input" type="email" placeholder="Email Address" /><button class="newsletter-btn">Sign Up</button></div>
+  </section>
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement & Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li>
+      <li><a onclick="showPage('home')">Home</a></li>
+      <li><a onclick="showPage('training')">Training Programs</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="page-store" class="page">
+  <div class="store-header">
+    <h1>Explore Our Fitness Store</h1>
+    <p>Training accessories and recovery products designed to support your M&M journey.</p>
+  </div>
+  <div class="store-grid">
+    <div class="store-card">
+      <img class="store-card-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/089c64be-8080-4f7b-82fc-802ce74d281f/Movement+%26+Miles+%284%29.png" alt="M/M Bands Kit" />
+      <div class="store-card-body">
+        <div class="store-card-title">M/M Bands Kit</div>
+        <div class="store-card-price">$14.99</div>
+        <div class="store-card-desc">The official Movement & Miles resistance bands kit. Four resistance levels (Light, Moderate, Heavy, X-Heavy) to support your strength training and prehab workouts inside the app.</div>
+        <button class="add-to-cart">Add to Cart</button>
+      </div>
+    </div>
+  </div>
+  <section class="newsletter-section" style="margin-top:60px">
+    <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
+    <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies delivered to your inbox.</p>
+    <div class="newsletter-form"><input class="newsletter-input" type="email" placeholder="Email Address" /><button class="newsletter-btn">Sign Up</button></div>
+  </section>
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement & Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li>
+      <li><a onclick="showPage('home')">Home</a></li>
+      <li><a onclick="showPage('training')">Training Programs</a></li>
+      <li><a onclick="showPage('race')">Race Plans</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="nelly-widget">
+  <div id="nelly-panel">
+    <div class="nelly-header">
+      <div class="nelly-avatar">N</div>
+      <div class="nelly-info">
+        <div class="nelly-name-t">Nelly</div>
+        <div class="nelly-status-t">● Your M&M Coaching Assistant</div>
+      </div>
+      <button class="nelly-close" onclick="toggleNelly()">✕</button>
+    </div>
+    <div id="nelly-msgs">
+      <div class="nmsg bot">Hey there! I'm Nelly, your Movement & Miles coaching assistant. I can help you find the right training plan for your goals or answer any questions about the app. What can I help you with?</div>
+    </div>
+    <div id="nelly-typing">
+      <div class="tdot"></div><div class="tdot"></div><div class="tdot"></div>
+    </div>
+    <div class="nelly-input-row">
+      <input id="nelly-input" placeholder="Ask me anything..." onkeydown="if(event.key==='Enter')sendMsg()" />
+      <button id="nelly-send" onclick="sendMsg()">→</button>
+    </div>
+    <div class="nelly-powered">Powered by Claude AI</div>
+  </div>
+  <div id="nelly-bubble" onclick="toggleNelly()">Nelly<div class="bubble-ping"></div></div>
+</div>
+
+<script>
+  function showPage(name) {
+    document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+    document.querySelectorAll('.nav-links a').forEach(function(a) { a.classList.remove('active'); });
+    document.getElementById('page-' + name).classList.add('active');
+    var link = document.querySelector('.nav-links a[data-page="' + name + '"]');
+    if (link) link.classList.add('active');
+    window.scrollTo(0, 0);
+    initFadeIns();
+  }
+
+  function toggleAcc(header) {
+    var item = header.parentElement;
+    var wasOpen = item.classList.contains('open');
+    document.querySelectorAll('.accordion-item').forEach(function(i) { i.classList.remove('open'); });
+    if (!wasOpen) item.classList.add('open');
+  }
+
+  function toggleNelly() {
+    document.getElementById('nelly-panel').classList.toggle('open');
+    document.querySelector('.bubble-ping').style.display = 'none';
+  }
+
+  var NELLY_API = '/api/chat';
+  var nellyHistory = [];
+
+  var pageMap = {
+    'training programs': 'training',
+    'training': 'training',
+    'race plans': 'race',
+    'race': 'race',
+    'store': 'store',
+    'home': 'home'
+  };
+
+  function renderBotText(text, container) {
+    var parts = text.split(/\[\[page:([^\]]+)\]\]/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) container.appendChild(document.createTextNode(parts[i]));
+      } else {
+        var pageName = parts[i];
+        var pageKey = pageMap[pageName.toLowerCase()] || 'home';
+        var a = document.createElement('a');
+        a.textContent = pageName;
+        a.href = '#';
+        a.className = 'nelly-link';
+        a.setAttribute('data-page', pageKey);
+        a.onclick = function(e) {
+          e.preventDefault();
+          var pg = this.getAttribute('data-page');
+          toggleNelly();
+          showPage(pg);
+        };
+        container.appendChild(a);
+      }
+    }
+  }
+
+  function parseButtons(text) {
+    var match = text.match(/\[([^\]]+)\]\s*$/);
+    if (!match) return { text: text, buttons: [] };
+    var cleanText = text.replace(/\[([^\]]+)\]\s*$/, '').trim();
+    var inner = match[1];
+    if (inner.indexOf('|') === -1) return { text: text, buttons: [] };
+    var buttons = inner.split('|').map(function(b) { return b.trim(); });
+    return { text: cleanText, buttons: buttons };
+  }
+
+  function addBotMessage(text) {
+    var msgs = document.getElementById('nelly-msgs');
+    var parsed = parseButtons(text);
+    var b = document.createElement('div');
+    b.className = 'nmsg bot';
+    renderBotText(parsed.text, b);
+    msgs.appendChild(b);
+    if (parsed.buttons.length > 0) {
+      var btnRow = document.createElement('div');
+      btnRow.className = 'nelly-buttons';
+      parsed.buttons.forEach(function(label) {
+        var btn = document.createElement('button');
+        btn.className = 'nelly-qr';
+        btn.textContent = label;
+        btn.onclick = function() {
+          btnRow.remove();
+          sendMsgText(label);
+        };
+        btnRow.appendChild(btn);
+      });
+      msgs.appendChild(btnRow);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function sendMsgText(text) {
+    var msgs = document.getElementById('nelly-msgs');
+    var typing = document.getElementById('nelly-typing');
+    var u = document.createElement('div');
+    u.className = 'nmsg user';
+    u.textContent = text;
+    msgs.appendChild(u);
+    msgs.scrollTop = msgs.scrollHeight;
+    nellyHistory.push({ role: 'user', content: text });
+    typing.classList.add('show');
+    msgs.scrollTop = msgs.scrollHeight;
+    fetch(NELLY_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: nellyHistory.slice(0, -1) })
+    }).then(function(res) {
+      typing.classList.remove('show');
+      if (!res.ok) throw new Error('Server error: ' + res.status);
+      return res.json();
+    }).then(function(data) {
+      var reply = data.reply || "Sorry, couldn't connect right now. Try again!";
+      nellyHistory.push({ role: 'assistant', content: reply });
+      addBotMessage(reply);
+    }).catch(function(err) {
+      typing.classList.remove('show');
+      var b = document.createElement('div');
+      b.className = 'nmsg bot';
+      b.textContent = 'Having trouble connecting right now. Try again in a moment!';
+      msgs.appendChild(b);
+      msgs.scrollTop = msgs.scrollHeight;
+      console.error('Nelly error:', err);
+    });
+  }
+
+  function sendMsg() {
+    var input = document.getElementById('nelly-input');
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sendMsgText(text);
+  }
+
+  function initFadeIns() {
+    var obs = new IntersectionObserver(function(entries) {
+      entries.forEach(function(e) { if (e.isIntersecting) e.target.classList.add('visible'); });
+    }, { threshold: 0.08 });
+    document.querySelectorAll('.page.active .fade-in:not(.visible)').forEach(function(el) { obs.observe(el); });
+  }
+  initFadeIns();
+</script>
+</body>
+</html>
