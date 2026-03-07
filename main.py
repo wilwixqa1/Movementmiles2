@@ -1,12 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from typing import Optional
 import httpx
 import os
-import json
-from datetime import datetime
+import asyncpg
+import io
+import csv
+from datetime import datetime, timezone
 
 app = FastAPI(title="Movement & Miles")
 
@@ -19,6 +22,94 @@ app.add_middleware(
 )
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "mmadmin2026")
+
+# --- Database ---
+
+db_pool = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    if DATABASE_URL:
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS leads (
+                        id SERIAL PRIMARY KEY,
+                        first_name TEXT,
+                        email TEXT,
+                        experience_level TEXT,
+                        goals TEXT,
+                        referral_source TEXT,
+                        recommended_plan TEXT,
+                        extra TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS page_views (
+                        id SERIAL PRIMARY KEY,
+                        page TEXT NOT NULL,
+                        path TEXT,
+                        referrer TEXT,
+                        user_agent TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_sessions (
+                        id SERIAL PRIMARY KEY,
+                        session_type TEXT NOT NULL,
+                        message_count INTEGER DEFAULT 1,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+            print("Database connected and tables ready")
+        except Exception as e:
+            print(f"Database connection failed: {e}")
+            db_pool = None
+    else:
+        print("No DATABASE_URL set — running without database")
+
+@app.on_event("shutdown")
+async def shutdown():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+
+# --- Helpers ---
+
+def check_admin(password: str):
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+
+
+async def call_anthropic(system_prompt: str, messages: list) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 800,
+                "system": system_prompt,
+                "messages": messages,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"]
+
+
+# --- System Prompts ---
 
 NELLY_SYSTEM_PROMPT = """You are Nelly, the AI coaching assistant for Movement & Miles (M&M), a holistic running and fitness app created by coach Meg.
 
@@ -137,50 +228,45 @@ FINAL RECOMMENDATIONS: Always present exactly 3 options, each with a one-sentenc
 Remember: be conversational, one question at a time, short responses, use buttons for choices."""
 
 
-ONBOARD_SYSTEM_PROMPT = """You are Nelly, the onboarding assistant for Movement & Miles (M&M). You're helping a new user get started with a personalized plan recommendation.
+ONBOARD_SYSTEM_PROMPT = """You are Nelly, the onboarding assistant for Movement & Miles (M&M), a holistic running and fitness app created by coach Meg.
 
-PERSONALITY: Warm, brief, encouraging. Keep responses to 1-3 sentences max. You're having a quick, friendly chat.
+PERSONALITY: Warm, encouraging, brief. Keep every reply to 1-3 sentences. You are guiding them through sign-up.
 
-YOUR GOAL: Collect the user's info step by step, then recommend a plan and emit a lead tag.
+CONVERSATION FLOW — collect these ONE AT A TIME:
+1. Greet warmly. Ask their first name.
+2. Ask for their email address.
+3. Ask about their fitness goals.
+[Run more | Get stronger | Train for a race | Injury recovery | General fitness]
+4. Ask about experience level.
+[Beginner | Intermediate | Advanced]
+5. Ask about equipment access.
+[Bodyweight only | Dumbbells/kettlebells | Full gym setup]
+6. Ask how they heard about M&M.
+[Instagram | TikTok | Friend/referral | Google search | Other]
 
-CONVERSATION FLOW (ask ONE thing at a time, in this order):
-1. Their first name (the first message already asked this, so their reply will be their name)
-2. Their email address — say something like "Great to meet you, [name]! What's your email so we can set up your free trial?"
-3. Their fitness goals — use buttons: [Running + strength | Strength only | Train for a race | Mobility & injury prevention]
-4. Their experience level — use buttons: [Beginner | Intermediate | Advanced | Not sure]
-5. What equipment they have access to — use buttons: [Bodyweight only | Dumbbells/kettlebells | Full gym with barbell]
-6. How they heard about M&M — use buttons: [Social media | Friend/word of mouth | Google search | Other]
+After collecting all info, recommend ONE plan based on their answers. Use the same program names from the catalog. Then emit the lead tag on its own line at the very end of your message:
 
-After collecting all info, give a brief recommendation (1-2 sentences) and then emit the lead data tag.
+[[LEAD:{"first_name":"NAME","email":"EMAIL","experience_level":"LEVEL","goals":"GOALS","referral_source":"SOURCE","recommended_plan":"PLAN"}]]
 
-BUTTON FORMAT: End your message with options on a new line:
+BUTTON FORMAT: End messages with options when applicable:
 [Option A | Option B | Option C]
 
-CRITICAL — LEAD TAG: After your final recommendation, you MUST include this tag at the very end of your message (the frontend will parse and remove it):
-[[LEAD:{"first_name":"NAME","email":"EMAIL","experience_level":"LEVEL","goals":"GOALS","referral_source":"SOURCE","recommended_plan":"PLAN_NAME"}]]
+RULES:
+- ONE question per message
+- Never skip a step
+- Keep it conversational and warm
+- The lead tag must be valid JSON inside [[LEAD:...]]
+- After emitting lead tag, say something encouraging about getting started"""
 
-PROGRAM KNOWLEDGE (simplified):
-Beginner + bodyweight: Walk to Run Part 1, Miles + Bodyweight Strength, Bodyweight & Bands
-Beginner + weights: Walk to Run Part 2, Building Endurance & Strength, Strength Starts Here
-Intermediate + bodyweight: Strides + Calisthenics
-Intermediate + weights: Outdoor Miles + Weights, Stronger Strides, Total Body Power
-Advanced: Run + Lift, Peak Endurance & Power, Total Power & Strength
-Mobility/Prehab (any level): Prehab: Knee/ITBS + Mobility, Mobility Master, The Ultimate Mobility Plan
-Race training: mention we have 5K through 50K plans for all levels
 
-Pick the best fit based on their goals, level, and equipment. Always recommend a real program name from the list above.
-
-Remember: ONE question at a time, keep it brief and warm, use buttons for choices."""
-
+# --- Models ---
 
 class ChatRequest(BaseModel):
     message: str
     history: list = []
 
-
 class ChatResponse(BaseModel):
     reply: str
-
 
 class LeadData(BaseModel):
     first_name: str = ""
@@ -191,48 +277,13 @@ class LeadData(BaseModel):
     recommended_plan: str = ""
     extra: str = ""
 
-
-LEADS_FILE = "leads.json"
-
-
-def load_leads():
-    if os.path.exists(LEADS_FILE):
-        with open(LEADS_FILE, "r") as f:
-            return json.load(f)
-    return []
+class PageViewData(BaseModel):
+    page: str
+    path: str = ""
+    referrer: str = ""
 
 
-def save_lead(lead_dict):
-    leads = load_leads()
-    lead_dict["timestamp"] = datetime.utcnow().isoformat()
-    leads.append(lead_dict)
-    with open(LEADS_FILE, "w") as f:
-        json.dump(leads, f, indent=2)
-
-
-# --- API Routes (defined BEFORE static mount so they take priority) ---
-
-async def call_anthropic(system_prompt: str, messages: list) -> str:
-    """Shared helper to call the Anthropic API."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 800,
-                "system": system_prompt,
-                "messages": messages,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["content"][0]["text"]
-
+# --- API Routes (defined BEFORE static mount) ---
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -246,6 +297,16 @@ async def chat(req: ChatRequest):
         if msg.get("role") in ("user", "assistant") and msg.get("content"):
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": req.message})
+
+    # Track chat session
+    if db_pool and len(messages) == 1:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO chat_sessions (session_type) VALUES ($1)", "widget"
+                )
+        except Exception:
+            pass
 
     try:
         reply_text = await call_anthropic(NELLY_SYSTEM_PROMPT, messages)
@@ -269,6 +330,16 @@ async def onboard_chat(req: ChatRequest):
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": req.message})
 
+    # Track chat session
+    if db_pool and len(messages) == 1:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO chat_sessions (session_type) VALUES ($1)", "onboard"
+                )
+        except Exception:
+            pass
+
     try:
         reply_text = await call_anthropic(ONBOARD_SYSTEM_PROMPT, messages)
         return ChatResponse(reply=reply_text)
@@ -279,22 +350,161 @@ async def onboard_chat(req: ChatRequest):
 
 
 @app.post("/api/lead")
-async def save_lead_endpoint(lead: LeadData):
+async def save_lead(lead: LeadData):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    lead.first_name, lead.email, lead.experience_level,
+                    lead.goals, lead.referral_source, lead.recommended_plan, lead.extra
+                )
+            return {"status": "saved", "storage": "postgres"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    else:
+        # Fallback to JSON file
+        import json
+        leads = []
+        try:
+            with open("leads.json", "r") as f:
+                leads = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            leads = []
+        lead_dict = lead.dict()
+        lead_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
+        leads.append(lead_dict)
+        with open("leads.json", "w") as f:
+            json.dump(leads, f, indent=2)
+        return {"status": "saved", "storage": "json"}
+
+
+@app.post("/api/page-view")
+async def track_page_view(pv: PageViewData, request: Request):
+    if not db_pool:
+        return {"status": "skipped", "reason": "no database"}
     try:
-        save_lead(lead.model_dump())
-        return {"status": "ok"}
+        ua = request.headers.get("user-agent", "")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO page_views (page, path, referrer, user_agent)
+                   VALUES ($1, $2, $3, $4)""",
+                pv.page, pv.path, pv.referrer, ua
+            )
+        return {"status": "tracked"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/leads")
-async def get_leads():
-    return load_leads()
+        return {"status": "error", "detail": str(e)}
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "Movement & Miles", "version": "5.0"}
+    db_status = "connected" if db_pool else "not connected"
+    return {"status": "ok", "service": "Movement & Miles", "version": "6.0", "database": db_status}
+
+
+# --- Admin API ---
+
+@app.post("/api/admin/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    pw = body.get("password", "")
+    if pw != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(x_admin_password: Optional[str] = Header(None)):
+    check_admin(x_admin_password or "")
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db_pool.acquire() as conn:
+        # Leads
+        total_leads = await conn.fetchval("SELECT COUNT(*) FROM leads")
+        recent_leads = await conn.fetch(
+            """SELECT id, first_name, email, experience_level, goals,
+                      recommended_plan, referral_source, created_at
+               FROM leads ORDER BY created_at DESC LIMIT 50"""
+        )
+
+        # Page views — today and total
+        total_views = await conn.fetchval("SELECT COUNT(*) FROM page_views")
+        today_views = await conn.fetchval(
+            "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
+        )
+
+        # Page views by page (last 7 days)
+        views_by_page = await conn.fetch(
+            """SELECT page, COUNT(*) as views
+               FROM page_views
+               WHERE created_at > NOW() - INTERVAL '7 days'
+               GROUP BY page ORDER BY views DESC"""
+        )
+
+        # Page views by day (last 7 days)
+        views_by_day = await conn.fetch(
+            """SELECT created_at::date as day, COUNT(*) as views
+               FROM page_views
+               WHERE created_at > NOW() - INTERVAL '7 days'
+               GROUP BY day ORDER BY day"""
+        )
+
+        # Chat sessions
+        total_chats = await conn.fetchval("SELECT COUNT(*) FROM chat_sessions")
+        chats_by_type = await conn.fetch(
+            """SELECT session_type, COUNT(*) as count
+               FROM chat_sessions GROUP BY session_type"""
+        )
+
+    return {
+        "leads": {
+            "total": total_leads,
+            "recent": [dict(r) for r in recent_leads],
+        },
+        "page_views": {
+            "total": total_views,
+            "today": today_views,
+            "by_page": [dict(r) for r in views_by_page],
+            "by_day": [{"day": str(r["day"]), "views": r["views"]} for r in views_by_day],
+        },
+        "chats": {
+            "total": total_chats,
+            "by_type": [dict(r) for r in chats_by_type],
+        },
+    }
+
+
+@app.get("/api/admin/leads-csv")
+async def admin_leads_csv(x_admin_password: Optional[str] = Header(None)):
+    check_admin(x_admin_password or "")
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT first_name, email, experience_level, goals,
+                      recommended_plan, referral_source, created_at
+               FROM leads ORDER BY created_at DESC"""
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["First Name", "Email", "Level", "Goals", "Recommended Plan", "Referral", "Date"])
+    for r in rows:
+        writer.writerow([
+            r["first_name"], r["email"], r["experience_level"],
+            r["goals"], r["recommended_plan"], r["referral_source"],
+            str(r["created_at"])
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=mm-leads.csv"},
+    )
 
 
 # --- Static Site ---
@@ -303,12 +513,12 @@ async def health():
 async def root():
     return FileResponse("static/index.html")
 
+@app.get("/mm-admin")
+async def admin_page():
+    return FileResponse("static/admin.html")
 
-# Mount static directory for CSS, JS, images
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
-# Catch-all: serve index.html for all other paths (client-side routing)
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
