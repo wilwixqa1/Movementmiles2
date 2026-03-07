@@ -825,37 +825,35 @@ async def admin_stats(request: Request):
         return {"error": "No database connected"}
 
     # Date range filtering (optional query params)
-    from datetime import date as date_type
+    from datetime import timedelta
     date_from_str = request.query_params.get("from", "")
     date_to_str = request.query_params.get("to", "")
-    date_from_obj = None
-    date_to_obj = None
+    date_from_dt = None
+    date_to_dt = None
     try:
         if date_from_str:
-            parts = date_from_str.split("-")
-            date_from_obj = date_type(int(parts[0]), int(parts[1]), int(parts[2]))
+            date_from_dt = datetime.strptime(date_from_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         if date_to_str:
-            parts = date_to_str.split("-")
-            date_to_obj = date_type(int(parts[0]), int(parts[1]), int(parts[2]))
+            date_to_dt = datetime.strptime(date_to_str, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
     except Exception as e:
         print(f"Date parse error: {e}")
 
     async with db_pool.acquire() as conn:
         # Leads (with optional date filter)
-        if date_from_obj or date_to_obj:
+        if date_from_dt or date_to_dt:
             lead_count_q = "SELECT COUNT(*) FROM leads WHERE 1=1"
             lead_list_q = "SELECT * FROM leads WHERE 1=1"
             idx = 1
             args = []
-            if date_from_obj:
+            if date_from_dt:
                 lead_count_q += " AND created_at >= $" + str(idx)
                 lead_list_q += " AND created_at >= $" + str(idx)
-                args.append(date_from_obj)
+                args.append(date_from_dt)
                 idx += 1
-            if date_to_obj:
-                lead_count_q += " AND created_at < $" + str(idx) + " + 1"
-                lead_list_q += " AND created_at < $" + str(idx) + " + 1"
-                args.append(date_to_obj)
+            if date_to_dt:
+                lead_count_q += " AND created_at < $" + str(idx)
+                lead_list_q += " AND created_at < $" + str(idx)
+                args.append(date_to_dt)
                 idx += 1
             lead_list_q += " ORDER BY created_at DESC LIMIT 50"
             total_leads = await conn.fetchval(lead_count_q, *args)
@@ -867,17 +865,17 @@ async def admin_stats(request: Request):
             )
 
         # Page views (with optional date filter)
-        if date_from_obj or date_to_obj:
+        if date_from_dt or date_to_dt:
             pv_q = "SELECT COUNT(*) FROM page_views WHERE 1=1"
             pv_args = []
             pv_idx = 1
-            if date_from_obj:
+            if date_from_dt:
                 pv_q += " AND created_at >= $" + str(pv_idx)
-                pv_args.append(date_from_obj)
+                pv_args.append(date_from_dt)
                 pv_idx += 1
-            if date_to_obj:
-                pv_q += " AND created_at < $" + str(pv_idx) + " + 1"
-                pv_args.append(date_to_obj)
+            if date_to_dt:
+                pv_q += " AND created_at < $" + str(pv_idx)
+                pv_args.append(date_to_dt)
                 pv_idx += 1
             total_views = await conn.fetchval(pv_q, *pv_args)
             today_views = await conn.fetchval(
@@ -1115,7 +1113,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "8.1.2",
+        "version": "8.1.3",
         "database": db_status,
         "stripe": stripe_status,
     }
