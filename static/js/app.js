@@ -6,6 +6,7 @@ var PAGE_PATHS = {
   training: '/training-programs',
   race: '/race-plans',
   store: '/store',
+  'get-started': '/get-started',
   detail: null
 };
 
@@ -17,6 +18,9 @@ function showPage(name, skipPush) {
   if (link) link.classList.add('active');
   window.scrollTo(0, 0);
   initFadeIns();
+  // Auto-hide Nelly widget on get-started page
+  var nellyW = document.getElementById('nelly-widget');
+  if (nellyW) nellyW.style.display = (name === 'get-started') ? 'none' : 'flex';
   if (!skipPush && PAGE_PATHS[name] !== undefined && PAGE_PATHS[name] !== null) {
     history.pushState({page: name}, '', PAGE_PATHS[name]);
   }
@@ -63,7 +67,8 @@ function initFadeIns() {
     'about-meg': 'about',
     'training-programs': 'training',
     'race-plans': 'race',
-    'store': 'store'
+    'store': 'store',
+    'get-started': 'get-started'
   };
   if (pathToPage[path]) {
     showPage(pathToPage[path], true);
