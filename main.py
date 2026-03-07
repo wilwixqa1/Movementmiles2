@@ -1069,10 +1069,10 @@ async def admin_stats(request: Request):
             ],
             "arr_cents": arr_cents,
             "arr_display": f"${arr_cents / 100:,.2f}",
-            "avg_sub_age_days": round(avg_sub_age or 0, 1),
-            "avg_monthly_per_sub_cents": round(avg_monthly_per_sub or 0),
-            "est_ltv_cents": round((avg_monthly_per_sub or 0) * max((avg_sub_age or 30) / 30, 1)),
-            "est_ltv_display": f"${round((avg_monthly_per_sub or 0) * max((avg_sub_age or 30) / 30, 1)) / 100:,.2f}",
+            "avg_sub_age_days": round(float(avg_sub_age or 0), 1),
+            "avg_monthly_per_sub_cents": round(float(avg_monthly_per_sub or 0)),
+            "est_ltv_cents": round(float(avg_monthly_per_sub or 0) * max(float(avg_sub_age or 30) / 30, 1)),
+            "est_ltv_display": f"${round(float(avg_monthly_per_sub or 0) * max(float(avg_sub_age or 30) / 30, 1)) / 100:,.2f}",
             "recent_events": [
                 {
                     "event_type": r["event_type"],
@@ -1120,7 +1120,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "8.1",
+        "version": "8.1.1",
         "database": db_status,
         "stripe": stripe_status,
     }
