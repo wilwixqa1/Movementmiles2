@@ -1027,14 +1027,14 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
                     INSERT INTO subscriptions (
                         stripe_customer_id, stripe_subscription_id, email, status,
                         plan_interval, plan_amount, currency, source,
-                        current_period_start, updated_at
-                    ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', $5, $6, NOW())
+                        current_period_start, created_at, updated_at
+                    ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', $5, $6, COALESCE($7, NOW()), NOW())
                     ON CONFLICT (stripe_subscription_id) DO UPDATE SET
                         email = EXCLUDED.email,
                         status = EXCLUDED.status,
                         updated_at = NOW()
                 """,
-                    syn_id, email, plan_interval, plan_amount, source, period_start
+                    syn_id, email, plan_interval, plan_amount, source, period_start, period_start
                 )
                 imported += 1
                 existing_ids.add(syn_id)
