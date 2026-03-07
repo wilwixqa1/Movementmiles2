@@ -1045,6 +1045,48 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
     return {"status": "ok", "imported": imported, "skipped": skipped}
 
 
+@app.post("/api/admin/reconcile-cancellations")
+async def reconcile_cancellations(request: Request, file: UploadFile = File(...)):
+    """Upload CSV of cancelled emails. Matches against subscriptions and flips to canceled."""
+    import csv as csv_mod
+    import io as io_mod
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    contents = await file.read()
+    text = contents.decode("utf-8-sig")
+    reader = csv_mod.DictReader(io_mod.StringIO(text))
+
+    cancelled_emails = set()
+    for row in reader:
+        for key in row:
+            if key.strip().lower() in ("email", "e-mail"):
+                val = (row[key] or "").strip().lower()
+                if val and "@" in val:
+                    cancelled_emails.add(val)
+
+    if not cancelled_emails:
+        return {"status": "ok", "matched": 0, "total_emails": 0}
+
+    async with db_pool.acquire() as conn:
+        active_subs = await conn.fetch(
+            "SELECT id, email FROM subscriptions WHERE status IN ('active', 'trialing')"
+        )
+        matched = 0
+        for sub in active_subs:
+            if sub["email"] and sub["email"].strip().lower() in cancelled_emails:
+                await conn.execute(
+                    "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                    sub["id"]
+                )
+                matched += 1
+
+    return {"status": "ok", "matched": matched, "total_emails": len(cancelled_emails)}
+
+
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
