@@ -34,6 +34,17 @@ function gsStripLeadTag(text) {
 }
 
 function gsSaveLead(leadData) {
+  // Attach UTM data from cookie (set on landing by index.html)
+  try {
+    var match = document.cookie.match(/mm_utm=([^;]+)/);
+    if (match) {
+      var utm = JSON.parse(decodeURIComponent(match[1]));
+      leadData.utm_source = utm.s || '';
+      leadData.utm_medium = utm.m || '';
+      leadData.utm_campaign = utm.c || '';
+    }
+  } catch(e) { console.error('UTM read error:', e); }
+
   fetch('/api/lead', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
