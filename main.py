@@ -824,18 +824,75 @@ async def admin_stats(request: Request):
     if not db_pool:
         return {"error": "No database connected"}
 
-    async with db_pool.acquire() as conn:
-        # Leads
-        total_leads = await conn.fetchval("SELECT COUNT(*) FROM leads")
-        recent_leads = await conn.fetch(
-            "SELECT * FROM leads ORDER BY created_at DESC LIMIT 50"
-        )
+    # Date range filtering (optional query params)
+    date_from = request.query_params.get("from", "")
+    date_to = request.query_params.get("to", "")
+    date_clause = ""
+    date_params = []
+    if date_from:
+        date_clause += " AND created_at >= $__N__"
+        date_params.append(date_from)
+    if date_to:
+        date_clause += " AND created_at < ($__N__)::date + 1"
+        date_params.append(date_to)
 
-        # Page views
-        total_views = await conn.fetchval("SELECT COUNT(*) FROM page_views")
-        today_views = await conn.fetchval(
-            "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
-        )
+    # Build parameterized date filter for leads
+    leads_where = "WHERE 1=1" + date_clause if date_clause else ""
+    leads_date_args = list(date_params)
+
+    async with db_pool.acquire() as conn:
+        # Leads (with optional date filter)
+        if date_clause:
+            param_idx = 1
+            q = "SELECT COUNT(*) FROM leads WHERE 1=1"
+            for dp in date_params:
+                q = q  # built below
+            # Build dynamic query
+            lead_count_q = "SELECT COUNT(*) FROM leads WHERE 1=1"
+            lead_list_q = "SELECT * FROM leads WHERE 1=1"
+            idx = 1
+            args = []
+            if date_from:
+                lead_count_q += " AND created_at >= $" + str(idx)
+                lead_list_q += " AND created_at >= $" + str(idx)
+                args.append(date_from)
+                idx += 1
+            if date_to:
+                lead_count_q += " AND created_at < ($" + str(idx) + ")::date + 1"
+                lead_list_q += " AND created_at < ($" + str(idx) + ")::date + 1"
+                args.append(date_to)
+                idx += 1
+            lead_list_q += " ORDER BY created_at DESC LIMIT 50"
+            total_leads = await conn.fetchval(lead_count_q, *args)
+            recent_leads = await conn.fetch(lead_list_q, *args)
+        else:
+            total_leads = await conn.fetchval("SELECT COUNT(*) FROM leads")
+            recent_leads = await conn.fetch(
+                "SELECT * FROM leads ORDER BY created_at DESC LIMIT 50"
+            )
+
+        # Page views (with optional date filter)
+        if date_from or date_to:
+            pv_q = "SELECT COUNT(*) FROM page_views WHERE 1=1"
+            pv_args = []
+            pv_idx = 1
+            if date_from:
+                pv_q += " AND created_at >= $" + str(pv_idx)
+                pv_args.append(date_from)
+                pv_idx += 1
+            if date_to:
+                pv_q += " AND created_at < ($" + str(pv_idx) + ")::date + 1"
+                pv_args.append(date_to)
+                pv_idx += 1
+            total_views = await conn.fetchval(pv_q, *pv_args)
+            today_views = await conn.fetchval(
+                "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
+            )
+        else:
+            total_views = await conn.fetchval("SELECT COUNT(*) FROM page_views")
+            today_views = await conn.fetchval(
+                "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
+            )
         views_by_page = await conn.fetch(
             """SELECT page, COUNT(*) as views FROM page_views
                WHERE created_at > NOW() - INTERVAL '7 days'
@@ -931,6 +988,38 @@ async def admin_stats(request: Request):
                GROUP BY source"""
         )
 
+        # Phase 5b: MRR trend (last 6 months)
+        mrr_trend = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', updated_at), 'YYYY-MM') as month,
+                COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as monthly_total,
+                COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as annual_total
+               FROM subscriptions
+               WHERE status = 'active' AND updated_at > NOW() - INTERVAL '6 months'
+               GROUP BY month ORDER BY month"""
+        )
+
+        # Avg subscription age (days)
+        avg_sub_age = await conn.fetchval(
+            """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0)
+               FROM subscriptions WHERE status IN ('active', 'trialing')"""
+        )
+
+        # Estimated LTV = avg monthly revenue per sub * avg lifetime months
+        avg_monthly_per_sub = await conn.fetchval(
+            """SELECT COALESCE(AVG(
+                CASE WHEN plan_interval='month' THEN plan_amount
+                     WHEN plan_interval='year' THEN plan_amount/12
+                     ELSE 0 END
+               ), 0) FROM subscriptions WHERE status = 'active'"""
+        )
+
+        # Total subscribers ever (for lifetime calc)
+        total_subs_ever = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+        # ARR
+        arr_cents = mrr_cents * 12
+
     # Build response
     trial_conversion_rate = 0
     if total_ever_trialed and total_ever_trialed > 0:
@@ -974,6 +1063,16 @@ async def admin_stats(request: Request):
                 {"source": r["source"], "mrr_cents": (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)}
                 for r in mrr_by_source
             ],
+            "mrr_trend": [
+                {"month": r["month"], "mrr_cents": (r["monthly_total"] or 0) + (r["annual_total"] or 0)}
+                for r in mrr_trend
+            ],
+            "arr_cents": arr_cents,
+            "arr_display": f"${arr_cents / 100:,.2f}",
+            "avg_sub_age_days": round(avg_sub_age or 0, 1),
+            "avg_monthly_per_sub_cents": round(avg_monthly_per_sub or 0),
+            "est_ltv_cents": round((avg_monthly_per_sub or 0) * max((avg_sub_age or 30) / 30, 1)),
+            "est_ltv_display": f"${round((avg_monthly_per_sub or 0) * max((avg_sub_age or 30) / 30, 1)) / 100:,.2f}",
             "recent_events": [
                 {
                     "event_type": r["event_type"],
@@ -1021,7 +1120,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "8.0",
+        "version": "8.1",
         "database": db_status,
         "stripe": stripe_status,
     }
