@@ -374,6 +374,22 @@
 
 <!-- ═══════════════════════ CORE APP JS ═══════════════════════ -->
 <script>
+  // --- UTM Capture ---
+  // Reads utm_source, utm_medium, utm_campaign from URL params on landing.
+  // Stores in cookie (30 days). onboard.js reads this when saving lead.
+  (function() {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var src = params.get('utm_source') || '';
+      var med = params.get('utm_medium') || '';
+      var cam = params.get('utm_campaign') || '';
+      if (src || med || cam) {
+        var utm = JSON.stringify({s: src, m: med, c: cam});
+        document.cookie = 'mm_utm=' + encodeURIComponent(utm) + ';path=/;max-age=2592000;SameSite=Lax';
+      }
+    } catch(e) {}
+  })();
+
   var PAGE_PATHS = {
     home: '/',
     about: '/about-meg',
