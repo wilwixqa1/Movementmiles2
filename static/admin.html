@@ -90,6 +90,26 @@
 
   .divider{border:none;border-top:1px solid var(--border);margin:32px 0 20px}
 
+  .tools-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:24px}
+  .tool-card{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:24px}
+  .tool-card h3{font-size:.95rem;font-weight:600;margin-bottom:6px;color:var(--navy)}
+  .tool-card p{font-size:.8rem;color:var(--navy-mid);margin-bottom:16px;line-height:1.4}
+  .tool-btn{border:none;padding:10px 24px;border-radius:8px;font-family:inherit;font-size:.84rem;font-weight:600;cursor:pointer;width:100%}
+  .tool-btn:disabled{opacity:.5;cursor:not-allowed}
+  .tool-btn-navy{background:var(--navy);color:var(--white)}
+  .tool-btn-navy:hover:not(:disabled){background:#2a3a5c}
+  .tool-btn-red{background:var(--red);color:var(--white)}
+  .tool-btn-red:hover:not(:disabled){background:#a93226}
+  .tool-btn-green{background:var(--green);color:var(--white)}
+  .tool-btn-green:hover:not(:disabled){background:#3a8a3a}
+  .tool-result{margin-top:12px;padding:10px 14px;border-radius:6px;font-size:.82rem;display:none}
+  .tool-result.ok{display:block;background:#e8f4e8;color:#2d6a2d}
+  .tool-result.err{display:block;background:#fde8e8;color:#c0392b}
+  .tool-result.loading{display:block;background:#e8eaf6;color:#3949ab}
+  .reset-confirm{display:none;margin-top:12px}
+  .reset-confirm input{width:100%;border:1px solid var(--border);padding:8px 12px;border-radius:6px;font-family:inherit;font-size:.84rem;margin-bottom:8px}
+  .csv-upload{margin-bottom:12px}
+  .csv-upload input[type=file]{font-size:.82rem;font-family:inherit}
   @media(max-width:768px){
     .stat-cards{grid-template-columns:repeat(2,1fr)}
     .views-grid{grid-template-columns:1fr}
@@ -135,6 +155,34 @@
       <button class="quick-btn" id="qb-90" onclick="setQuickRange(90)">90d</button>
       <button class="quick-btn active" id="qb-all" onclick="clearDateFilter()">All Time</button>
       <span class="date-range-label" id="range-label">Showing: All Time</span>
+    </div>
+
+    <!-- Data Tools -->
+    <div class="section-label">Data Tools</div>
+    <div class="tools-grid">
+      <div class="tool-card">
+        <h3>Backfill Stripe</h3>
+        <p>Pull all existing Stripe subscriptions into the dashboard. Safe to run multiple times (upserts by subscription ID).</p>
+        <button class="tool-btn tool-btn-navy" id="btn-backfill" onclick="doBackfill()">Backfill Stripe Subscriptions</button>
+        <div class="tool-result" id="res-backfill"></div>
+      </div>
+      <div class="tool-card">
+        <h3>Reset Test Data</h3>
+        <p>Wipe ALL data from every table (leads, page views, chats, subscriptions, events). Use on launch day to clear test data.</p>
+        <button class="tool-btn tool-btn-red" id="btn-reset" onclick="showResetConfirm()">Reset All Data</button>
+        <div class="reset-confirm" id="reset-confirm">
+          <input type="text" id="reset-input" placeholder="Type RESET to confirm" />
+          <button class="tool-btn tool-btn-red" onclick="doReset()">Confirm Reset</button>
+        </div>
+        <div class="tool-result" id="res-reset"></div>
+      </div>
+      <div class="tool-card">
+        <h3>Import Leads CSV</h3>
+        <p>Upload a CSV with email, first_name, last_name columns. Skips duplicate emails already in the database.</p>
+        <div class="csv-upload"><input type="file" id="csv-file" accept=".csv" /></div>
+        <button class="tool-btn tool-btn-green" id="btn-import" onclick="doImport()">Import Leads</button>
+        <div class="tool-result" id="res-import"></div>
+      </div>
     </div>
 
     <!-- Revenue Section -->
@@ -532,6 +580,99 @@ function renderBarChart(containerId, data) {
   }).join('');
 }
 
+
+function doBackfill() {
+  if (!confirm("Pull all Stripe subscriptions into the dashboard?")) return;
+  var btn = document.getElementById("btn-backfill");
+  var res = document.getElementById("res-backfill");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Pulling subscriptions from Stripe... this may take a minute.";
+  fetch("/api/admin/backfill-stripe", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    res.textContent = "Done! Imported " + d.imported + " subscriptions" + (d.errors ? " (" + d.errors + " errors)" : "") + ".";
+    btn.disabled = false;
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function showResetConfirm() {
+  var el = document.getElementById("reset-confirm");
+  el.style.display = el.style.display === "block" ? "none" : "block";
+  document.getElementById("reset-input").value = "";
+  document.getElementById("reset-input").focus();
+}
+
+function doReset() {
+  var val = document.getElementById("reset-input").value.trim();
+  if (val !== "RESET") {
+    alert("You must type RESET exactly to confirm.");
+    return;
+  }
+  var res = document.getElementById("res-reset");
+  res.className = "tool-result loading";
+  res.textContent = "Clearing all data...";
+  fetch("/api/admin/reset-data", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Admin-Password": adminPw},
+    body: JSON.stringify({confirm: "RESET"})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    res.textContent = "All data cleared successfully.";
+    document.getElementById("reset-confirm").style.display = "none";
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doImport() {
+  var fileInput = document.getElementById("csv-file");
+  if (!fileInput.files || !fileInput.files[0]) {
+    alert("Please select a CSV file first.");
+    return;
+  }
+  var file = fileInput.files[0];
+  if (!confirm("Import leads from " + file.name + "?")) return;
+  var btn = document.getElementById("btn-import");
+  var res = document.getElementById("res-import");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Uploading and importing...";
+  var formData = new FormData();
+  formData.append("file", file);
+  fetch("/api/admin/import-leads-csv", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw},
+    body: formData
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    res.textContent = "Done! Imported " + d.imported + " leads, skipped " + d.skipped + " duplicates.";
+    btn.disabled = false;
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
 function exportCSV() {
   fetch('/api/admin/leads-csv', {
     headers: {'X-Admin-Password': adminPw}
