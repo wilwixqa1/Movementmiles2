@@ -5,3 +5,4 @@ pydantic==2.9.2
 aiofiles==24.1.0
 asyncpg==0.30.0
 stripe==8.0.0
+python-multipart==0.0.9
