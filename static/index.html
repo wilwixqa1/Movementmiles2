@@ -187,6 +187,41 @@
   .nelly-qr:hover { background:var(--navy); color:var(--white); transform:translateY(-1px); }
   .nelly-link { color:var(--navy-mid); font-weight:600; text-decoration:underline; text-underline-offset:2px; cursor:pointer; transition:color .2s; }
   .nelly-link:hover { color:var(--navy); }
+
+  /* ── ABOUT MEG PAGE ── */
+  .about-hero { display:grid; grid-template-columns:1fr 1fr; gap:60px; max-width:1100px; margin:0 auto; padding:80px 60px; align-items:center; }
+  .about-img { width:100%; border-radius:16px; object-fit:cover; aspect-ratio:4/5; }
+  .about-content h2 { font-size:clamp(28px,3vw,42px); font-weight:400; letter-spacing:-.02em; color:var(--navy); margin-bottom:24px; }
+  .about-content p { font-size:.92rem; color:var(--muted); line-height:1.85; margin-bottom:16px; }
+  .about-content strong { color:var(--navy); }
+  .about-certs { margin-top:20px; padding:20px 24px; background:var(--bg-warm); border-radius:12px; border:1px solid var(--border); }
+  .about-certs p { font-size:.85rem; margin-bottom:0; }
+
+  /* ── PROGRAM DETAIL PAGE ── */
+  .detail-back { display:inline-flex; align-items:center; gap:6px; font-size:.88rem; font-weight:500; color:var(--navy-mid); cursor:pointer; text-decoration:none; padding:24px 60px 0; transition:color .2s; }
+  .detail-back:hover { color:var(--navy); }
+  .detail-hero { display:grid; grid-template-columns:1fr 1fr; gap:60px; max-width:1100px; margin:0 auto; padding:40px 60px 60px; align-items:start; }
+  .detail-img { width:100%; border-radius:16px; object-fit:cover; aspect-ratio:4/3; background:#eee; }
+  .detail-info h1 { font-size:clamp(24px,3vw,38px); font-weight:500; letter-spacing:-.02em; color:var(--navy); margin-bottom:16px; line-height:1.2; }
+  .detail-meta { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px; }
+  .detail-meta .tag { font-size:.75rem; }
+  .detail-duration { font-size:.88rem; color:var(--muted); font-weight:500; }
+  .detail-weekly { font-size:.9rem; color:var(--text); line-height:1.7; margin-bottom:20px; padding:16px 20px; background:var(--bg); border-radius:10px; border:1px solid var(--border); }
+  .detail-weekly strong { color:var(--navy); }
+  .detail-desc { font-size:.9rem; color:var(--muted); line-height:1.85; margin-bottom:24px; }
+  .detail-equip { font-size:.88rem; color:var(--text); line-height:1.7; margin-bottom:28px; }
+  .detail-equip strong { color:var(--navy); }
+  .detail-cta-box { background:var(--navy); border-radius:14px; padding:36px; text-align:center; margin-top:20px; }
+  .detail-cta-box h3 { color:var(--white); font-weight:400; font-size:1.2rem; margin-bottom:6px; }
+  .detail-cta-box p { color:rgba(247,247,247,.65); font-size:.88rem; margin-bottom:18px; }
+
+  @media(max-width:768px) {
+    .about-hero, .detail-hero { grid-template-columns:1fr; gap:30px; padding:40px 24px; }
+    .detail-back { padding:16px 24px 0; }
+    .site-nav { padding:0 16px; }
+    .nav-links { display:none; }
+    .race-grid { grid-template-columns:1fr; padding:30px 24px; }
+  }
 </style>
 </head>
 <body>
@@ -196,7 +231,7 @@
     <img src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/9419ffc3-05b5-47a3-9911-0bc1ba1a990b/MovementMiles_Logo-02.png?format=300w" alt="Movement & Miles" />
   </a>
   <ul class="nav-links">
-    <li><a onclick="showPage('home')" data-page="home">About Meg</a></li>
+    <li><a onclick="showPage('about')" data-page="about">About Meg</a></li>
     <li><a onclick="showPage('training')" data-page="training">Training Programs</a></li>
     <li><a onclick="showPage('race')" data-page="race">Race Plans</a></li>
     <li><a onclick="showPage('store')" data-page="store">Store</a></li>
@@ -301,6 +336,40 @@
     <ul class="footer-links">
       <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li><li><a>Accessibility statement</a></li>
       <li><a onclick="showPage('training')">Training Programs</a></li><li><a>Manage Subscription</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="page-about" class="page">
+  <div class="about-hero">
+    <img class="about-img" src="https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/9f593b9b-c3ca-4504-88ef-0673a444f243/Screenshot+2025-09-16+at+2.07.49+PM.png" alt="Meg" />
+    <div class="about-content">
+      <h2>Hi, I'm Meg:</h2>
+      <p><strong>In 2013 I became a certified personal trainer.</strong></p>
+      <p><strong>In 2014, I got a L2 CrossFit certification. I love lifting.</strong></p>
+      <p><strong>In 2015, I became a certified running coach.</strong></p>
+      <p><strong>In 2016, I became a founding trainer of an audio-guided running app, which took me to New York City.</strong></p>
+      <p><strong>And in 2019, I created my own app, Movement &amp; Miles, and moved to Colorado. Trail running truly stole my heart.</strong></p>
+      <div class="about-certs">
+        <p><strong>My current certifications are: RRCA, UESCA, NASM CPT/CNC, USATF, CrossFit L2.</strong></p>
+      </div>
+      <p style="margin-top:20px"><strong>But let's rewind.</strong></p>
+      <p>I ran track at Georgia State University, the 800 meter race, and in 2011, I graduated with a degree in Journalism. After graduation, I dabbled in PR and marketing for a while, but eventually decided the 9-5 wasn't for me and that my true passion was in helping to coach, teach, and work with athletes.</p>
+      <p>Post-college, my personal running journey really took off. I went from running the 800 meter race, to running several half marathons, a few marathons, and then I got REALLY into ultra running, all the while simultaneously crafting my holistic approach to running through certifications, courses, my own personal injuries, and working with 1:1 clients. As an injury-prone athlete myself, I became SO curious as to WHY there were no apps or coaches out there with a really comprehensive and holistic approach to running. But I knew I had the skills and experience to build something to fill that niche, so I did.</p>
+      <p>And now we're here. And I'm stoked you found me. There's nothing I love more than the opportunity to coach someone who relates to my approach and my coaching.</p>
+    </div>
+  </div>
+  <section class="newsletter-section">
+    <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
+    <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies delivered to your inbox.</p>
+    <div class="newsletter-form"><input class="newsletter-input" type="email" placeholder="Email Address" /><button class="newsletter-btn">Sign Up</button></div>
+  </section>
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement &amp; Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li>
+      <li><a onclick="showPage('home')">Home</a></li>
+      <li><a onclick="showPage('training')">Training Programs</a></li>
     </ul>
   </footer>
 </div>
@@ -421,6 +490,41 @@
       <li><a onclick="showPage('home')">Home</a></li>
       <li><a onclick="showPage('training')">Training Programs</a></li>
       <li><a onclick="showPage('race')">Race Plans</a></li>
+    </ul>
+  </footer>
+</div>
+
+<div id="page-detail" class="page">
+  <a class="detail-back" onclick="showPage('training')">← Back to Training Programs</a>
+  <div class="detail-hero">
+    <img class="detail-img" id="detail-img" src="" alt="" />
+    <div class="detail-info">
+      <h1 id="detail-title"></h1>
+      <div class="detail-meta">
+        <span class="tag" id="detail-tag"></span>
+        <span class="detail-duration" id="detail-duration"></span>
+      </div>
+      <div class="detail-weekly" id="detail-weekly"></div>
+      <div class="detail-desc" id="detail-desc"></div>
+      <div class="detail-equip" id="detail-equip"></div>
+      <div class="detail-cta-box">
+        <h3>Join Movement &amp; Miles</h3>
+        <p>First Month is Free!</p>
+        <a class="btn-primary" href="https://movementandmiles.ymove.app/p" target="_blank" style="background:var(--white);color:var(--navy);font-weight:600">Sign Up Today</a>
+      </div>
+    </div>
+  </div>
+  <section class="newsletter-section">
+    <h2 class="newsletter-heading">Sign Up for our Newsletter!</h2>
+    <p class="newsletter-sub">Get science-backed training advice, mobility routines, and nutrition strategies delivered to your inbox.</p>
+    <div class="newsletter-form"><input class="newsletter-input" type="email" placeholder="Email Address" /><button class="newsletter-btn">Sign Up</button></div>
+  </section>
+  <footer>
+    <div class="footer-copy">&copy;2026 Movement &amp; Miles. All rights reserved.</div>
+    <ul class="footer-links">
+      <li><a>Terms of use</a></li><li><a>Privacy Policy</a></li>
+      <li><a onclick="showPage('home')">Home</a></li>
+      <li><a onclick="showPage('training')">Training Programs</a></li>
     </ul>
   </footer>
 </div>
@@ -593,6 +697,59 @@
     document.querySelectorAll('.page.active .fade-in:not(.visible)').forEach(function(el) { obs.observe(el); });
   }
   initFadeIns();
+
+  var PROGRAMS = [
+    {slug:"3-week-beginner-walk-to-run", title:"Walk To Run: Part 1", level:"Beginner", duration:"3 weeks", weekly:"4 run/walk workouts, 1 mobility workout, and 2 bodyweight strength training workouts each week.", desc:"This program is a great soft-launch into running. I would recommend this plan for a novice runner, or a completely new runner. The workouts are all walk/run interval style and gradually progress, in terms of running duration, throughout the 3 weeks. Each week is planned out for you and includes bodyweight strength training, mobility and strength training to help you improve your range of motion, strength, flexibility, and stability.", equip:"Running shoes, a mat, foam roller, resistance bands, and a box or bench.", img:"https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/024074f3-1790-45e0-ae72-a273547c894a/app+pics+6.jpg", section:"running"},
+    {slug:"6-week-beginner-walk-to-run", title:"Walk To Run: Part 2", level:"Beginner", duration:"6 weeks", weekly:"4 run/walk workouts, 1 mobility workout, and 2 strength training workouts (weights and bodyweight) each week.", desc:"This program picks up where Part 1 left off. You will continue building running endurance with walk/run intervals that gradually increase in running duration. Strength training now incorporates weights alongside bodyweight exercises to build a stronger foundation.", equip:"Running shoes, 10lb+ dumbbell or kettlebell, mini resistance bands, a mat, foam roller, and a box or bench.", img:"https://images.squarespace-cdn.com/content/v1/62da6d587c033c22c1b4475a/15e0db8f-33c4-4a58-b325-aed10e9d6c54/pexels-magda-ehlers-pexels-4065511.jpg", section:"running"},
+    {slug:"beginner-outdoor-running-plan", title:"Miles + Bodyweight Strength", level:"Beginner", duration:"8 weeks", weekly:"4-5 run workouts, 1-2 mobility workouts, and 2 bodyweight strength training workouts each week.", desc:"This program is great for a beginner-level runner who has some prior running experience; the ability to run for about 30 minutes, at an easy effort, without stopping. Each week, you have 4-5 runs; about 12-15 miles/week. The running workouts include a variety of styles: endurance, speed workouts, and interval walk/run style. The strength training workouts are all bodyweight-focused (no weights needed).", equip:"Running shoes, mini resistance bands, foam roller, mat, and a box or bench.", img:"", section:"running"},
+    {slug:"beginner-treadmill-outdoor", title:"Beginners: Total Package", level:"Beginner", duration:"8 weeks", weekly:"4-5 runs, 1 mobility workout, and 2 strength training workouts each week (bodyweight and weights).", desc:"A comprehensive beginner program combining treadmill and outdoor running with strength training. This program builds your endurance while incorporating weighted exercises to develop total-body fitness.", equip:"Treadmill, 10lb+ dumbbell or kettlebell, mini resistance bands, a mat, foam roller, and a box or bench.", img:"", section:"running"},
+    {slug:"building-endurance", title:"Building Endurance & Strength", level:"Beginner", duration:"6 weeks", weekly:"4 runs, 1 mobility workout, and 2 strength training workouts (weights and bodyweight) each week.", desc:"Designed to help you build running endurance while developing strength. Each week combines outdoor runs with a mix of weighted and bodyweight strength sessions plus mobility work to keep you injury-free.", equip:"10lb+ dumbbell or kettlebell, mini resistance bands, a mat, foam roller, and a box or bench.", img:"", section:"running"},
+    {slug:"outdoor-miles-bodyweight-strength", title:"Strides + Calisthenics", level:"Intermediate", duration:"6 weeks", weekly:"4 runs, 2 bodyweight strength training workouts, and 1-2 mobility workouts each week.", desc:"An intermediate program that pairs outdoor running with calisthenics-style bodyweight training. No weights needed. Great for runners who want to build functional strength without a gym.", equip:"Running shoes, mini resistance bands, foam roller, mat, and a box or bench.", img:"", section:"running"},
+    {slug:"intermediate-outdoor-running-weights", title:"Outdoor Miles + Weights", level:"Intermediate", duration:"4 weeks", weekly:"4 runs, 2 strength training workouts, and 1-2 mobility workouts each week.", desc:"A focused 4-week intermediate program combining outdoor running with weighted strength training. Build power and endurance simultaneously with a balanced weekly schedule.", equip:"15lb+ dumbbell or kettlebell, mini resistance bands, a box or bench, a mat, a foam roller.", img:"", section:"running"},
+    {slug:"6-week-challenge-20-miles-per-week", title:"Balanced Strides & Strength", level:"Intermediate", duration:"6 weeks", weekly:"3 run workouts, 3 strength training workouts, and 1-2 mobility workouts each week.", desc:"For the intermediate runner who wants equal emphasis on running and lifting. Three runs and three strength sessions each week create a truly balanced training approach.", equip:"15lb+ dumbbell or kettlebell, mini resistance bands, a box or bench, foam roller, and a mat.", img:"", section:"running"},
+    {slug:"intermediate-treadmill-outdoor-running-plan", title:"Endurance & Strength", level:"Intermediate", duration:"8 weeks", weekly:"5 running workouts, 2 strength training workouts, and 1-2 mobility workouts each week.", desc:"An 8-week intermediate program with higher running volume plus strength and mobility. Perfect for runners looking to push their endurance while maintaining strength.", equip:"Treadmill, 15lb+ dumbbell or kettlebell, mini resistance bands, a box or bench, foam roller, and a mat.", img:"", section:"running"},
+    {slug:"run-lift", title:"Run + Lift", level:"Advanced", duration:"6 weeks", weekly:"3 running workouts (outdoor), 3 strength training workouts, and 1-2 mobility workouts each week.", desc:"An advanced program for athletes who want serious strength gains alongside their running. Three dedicated lifting sessions per week with compound movements and progressive overload.", equip:"Kettlebells, a barbell, plates, a box or bench, mini resistance bands, and a mat.", img:"", section:"running"},
+    {slug:"fast-track", title:"Endurance, Speed, and Strength", level:"Advanced", duration:"6 weeks", weekly:"2 speed workouts, 2 endurance runs, 2 strength training workouts, and 1 mobility workout each week.", desc:"The most well-rounded advanced program. Dedicated speed work, endurance runs, and heavy strength training in one comprehensive plan. For experienced runners who want to get faster and stronger.", equip:"Barbell, kettlebells, plates, box or bench, mini resistance bands, and a mat.", img:"", section:"running"},
+    {slug:"advanced-treadmill-outdoor-running", title:"Peak Endurance & Power", level:"Advanced", duration:"6 weeks", weekly:"5 running workouts, 2 strength training workouts, and 1-2 mobility workouts each week.", desc:"High-volume advanced running with 5 runs per week, supplemented by heavy strength work. Designed for experienced runners pushing toward peak performance.", equip:"Barbell, plates, mini resistance bands, 20lb+ kettlebell, box or bench, and a mat.", img:"", section:"running"},
+    {slug:"7-weeks-to-10-miles", title:"7 Weeks to 10 Miles", level:"Advanced", duration:"7 weeks", weekly:"4-5 runs, 2 strength training workouts, and 1-2 mobility workouts each week.", desc:"A goal-oriented advanced plan that builds you up to running 10 miles. Progressive mileage increases with strength and mobility work to support the higher training load.", equip:"Barbell, plates, kettlebells or dumbbells, box or bench, mini resistance bands, and a mat.", img:"", section:"running"},
+    {slug:"bodyweight-bands", title:"Bodyweight & Bands", level:"Beginner", duration:"4 weeks", weekly:"3 bodyweight strength training workouts and 2 mobility workouts each week.", desc:"A no-weights-needed strength program using only your bodyweight and resistance bands. Perfect for beginners or anyone without gym access.", equip:"Mini resistance bands, a mat, foam roller, and a box or bench.", img:"", section:"strength"},
+    {slug:"strength-starts-here", title:"Strength Starts Here!", level:"Beginner", duration:"2 weeks", weekly:"3 strength training workouts (bodyweight and weights) and 2 mobility workouts each week.", desc:"A 2-week intro to strength training that eases you into weighted exercises. Great for runners who have never lifted before.", equip:"10lb+ dumbbell or kettlebell, mini resistance bands, a mat, foam roller, and a box or bench.", img:"", section:"strength"},
+    {slug:"pure-strength", title:"Pure Strength", level:"Beginner", duration:"6 weeks", weekly:"3 strength training workouts and 1 mobility workout each week.", desc:"A focused 6-week strength-building program for beginners ready to commit to consistent lifting. Progressive overload with proper form emphasis.", equip:"Dumbbells or kettlebells, mini resistance bands, a mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"cross-train-smart", title:"Cross-Train Smart", level:"Beginner", duration:"6 weeks", weekly:"1 strength training workout, 1 prehab workout, and 1 mobility workout each week.", desc:"A gentle cross-training program that complements your running with targeted strength, prehab, and mobility work. Low time commitment with high impact.", equip:"Mini resistance bands, foam roller, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"stronger-strides", title:"Stronger Strides", level:"Intermediate", duration:"6 weeks", weekly:"2 strength training workouts and 1 mobility workout each week.", desc:"Intermediate strength training designed specifically for runners. Build the muscle groups that matter most for running performance and injury prevention.", equip:"15lb+ dumbbell or kettlebell, mini resistance bands, a mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"runners-strength-mobility-and-prehab", title:"Total Body Power", level:"Intermediate", duration:"6 weeks", weekly:"4 strength training workouts and 1 mobility workout each week.", desc:"A high-frequency strength program with 4 sessions per week. For intermediate athletes who want to prioritize building power and muscle.", equip:"Dumbbells or kettlebells, barbell, plates, mini resistance bands, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"well-built", title:"Well Built", level:"Intermediate", duration:"4 weeks", weekly:"2 strength training workouts, 1 prehab workout, and 1 mobility workout each week.", desc:"A balanced intermediate plan combining strength, prehab, and mobility. Well-rounded training that builds you up without breaking you down.", equip:"Dumbbells or kettlebells, mini resistance bands, foam roller, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"progressing-into-strength", title:"Kettlebell & Core Mash-Up", level:"Advanced", duration:"6 weeks", weekly:"1 mobility workout and 2 strength training workouts each week.", desc:"An advanced kettlebell-focused program that builds explosive power and core strength. Challenging compound movements for experienced lifters.", equip:"Kettlebells, mini resistance bands, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"total-power-strength", title:"Total Power & Strength", level:"Advanced", duration:"6 weeks", weekly:"3 strength training workouts and 1 mobility workout each week.", desc:"Serious advanced lifting with barbell compounds and heavy kettlebell work. For athletes who want to maximize their strength potential.", equip:"Barbell, plates, kettlebells, mini resistance bands, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"ultimate-strength-plan", title:"Ultimate Strength Plan", level:"Advanced", duration:"4 weeks", weekly:"4 strength training workouts and 1 mobility workout each week.", desc:"The most intense strength program in the catalog. Four heavy lifting sessions per week with advanced programming for experienced athletes.", equip:"Barbell, plates, kettlebells or dumbbells, mini resistance bands, mat, and a box or bench.", img:"", section:"strength"},
+    {slug:"beginner-prehab-mobility-and-strength-plan", title:"Prehab: Knee/ITBS + Mobility", level:"All Levels", duration:"4 weeks", weekly:"2 mobility workouts and 2 prehab workouts each week.", desc:"Targeted prehab for common running injuries including knee pain and IT band syndrome. Combines mobility work with strengthening exercises for the areas most vulnerable to running injuries.", equip:"Mini resistance bands, foam roller, yoga block, and a mat.", img:"", section:"mobility"},
+    {slug:"beginner-mobility-core-upper-body", title:"Beginners: Mobility, Strength & Prehab", level:"Beginner", duration:"6 weeks", weekly:"2 mobility workouts, 1 core workout, and 1 prehab workout each week.", desc:"A gentle introduction to mobility and prehab work. Focuses on building core strength, improving flexibility, and preventing common injuries.", equip:"Mini resistance bands, foam roller, yoga block, and a mat.", img:"", section:"mobility"},
+    {slug:"trail-running-strength-essentials-1", title:"Mobility Master", level:"All Levels", duration:"4 weeks", weekly:"3 mobility and flexibility workouts each week.", desc:"Dedicated mobility training to improve your range of motion, joint strength, and overall flexibility. Great as a standalone program or supplement to your running.", equip:"15lb+ kb or dumbbell, foam roller, yoga block, and a mat.", img:"", section:"mobility"},
+    {slug:"beginner-mobility-flexibility", title:"Total Package Prehab", level:"Intermediate", duration:"4 weeks", weekly:"1 mobility workout and 3 prehab/strength training workouts each week.", desc:"Intermediate-level prehab that combines mobility with targeted strength work. For runners who want to bulletproof their body against injury.", equip:"Dumbbells or kettlebells, mini resistance bands, foam roller, and a mat.", img:"", section:"mobility"},
+    {slug:"cross-train-mobility-prehab-and-strength-plan", title:"Cross-Training Power", level:"Advanced", duration:"4 weeks", weekly:"1 mobility workout and 3 strength training/prehab workouts each week.", desc:"Advanced cross-training combining heavy prehab with strength work. For experienced athletes who want to maintain durability at high training loads.", equip:"Barbell, kettlebells, mini resistance bands, foam roller, and a mat.", img:"", section:"mobility"},
+    {slug:"the-ultimate-mobility-plan", title:"The Ultimate Mobility Plan", level:"All Levels", duration:"4 weeks", weekly:"3 mobility and flexibility workouts each week.", desc:"The most comprehensive mobility program in the catalog. Three dedicated sessions per week focusing on hip mobility, joint strength, and full-body flexibility.", equip:"Mini resistance bands, foam roller, yoga block, and a mat.", img:"", section:"mobility"},
+    {slug:"ankle-foot-calf", title:"Ankle, Foot, and Calf Strength", level:"All Levels", duration:"10 modules", weekly:"Self-paced modules targeting ankle, foot, and calf strength.", desc:"A focused collection of exercises to build strength and resilience in your lower legs. Essential for runners dealing with ankle instability, plantar fasciitis, or calf tightness.", equip:"Mini resistance bands, foam roller, and a mat.", img:"", section:"mobility"},
+    {slug:"itbs-knee-pain", title:"ITBS/Knee Pain Workout Collection", level:"All Levels", duration:"10 modules", weekly:"Self-paced modules for IT band and knee pain relief.", desc:"Targeted workouts designed to address IT band syndrome and knee pain. A go-to resource for runners dealing with these common issues.", equip:"Mini resistance bands, foam roller, yoga block, and a mat.", img:"", section:"mobility"},
+    {slug:"trail-road-prehab", title:"Trail/Road Running Prehab Essentials", level:"All Levels", duration:"6 weeks", weekly:"2 strength/prehab workouts and 1 mobility workout each week.", desc:"Essential prehab for both trail and road runners. Builds the stability, strength, and mobility needed to handle varied terrain and high mileage.", equip:"Mini resistance bands, foam roller, and a mat.", img:"", section:"mobility"}
+  ];
+
+  function showDetail(slug) {
+    var p = PROGRAMS.find(function(x) { return x.slug === slug; });
+    if (!p) return;
+    var tagClass = p.level === 'Beginner' ? 'tag-beginner' : p.level === 'Intermediate' ? 'tag-intermediate' : p.level === 'Advanced' ? 'tag-advanced' : 'tag-all';
+    var imgEl = document.getElementById('detail-img');
+    if (p.img) { imgEl.src = p.img; imgEl.style.display = 'block'; }
+    else { imgEl.style.display = 'none'; }
+    document.getElementById('detail-title').textContent = p.title;
+    var tagEl = document.getElementById('detail-tag');
+    tagEl.textContent = p.level;
+    tagEl.className = 'tag ' + tagClass;
+    document.getElementById('detail-duration').textContent = p.duration;
+    document.getElementById('detail-weekly').innerHTML = '<strong>Each week has:</strong> ' + p.weekly;
+    document.getElementById('detail-desc').textContent = p.desc;
+    document.getElementById('detail-equip').innerHTML = '<strong>Equipment needed:</strong> ' + p.equip;
+    showPage('detail');
+  }
 </script>
 </body>
 </html>
