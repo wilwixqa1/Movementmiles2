@@ -8,7 +8,7 @@ var gsHistory = [];
    Example: https://buy.stripe.com/your_link_id
    You can also use a Stripe Checkout Session URL from your backend.
 */
-var STRIPE_CHECKOUT_URL = 'https://buy.stripe.com/PLACEHOLDER';
+var STRIPE_CHECKOUT_URL = 'https://buy.stripe.com/test_cNiaEWajyfKq9xa47R0kE00';
 
 function gsParseButtons(text) {
   var match = text.match(/\[([^\]]+)\]\s*$/);
