@@ -3,6 +3,13 @@
 var GS_API = '/api/onboard-chat';
 var gsHistory = [];
 
+/* ── STRIPE CHECKOUT URL ──
+   Replace this placeholder with your real Stripe Payment Link.
+   Example: https://buy.stripe.com/your_link_id
+   You can also use a Stripe Checkout Session URL from your backend.
+*/
+var STRIPE_CHECKOUT_URL = 'https://buy.stripe.com/PLACEHOLDER';
+
 function gsParseButtons(text) {
   var match = text.match(/\[([^\]]+)\]\s*$/);
   if (!match) return { text: text, buttons: [] };
@@ -42,8 +49,9 @@ function gsShowThankYou() {
   var chat = document.querySelector('.gs-chat');
   chat.innerHTML = '<div class="gs-thank-you">' +
     '<h2>You\'re all set!</h2>' +
-    '<p>Thanks for chatting with Nelly! Based on your goals, we\'ve picked the perfect plan for you. Download the app to get started with your free month.</p>' +
-    '<a class="btn-primary" href="https://movementandmiles.ymove.app/p" target="_blank" style="padding:14px 40px">Download the App</a>' +
+    '<p>Thanks for chatting with Nelly! Based on your goals, we\'ve picked the perfect plan for you. Start your free month — no commitment, cancel anytime.</p>' +
+    '<a class="btn-primary" href="' + STRIPE_CHECKOUT_URL + '" target="_blank" style="padding:14px 40px;display:inline-block;margin-bottom:12px">Start Your Free Trial</a>' +
+    '<p style="font-size:0.85rem;color:#536c7c;margin-top:8px">Already have the app? <a href="https://movementandmiles.ymove.app/p" target="_blank" style="color:#182241;font-weight:600">Open Movement & Miles</a></p>' +
     '</div>';
 }
 
