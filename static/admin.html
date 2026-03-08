@@ -276,6 +276,48 @@
       <button class="export-btn" onclick="exportJourneyCSV()">Export User Journey CSV</button>
     </div>
 
+    <!-- Session 11: Manual Email Attach for Apple/Google subs -->
+    <div class="card" style="margin-bottom:24px">
+      <div class="section-title" style="margin-bottom:4px">Attach Email to Apple/Google Subscriber</div>
+      <p style="font-size:.8rem;color:var(--navy-mid);margin-bottom:16px;line-height:1.4">Look up an Apple/Google subscriber in ymove, then enter their email here. This permanently links their identity so they get full attribution in exports.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end">
+        <div>
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Subscription ID</label>
+          <input type="text" id="attach-sub-id" placeholder="e.g. import_apple_3f8a... or search" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" oninput="searchSubs()" />
+        </div>
+        <div>
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Email Address</label>
+          <input type="email" id="attach-email" placeholder="user@example.com" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" />
+        </div>
+        <div>
+          <button class="export-btn" style="margin-bottom:0;white-space:nowrap" onclick="doAttachEmail()">Attach Email</button>
+        </div>
+      </div>
+      <div id="attach-search-results" style="margin-top:8px;max-height:160px;overflow-y:auto;display:none"></div>
+      <div id="attach-msg" style="margin-top:10px;font-size:.82rem;display:none"></div>
+    </div>
+
+    <!-- Session 11: Manual Email Attach -->
+    <div class="card" style="margin-bottom:24px">
+      <div class="section-title" style="margin-bottom:4px">Attach Email to Apple/Google Subscriber</div>
+      <p style="font-size:.8rem;color:var(--navy-mid);margin-bottom:16px">Look up a subscriber in ymove, then enter their ID and email here. This permanently links their subscription to their lead data for full attribution.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end">
+        <div>
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Subscriber ID or Email</label>
+          <input type="text" id="attach-search" placeholder="e.g. import_apple_... or email" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" oninput="searchSubs()" />
+        </div>
+        <div>
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Email to Attach</label>
+          <input type="email" id="attach-email" placeholder="subscriber@email.com" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" />
+        </div>
+        <div style="display:flex;align-items:flex-end">
+          <button class="export-btn" style="margin-bottom:0;white-space:nowrap" onclick="doAttachEmail()">Attach Email</button>
+        </div>
+      </div>
+      <div id="attach-results" style="margin-top:8px;font-size:.82rem;max-height:160px;overflow-y:auto"></div>
+      <div id="attach-msg" style="margin-top:8px;font-size:.82rem;display:none"></div>
+    </div>
+
     <div class="stat-cards">
       <div class="stat-card">
         <div class="label">Active Subscribers</div>
@@ -954,6 +996,76 @@ function renderBarChart(containerId, data) {
   }).join('');
 }
 
+// --- Session 11: Attach Email to Apple/Google subscriber ---
+
+var searchTimeout = null;
+function searchSubs() {
+  var q = document.getElementById('attach-sub-id').value.trim();
+  var resultsEl = document.getElementById('attach-search-results');
+  if (q.length < 3) { resultsEl.style.display = 'none'; return; }
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(function() {
+    fetch('/api/admin/search-subscriptions?q=' + encodeURIComponent(q), {
+      headers: {'X-Admin-Password': adminPw}
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      var results = d.results || [];
+      if (results.length === 0) {
+        resultsEl.style.display = 'none';
+        return;
+      }
+      resultsEl.style.display = 'block';
+      resultsEl.innerHTML = '<table style="width:100%"><thead><tr><th>ID</th><th>Source</th><th>Status</th><th>Email</th><th>Plan</th><th></th></tr></thead><tbody>' +
+        results.map(function(r) {
+          var idShort = r.id.length > 30 ? r.id.slice(0,28) + '...' : r.id;
+          var srcTag = '<span class="tag tag-src-' + r.source + '">' + r.source + '</span>';
+          var statusTag = '<span class="tag tag-' + r.status + '">' + r.status + '</span>';
+          return '<tr><td title="' + escHtml(r.id) + '">' + escHtml(idShort) + '</td><td>' + srcTag + '</td><td>' + statusTag + '</td><td>' + (r.email || '<em style="color:var(--navy-mid)">none</em>') + '</td><td>' + r.plan + '</td><td><a href="#" onclick="pickSub(\'' + escHtml(r.id).replace(/'/g, "\\'") + '\');return false" style="color:var(--navy);font-weight:600;text-decoration:none">Select</a></td></tr>';
+        }).join('') + '</tbody></table>';
+    }).catch(function() { resultsEl.style.display = 'none'; });
+  }, 400);
+}
+
+function pickSub(id) {
+  document.getElementById('attach-sub-id').value = id;
+  document.getElementById('attach-search-results').style.display = 'none';
+  document.getElementById('attach-email').focus();
+}
+
+function doAttachEmail() {
+  var subId = document.getElementById('attach-sub-id').value.trim();
+  var email = document.getElementById('attach-email').value.trim();
+  var msg = document.getElementById('attach-msg');
+  if (!subId) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter a subscription ID.'; return; }
+  if (!email || email.indexOf('@') < 0) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter a valid email.'; return; }
+  if (!confirm('Attach ' + email + ' to subscription ' + subId + '?')) return;
+  fetch('/api/admin/attach-email', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
+    body: JSON.stringify({subscription_id: subId, email: email})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || 'Failed'); });
+    return r.json();
+  }).then(function(d) {
+    msg.style.display = 'block';
+    msg.style.color = 'var(--green)';
+    var txt = 'Email attached! ' + d.email + ' -> ' + d.subscription_id + ' (' + d.source + ')';
+    if (d.matched_lead) {
+      txt += ' | Matched lead: ' + (d.matched_lead.name || 'no name');
+      if (d.matched_lead.utm_source) txt += ', utm_source=' + d.matched_lead.utm_source;
+    } else {
+      txt += ' | No matching lead found (email not in leads table)';
+    }
+    msg.textContent = txt;
+    document.getElementById('attach-sub-id').value = '';
+    document.getElementById('attach-email').value = '';
+    document.getElementById('attach-search-results').style.display = 'none';
+  }).catch(function(e) {
+    msg.style.display = 'block';
+    msg.style.color = 'var(--red)';
+    msg.textContent = 'Error: ' + e.message;
+  });
+}
+
 // --- Session 11: CSV Exports ---
 
 function exportSubsCSV() {
@@ -1048,6 +1160,74 @@ function renderAdSpendTable(data) {
     var amt = '$' + (r.amount_cents / 100).toFixed(2);
     return '<tr><td>' + r.month + '</td><td>' + r.channel + '</td><td>' + amt + '</td><td><a href="#" onclick="deleteAdSpend(\'' + r.month + '\',\'' + r.channel + '\');return false" style="color:var(--red);font-size:.8rem;text-decoration:none">Delete</a></td></tr>';
   }).join('');
+}
+
+// --- Session 11: Attach Email to Apple/Google Sub ---
+
+var searchTimer = null;
+function searchSubs() {
+  clearTimeout(searchTimer);
+  var q = document.getElementById('attach-search').value.trim();
+  var resultsEl = document.getElementById('attach-results');
+  if (q.length < 3) { resultsEl.innerHTML = ''; return; }
+  searchTimer = setTimeout(function() {
+    fetch('/api/admin/search-subs?q=' + encodeURIComponent(q), {
+      headers: {'X-Admin-Password': adminPw}
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      var results = d.results || [];
+      if (results.length === 0) {
+        resultsEl.innerHTML = '<div style="color:var(--navy-mid);padding:8px 0">No matches found.</div>';
+        return;
+      }
+      resultsEl.innerHTML = '<table style="width:100%"><thead><tr><th>ID</th><th>Source</th><th>Email</th><th>Status</th><th>Plan</th><th>Signed Up</th><th></th></tr></thead><tbody>' +
+        results.map(function(r) {
+          var idShort = r.sub_id.length > 30 ? r.sub_id.slice(0, 28) + '...' : r.sub_id;
+          var emailCol = r.email || '<em style="color:var(--navy-mid)">none</em>';
+          var selectBtn = '<a href="#" onclick="selectSubForAttach(\x27' + r.sub_id.replace(/'/g, '') + '\x27);return false" style="color:var(--navy);font-size:.8rem;font-weight:600;text-decoration:none">Select</a>';
+          return '<tr><td style="font-size:.78rem">' + idShort + '</td><td><span class="tag tag-src-' + r.source + '">' + r.source + '</span></td><td>' + emailCol + '</td><td><span class="tag tag-' + r.status + '">' + r.status + '</span></td><td>' + r.plan + '</td><td>' + r.created + '</td><td>' + selectBtn + '</td></tr>';
+        }).join('') + '</tbody></table>';
+    }).catch(function() {
+      resultsEl.innerHTML = '<div style="color:var(--red)">Search error.</div>';
+    });
+  }, 400);
+}
+
+function selectSubForAttach(subId) {
+  document.getElementById('attach-search').value = subId;
+  document.getElementById('attach-results').innerHTML = '<div style="color:var(--green);padding:4px 0">Selected: ' + subId.slice(0, 40) + (subId.length > 40 ? '...' : '') + '</div>';
+  document.getElementById('attach-email').focus();
+}
+
+function doAttachEmail() {
+  var subId = document.getElementById('attach-search').value.trim();
+  var email = document.getElementById('attach-email').value.trim();
+  var msg = document.getElementById('attach-msg');
+
+  if (!subId) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter or select a subscriber ID.'; return; }
+  if (!email || email.indexOf('@') === -1) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter a valid email.'; return; }
+
+  if (!confirm('Attach ' + email + ' to subscription ' + subId.slice(0, 40) + '?')) return;
+
+  fetch('/api/admin/attach-email', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
+    body: JSON.stringify({subscriber_id: subId, email: email})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || 'Failed'); });
+    return r.json();
+  }).then(function(d) {
+    msg.style.display = 'block';
+    msg.style.color = 'var(--green)';
+    msg.textContent = 'Attached ' + d.new_email + ' to ' + d.source + ' sub. Old email: ' + (d.old_email || 'none');
+    document.getElementById('attach-search').value = '';
+    document.getElementById('attach-email').value = '';
+    document.getElementById('attach-results').innerHTML = '';
+    setTimeout(function() { msg.style.display = 'none'; }, 5000);
+  }).catch(function(e) {
+    msg.style.display = 'block';
+    msg.style.color = 'var(--red)';
+    msg.textContent = 'Error: ' + e.message;
+  });
 }
 
 // --- Session 11: Send Test Digest ---
