@@ -10,6 +10,7 @@ import asyncpg
 import stripe
 import re
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 from zoneinfo import ZoneInfo
 
 app = FastAPI(title="Movement & Miles")
@@ -1968,6 +1969,239 @@ async def admin_subscriptions_csv(request: Request):
         headers={"Content-Disposition": "attachment; filename=mm-subscriptions.csv"}
     )
 
+
+# --- Session 11: Multi-Tab XLSX Export (Meg format) ---
+
+@app.get("/api/admin/subscriptions-xlsx")
+async def admin_subscriptions_xlsx(request: Request):
+    """Export subscribers as multi-tab XLSX matching Meg's spreadsheet layout."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        # All subscriptions with lead data
+        all_subs = await conn.fetch("""
+            SELECT s.*,
+                   l.first_name as lead_name,
+                   l.extra as lead_last_name,
+                   l.utm_source as lead_utm_source,
+                   l.utm_medium as lead_utm_medium,
+                   l.utm_campaign as lead_utm_campaign
+            FROM subscriptions s
+            LEFT JOIN LATERAL (
+                SELECT first_name, extra, utm_source, utm_medium, utm_campaign
+                FROM leads
+                WHERE lower(leads.email) = lower(s.email) AND s.email != ''
+                ORDER BY created_at DESC LIMIT 1
+            ) l ON true
+            ORDER BY s.created_at
+        """)
+
+        # Leads without an active subscription (offered trial but not subscribed)
+        offered_leads = await conn.fetch("""
+            SELECT l.first_name, l.extra as last_name, l.email,
+                   l.experience_level, l.goals, l.recommended_plan,
+                   l.utm_source, l.utm_medium, l.utm_campaign, l.created_at
+            FROM leads l
+            WHERE l.email != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM subscriptions s
+                WHERE lower(s.email) = lower(l.email)
+                AND s.status IN ('active', 'trialing')
+            )
+            AND l.email NOT IN (
+                SELECT DISTINCT lower(email) FROM subscriptions
+                WHERE email != '' AND status = 'canceled'
+            )
+            ORDER BY l.created_at DESC
+        """)
+
+    # Split subs into tabs
+    apple_google_active = []
+    stripe_active = []
+    trialing = []
+    cancelled = []
+
+    for r in all_subs:
+        status = r.get("status", "")
+        source = r.get("source", "stripe") or "stripe"
+        if status == "trialing":
+            trialing.append(r)
+        elif status == "canceled":
+            cancelled.append(r)
+        elif status == "active":
+            if source in ("apple", "google"):
+                apple_google_active.append(r)
+            else:
+                stripe_active.append(r)
+
+    # Build workbook
+    wb = Workbook()
+
+    # Style definitions
+    hdr_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    hdr_fill_navy = PatternFill("solid", fgColor="182241")
+    hdr_fill_green = PatternFill("solid", fgColor="2d6a2d")
+    hdr_fill_blue = PatternFill("solid", fgColor="3949ab")
+    hdr_fill_orange = PatternFill("solid", fgColor="b35a00")
+    hdr_fill_red = PatternFill("solid", fgColor="c0392b")
+    cancel_fill = PatternFill("solid", fgColor="FF6666")
+    data_font = Font(name="Arial", size=10)
+    center = Alignment(horizontal="center")
+    thin_border = Border(
+        bottom=Side(style="thin", color="E0E0E0")
+    )
+
+    SUB_HEADERS = [
+        "Readable ID", "First Name", "Last Name", "Email", "Sign-up Date",
+        "Source", "Status", "Plan", "Trial Start", "Trial End",
+        "Converted", "Renewals", "Last Renewed", "Cancel Date",
+        "Months Active", "Est Revenue", "UTM Source", "UTM Medium", "UTM Campaign"
+    ]
+
+    def sub_row(r):
+        source = r.get("source", "stripe") or "stripe"
+        rid = r.get("readable_id", "") or r.get("stripe_subscription_id", "") or ""
+        plan_amount = r.get("plan_amount", 0) or 0
+        plan_interval = r.get("plan_interval", "") or ""
+        created = r.get("created_at")
+        canceled = r.get("canceled_at")
+        if plan_interval == "year":
+            plan_disp = f"${plan_amount/100:.2f}/yr"
+        elif plan_interval == "month":
+            plan_disp = f"${plan_amount/100:.2f}/mo"
+        else:
+            plan_disp = f"${plan_amount/100:.2f}" if plan_amount else ""
+        months = 0
+        revenue = 0
+        if created and plan_amount:
+            end = canceled if canceled else datetime.now(timezone.utc)
+            months = round(max(1, (end - created).days / 30), 1)
+            meq = plan_amount / 12 if plan_interval == "year" else plan_amount
+            revenue = round(meq * months)
+        return [
+            rid,
+            r.get("lead_name", "") or "",
+            r.get("lead_last_name", "") or "",
+            r.get("email", "") or "",
+            created.strftime("%Y-%m-%d") if created else "",
+            source.upper(),
+            r.get("status", ""),
+            plan_disp,
+            r["trial_start"].strftime("%Y-%m-%d") if r.get("trial_start") else "",
+            r["trial_end"].strftime("%Y-%m-%d") if r.get("trial_end") else "",
+            r["converted_at"].strftime("%Y-%m-%d") if r.get("converted_at") else "",
+            r.get("renewal_count", 0) or 0,
+            r["last_renewed_at"].strftime("%Y-%m-%d") if r.get("last_renewed_at") else "",
+            canceled.strftime("%Y-%m-%d") if canceled else "",
+            months,
+            f"${revenue/100:.2f}" if revenue else "",
+            r.get("lead_utm_source", "") or "",
+            r.get("lead_utm_medium", "") or "",
+            r.get("lead_utm_campaign", "") or "",
+        ]
+
+    def write_sub_sheet(ws, rows, hdr_fill):
+        for ci, h in enumerate(SUB_HEADERS, 1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = center
+        for ri, r in enumerate(rows, 2):
+            vals = sub_row(r)
+            for ci, v in enumerate(vals, 1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.font = data_font
+                c.border = thin_border
+        # Auto-width
+        for ci in range(1, len(SUB_HEADERS) + 1):
+            max_len = len(SUB_HEADERS[ci-1])
+            for ri in range(2, min(len(rows)+2, 100)):
+                val = ws.cell(row=ri, column=ci).value
+                if val:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 3, 30)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions if len(rows) > 0 else "A1:S1"
+
+    # Tab 1: Apple & Google Members
+    ws1 = wb.active
+    ws1.title = "Apple & Google Members"
+    write_sub_sheet(ws1, apple_google_active, hdr_fill_navy)
+
+    # Tab 2: Stripe Members
+    ws2 = wb.create_sheet("Stripe Members")
+    write_sub_sheet(ws2, stripe_active, hdr_fill_green)
+
+    # Tab 3: Free Month Trial
+    ws3 = wb.create_sheet("Free Month Trial")
+    write_sub_sheet(ws3, trialing, hdr_fill_blue)
+
+    # Tab 4: Downloaded & Offered Trial (leads without active sub)
+    ws4 = wb.create_sheet("Downloaded & Offered Trial")
+    lead_headers = [
+        "First Name", "Last Name", "Email", "Date",
+        "Experience", "Goals", "Recommended Plan",
+        "UTM Source", "UTM Medium", "UTM Campaign"
+    ]
+    for ci, h in enumerate(lead_headers, 1):
+        c = ws4.cell(row=1, column=ci, value=h)
+        c.font = hdr_font
+        c.fill = hdr_fill_orange
+        c.alignment = center
+    for ri, r in enumerate(offered_leads, 2):
+        vals = [
+            r.get("first_name", "") or "",
+            r.get("last_name", "") or "",
+            r.get("email", "") or "",
+            r["created_at"].strftime("%Y-%m-%d") if r.get("created_at") else "",
+            r.get("experience_level", "") or "",
+            r.get("goals", "") or "",
+            r.get("recommended_plan", "") or "",
+            r.get("utm_source", "") or "",
+            r.get("utm_medium", "") or "",
+            r.get("utm_campaign", "") or "",
+        ]
+        for ci, v in enumerate(vals, 1):
+            c = ws4.cell(row=ri, column=ci, value=v)
+            c.font = data_font
+            c.border = thin_border
+    for ci in range(1, len(lead_headers) + 1):
+        max_len = len(lead_headers[ci-1])
+        for ri in range(2, min(len(offered_leads)+2, 100)):
+            val = ws4.cell(row=ri, column=ci).value
+            if val:
+                max_len = max(max_len, len(str(val)))
+        ws4.column_dimensions[get_column_letter(ci)].width = min(max_len + 3, 30)
+    ws4.freeze_panes = "A2"
+    if len(offered_leads) > 0:
+        ws4.auto_filter.ref = ws4.dimensions
+
+    # Tab 5: Cancelled Subscription
+    ws5 = wb.create_sheet("Cancelled Subscription")
+    write_sub_sheet(ws5, cancelled, hdr_fill_red)
+    # Highlight cancelled rows in red
+    for ri in range(2, len(cancelled) + 2):
+        for ci in range(1, len(SUB_HEADERS) + 1):
+            cell = ws5.cell(row=ri, column=ci)
+            cell.fill = PatternFill("solid", fgColor="FFE0E0")
+
+    # Save to bytes
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=mm-subscribers.xlsx"}
+    )
 
 # --- Session 11: User Journey CSV (lead -> subscriber timeline) ---
 
