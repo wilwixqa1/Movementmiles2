@@ -273,6 +273,7 @@
     <!-- Session 11: Export buttons -->
     <div class="export-btn-row">
       <button class="export-btn" onclick="exportSubsCSV()">Export Subscriptions CSV</button>
+      <button class="export-btn" onclick="exportSubsXLSX()" style="background:var(--green)">Export Subscribers XLSX</button>
       <button class="export-btn" onclick="exportJourneyCSV()">Export User Journey CSV</button>
     </div>
 
@@ -1008,6 +1009,25 @@ function exportSubsCSV() {
   }).catch(function(err) {
     console.error('Subs CSV export error:', err);
     alert('Failed to export subscriptions CSV.');
+  });
+}
+
+function exportSubsXLSX() {
+  fetch('/api/admin/subscriptions-xlsx', {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(res) {
+    if (!res.ok) throw new Error('Failed');
+    return res.blob();
+  }).then(function(blob) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'mm-subscribers.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+  }).catch(function(err) {
+    console.error('XLSX export error:', err);
+    alert('Failed to export XLSX. Check console.');
   });
 }
 
