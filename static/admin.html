@@ -31,6 +31,7 @@
   .section-label{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--navy-mid);margin-bottom:12px;margin-top:8px}
 
   .stat-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:12px}
+  .stat-cards-2{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:12px}
   .stat-card{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:24px}
   .stat-card .label{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--navy-mid);margin-bottom:8px}
   .stat-card .value{font-size:2rem;font-weight:600;color:var(--navy)}
@@ -111,14 +112,14 @@
   .csv-upload{margin-bottom:12px}
   .csv-upload input[type=file]{font-size:.82rem;font-family:inherit}
 
-  /* Data Tools Toggle */
-  .tools-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;margin-bottom:12px;margin-top:8px}
-  .tools-toggle .section-label{margin:0;cursor:pointer}
-  .tools-toggle .chevron{font-size:.65rem;color:var(--navy-mid);transition:transform .2s}
-  .tools-toggle .chevron.open{transform:rotate(90deg)}
-  .tools-toggle .tool-count{font-size:.7rem;color:var(--navy-mid);font-weight:400;margin-left:4px}
-  .tools-body{overflow:hidden;max-height:0;transition:max-height .3s ease-out}
-  .tools-body.open{max-height:2000px;transition:max-height .4s ease-in}
+  /* Collapsible toggle */
+  .section-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;margin-bottom:12px;margin-top:8px}
+  .section-toggle .section-label{margin:0;cursor:pointer}
+  .section-toggle .chevron{font-size:.65rem;color:var(--navy-mid);transition:transform .2s}
+  .section-toggle .chevron.open{transform:rotate(90deg)}
+  .section-toggle .toggle-hint{font-size:.7rem;color:var(--navy-mid);font-weight:400;margin-left:4px}
+  .collapsible{overflow:hidden;max-height:0;transition:max-height .3s ease-out}
+  .collapsible.open{max-height:4000px;transition:max-height .5s ease-in}
 
   /* UTM Link Generator */
   .utm-gen{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px}
@@ -137,10 +138,12 @@
 
   @media(max-width:768px){
     .stat-cards{grid-template-columns:repeat(2,1fr)}
+    .stat-cards-2{grid-template-columns:1fr}
     .views-grid{grid-template-columns:1fr}
     .dash-body{padding:20px 16px}
     .dash-nav{padding:16px}
     .utm-row{grid-template-columns:1fr}
+    .tools-grid{grid-template-columns:1fr}
   }
 </style>
 </head>
@@ -160,11 +163,11 @@
 <!-- Dashboard -->
 <div class="dash" id="dashboard">
   <div class="dash-nav">
-    <h1>Movement & Miles — Admin</h1>
+    <h1>Movement &amp; Miles -- Admin</h1>
     <div class="dash-nav-right">
       <a onclick="loadStats()">Refresh</a>
       <a onclick="exportCSV()">Export Leads CSV</a>
-      <a href="/">← Back to Site</a>
+      <a href="/">Back to Site</a>
     </div>
   </div>
   <div class="dash-body">
@@ -183,10 +186,144 @@
       <span class="date-range-label" id="range-label">Showing: All Time</span>
     </div>
 
+    <!-- ============================================ -->
+    <!-- SECTION 1: REVENUE                           -->
+    <!-- ============================================ -->
+    <div class="section-label">Revenue</div>
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">Gross MRR</div>
+        <div class="value green" id="s-mrr">--</div>
+        <div class="sub">Before platform fees</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Net MRR</div>
+        <div class="value green" id="s-net-mrr">--</div>
+        <div class="sub">After all fees</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Gross ARR</div>
+        <div class="value green" id="s-arr">--</div>
+        <div class="sub">Gross MRR x 12</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Net ARR</div>
+        <div class="value green" id="s-net-arr">--</div>
+        <div class="sub">Net MRR x 12</div>
+      </div>
+    </div>
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">Platform Fees / Mo</div>
+        <div class="value orange" id="s-total-fees">--</div>
+        <div class="sub" id="s-fees-pct"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Apple Fees / Mo</div>
+        <div class="value" id="s-apple-fees">--</div>
+        <div class="sub">15% of Apple MRR</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Google Fees / Mo</div>
+        <div class="value" id="s-google-fees">--</div>
+        <div class="sub">15% of Google MRR</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Stripe Fees / Mo</div>
+        <div class="value" id="s-stripe-fees">--</div>
+        <div class="sub">~2.9% of Stripe MRR</div>
+      </div>
+    </div>
+
+    <!-- Revenue Charts -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">MRR Trend (Last 6 Months)</div>
+        <div id="chart-mrr-trend" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">MRR by Source</div>
+        <div id="chart-mrr-source" class="bar-chart"></div>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
+    <!-- ============================================ -->
+    <!-- SECTION 2: SUBSCRIBERS                       -->
+    <!-- ============================================ -->
+    <div class="section-label">Subscribers</div>
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">Active Subscribers</div>
+        <div class="value" id="s-active-subs">--</div>
+        <div class="sub" id="s-active-sub-detail"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Trial to Paid</div>
+        <div class="value" id="s-conversion">--</div>
+        <div class="sub">Conversion rate</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">30-Day Churn</div>
+        <div class="value" id="s-churn">--</div>
+        <div class="sub" id="s-churn-detail"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Total Subs</div>
+        <div class="value" id="s-total-subs">--</div>
+        <div class="sub">All time</div>
+      </div>
+    </div>
+    <div class="stat-cards-2">
+      <div class="stat-card">
+        <div class="label">Est. LTV</div>
+        <div class="value" id="s-ltv">--</div>
+        <div class="sub" id="s-ltv-detail"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Avg Sub Age</div>
+        <div class="value" id="s-sub-age">--</div>
+        <div class="sub">days active</div>
+      </div>
+    </div>
+
+    <!-- Subscriber Charts -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Subscriptions by Status</div>
+        <div id="chart-sub-status" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Subscribers by Source</div>
+        <div id="chart-sub-source" class="bar-chart"></div>
+      </div>
+    </div>
+
+    <!-- Recent Subscription Events -->
+    <div class="card">
+      <div class="section-title">Recent Subscription Events</div>
+      <div style="overflow-x:auto;max-height:220px;overflow-y:auto">
+        <table>
+          <thead><tr><th>Event</th><th>Source</th><th>Customer</th><th>Time</th></tr></thead>
+          <tbody id="events-tbody">
+            <tr><td colspan="4" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
+    <!-- ============================================ -->
+    <!-- SECTION 3: MARKETING & ATTRIBUTION           -->
+    <!-- ============================================ -->
+    <div class="section-label">Marketing &amp; Attribution</div>
+
     <!-- UTM Link Generator -->
     <div class="utm-gen">
       <h3>UTM Link Generator</h3>
-      <div class="utm-sub">Build tracked links for your campaigns. The UTM tags show up in Channel Attribution below.</div>
+      <div class="utm-sub">Build tracked links for your campaigns. Results show in the charts below.</div>
       <div class="utm-row">
         <div class="utm-field">
           <label>Base URL</label>
@@ -240,13 +377,103 @@
       </div>
     </div>
 
-    <!-- Data Tools (collapsed) -->
-    <div class="tools-toggle" onclick="toggleDataTools()">
-      <div class="section-label">Data Tools</div>
-      <span class="chevron" id="tools-chevron">&#9654;</span>
-      <span class="tool-count">(5 tools)</span>
+    <!-- Attribution Charts -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Leads by Source</div>
+        <div id="chart-leads-source" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Leads by Medium</div>
+        <div id="chart-leads-medium" class="bar-chart"></div>
+      </div>
     </div>
-    <div class="tools-body" id="tools-body">
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Leads by Campaign (Top 10)</div>
+        <div id="chart-leads-campaign" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Channel Breakdown</div>
+        <div style="overflow-x:auto;max-height:220px;overflow-y:auto">
+          <table>
+            <thead><tr><th>Source</th><th>Leads</th><th>Share</th></tr></thead>
+            <tbody id="attribution-tbody">
+              <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
+    <!-- ============================================ -->
+    <!-- SECTION 4: ENGAGEMENT & LEADS                -->
+    <!-- ============================================ -->
+    <div class="section-label">Engagement &amp; Leads</div>
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">Total Leads</div>
+        <div class="value" id="s-leads">--</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Page Views Today</div>
+        <div class="value" id="s-views-today">--</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Total Page Views</div>
+        <div class="value" id="s-views-total">--</div>
+        <div class="sub">Last 7 days tracked</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Chat Sessions</div>
+        <div class="value" id="s-chats">--</div>
+        <div class="sub" id="s-chats-sub"></div>
+      </div>
+    </div>
+
+    <!-- Page Views Charts -->
+    <div class="views-grid">
+      <div class="card">
+        <div class="section-title">Views by Page (7 days)</div>
+        <div id="chart-by-page" class="bar-chart"></div>
+      </div>
+      <div class="card">
+        <div class="section-title">Views by Day (7 days)</div>
+        <div id="chart-by-day" class="bar-chart"></div>
+      </div>
+    </div>
+
+    <!-- Leads Table -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:0">Recent Leads</div>
+        <button class="export-btn" onclick="exportCSV()">Download CSV</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>Date</th><th>Name</th><th>Email</th><th>Level</th><th>Goals</th><th>Plan</th><th>Referral</th></tr>
+          </thead>
+          <tbody id="leads-tbody">
+            <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+
+    <!-- ============================================ -->
+    <!-- SECTION 5: ADMIN TOOLS (collapsed)           -->
+    <!-- ============================================ -->
+    <div class="section-toggle" onclick="toggleSection('tools')">
+      <div class="section-label">Admin Tools</div>
+      <span class="chevron" id="chevron-tools">&#9654;</span>
+      <span class="toggle-hint">(5 tools)</span>
+    </div>
+    <div class="collapsible" id="body-tools">
       <div class="tools-grid">
         <div class="tool-card">
           <h3>Backfill Stripe</h3>
@@ -288,200 +515,6 @@
       </div>
     </div>
 
-    <!-- Revenue Section -->
-    <div class="section-label">Revenue & Subscriptions</div>
-    <div class="stat-cards">
-      <div class="stat-card">
-        <div class="label">MRR</div>
-        <div class="value green" id="s-mrr">—</div>
-        <div class="sub">Monthly Recurring Revenue</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">ARR</div>
-        <div class="value green" id="s-arr">—</div>
-        <div class="sub">Annual Recurring Revenue</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Est. LTV</div>
-        <div class="value" id="s-ltv">—</div>
-        <div class="sub" id="s-ltv-detail"></div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Avg Sub Age</div>
-        <div class="value" id="s-sub-age">—</div>
-        <div class="sub">days active</div>
-      </div>
-    </div>
-    <div class="stat-cards">
-      <div class="stat-card">
-        <div class="label">Active Subscribers</div>
-        <div class="value" id="s-active-subs">—</div>
-        <div class="sub" id="s-active-sub-detail"></div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Trial → Paid</div>
-        <div class="value" id="s-conversion">—</div>
-        <div class="sub">Conversion rate</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">30-Day Churn</div>
-        <div class="value" id="s-churn">—</div>
-        <div class="sub" id="s-churn-detail"></div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Total Subs</div>
-        <div class="value" id="s-total-subs">—</div>
-        <div class="sub">All time</div>
-      </div>
-    </div>
-
-    <!-- Net MRR & Platform Fees -->
-    <div class="stat-cards">
-      <div class="stat-card">
-        <div class="label">Net MRR</div>
-        <div class="value green" id="s-net-mrr">—</div>
-        <div class="sub">After platform fees</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Platform Fees / Mo</div>
-        <div class="value orange" id="s-total-fees">—</div>
-        <div class="sub" id="s-fees-pct"></div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Apple Fees / Mo</div>
-        <div class="value" id="s-apple-fees">—</div>
-        <div class="sub">15% of Apple MRR</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Google Fees / Mo</div>
-        <div class="value" id="s-google-fees">—</div>
-        <div class="sub">15% of Google MRR</div>
-      </div>
-    </div>
-
-    <!-- Subscription Charts Row 1 -->
-    <div class="views-grid">
-      <div class="card">
-        <div class="section-title">Subscriptions by Status</div>
-        <div id="chart-sub-status" class="bar-chart"></div>
-      </div>
-      <div class="card">
-        <div class="section-title">Subscribers by Source</div>
-        <div id="chart-sub-source" class="bar-chart"></div>
-      </div>
-    </div>
-
-    <!-- MRR Trend -->
-    <div class="card" style="margin-bottom:24px">
-      <div class="section-title">MRR Trend (Last 6 Months)</div>
-      <div id="chart-mrr-trend" class="bar-chart"></div>
-    </div>
-
-    <!-- Subscription Charts Row 2 -->
-    <div class="views-grid">
-      <div class="card">
-        <div class="section-title">MRR by Source</div>
-        <div id="chart-mrr-source" class="bar-chart"></div>
-      </div>
-      <div class="card">
-        <div class="section-title">Recent Subscription Events</div>
-        <div style="overflow-x:auto;max-height:200px;overflow-y:auto">
-          <table>
-            <thead><tr><th>Event</th><th>Source</th><th>Customer</th><th>Time</th></tr></thead>
-            <tbody id="events-tbody">
-              <tr><td colspan="4" class="empty-msg">Loading...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <hr class="divider"/>
-
-    <!-- Engagement Section -->
-    <div class="section-label">Channel Attribution (UTM)</div>
-    <div class="views-grid">
-      <div class="card">
-        <div class="section-title">Leads by Source</div>
-        <div id="chart-leads-source" class="bar-chart"></div>
-      </div>
-      <div class="card">
-        <div class="section-title">Leads by Medium</div>
-        <div id="chart-leads-medium" class="bar-chart"></div>
-      </div>
-    </div>
-    <div class="views-grid">
-      <div class="card">
-        <div class="section-title">Leads by Campaign (Top 10)</div>
-        <div id="chart-leads-campaign" class="bar-chart"></div>
-      </div>
-      <div class="card">
-        <div class="section-title">Channel Breakdown</div>
-        <div style="overflow-x:auto;max-height:220px;overflow-y:auto">
-          <table>
-            <thead><tr><th>Source</th><th>Leads</th><th>Share</th></tr></thead>
-            <tbody id="attribution-tbody">
-              <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <hr class="divider"/>
-
-    <div class="section-label">Engagement & Leads</div>
-    <div class="stat-cards">
-      <div class="stat-card">
-        <div class="label">Total Leads</div>
-        <div class="value" id="s-leads">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Page Views Today</div>
-        <div class="value" id="s-views-today">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Total Page Views</div>
-        <div class="value" id="s-views-total">—</div>
-        <div class="sub">Last 7 days tracked</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Chat Sessions</div>
-        <div class="value" id="s-chats">—</div>
-        <div class="sub" id="s-chats-sub"></div>
-      </div>
-    </div>
-
-    <!-- Page Views Charts -->
-    <div class="views-grid">
-      <div class="card">
-        <div class="section-title">Views by Page (7 days)</div>
-        <div id="chart-by-page" class="bar-chart"></div>
-      </div>
-      <div class="card">
-        <div class="section-title">Views by Day (7 days)</div>
-        <div id="chart-by-day" class="bar-chart"></div>
-      </div>
-    </div>
-
-    <!-- Leads Table -->
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <div class="section-title" style="margin-bottom:0">Recent Leads</div>
-        <button class="export-btn" onclick="exportCSV()">Download CSV</button>
-      </div>
-      <div style="overflow-x:auto">
-        <table>
-          <thead>
-            <tr><th>Date</th><th>Name</th><th>Email</th><th>Level</th><th>Goals</th><th>Plan</th><th>Referral</th></tr>
-          </thead>
-          <tbody id="leads-tbody">
-            <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
   </div>
 </div>
 
@@ -508,10 +541,10 @@ function doLogin() {
   });
 }
 
-// --- Data Tools Toggle ---
-function toggleDataTools() {
-  var body = document.getElementById('tools-body');
-  var chevron = document.getElementById('tools-chevron');
+// --- Collapsible sections ---
+function toggleSection(name) {
+  var body = document.getElementById('body-' + name);
+  var chevron = document.getElementById('chevron-' + name);
   body.classList.toggle('open');
   chevron.classList.toggle('open');
 }
@@ -559,9 +592,7 @@ function updateUtmPreview() {
   if (campaign) params.push('utm_campaign=' + encodeURIComponent(campaign));
 
   var sep = base.indexOf('?') > -1 ? '&' : '?';
-  var url = base + sep + params.join('&');
 
-  // Highlight the UTM params in green
   var baseDisplay = escHtml(base + sep);
   var paramsDisplay = params.map(function(p) {
     return '<span class="utm-param">' + escHtml(p) + '</span>';
@@ -655,6 +686,11 @@ function clearDateFilter() {
   loadStats();
 }
 
+// --- Dollar formatter ---
+function fmtDollars(cents) {
+  return '$' + (cents / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
 function loadStats() {
   var statsUrl = '/api/admin/stats';
   var qp = [];
@@ -667,29 +703,15 @@ function loadStats() {
     if (!res.ok) throw new Error('Failed');
     return res.json();
   }).then(function(d) {
-    // --- Revenue cards ---
     var subs = d.subscriptions || {};
-    document.getElementById('s-mrr').textContent = subs.mrr_display || '$0.00';
-    document.getElementById('s-arr').textContent = subs.arr_display || '$0.00';
-    document.getElementById('s-ltv').textContent = subs.est_ltv_display || '$0.00';
-    var ltv_months = ((subs.avg_sub_age_days || 30) / 30).toFixed(1);
-    document.getElementById('s-ltv-detail').textContent = 'Based on ~' + ltv_months + ' mo avg lifetime';
-    document.getElementById('s-sub-age').textContent = Math.round(subs.avg_sub_age_days || 0);
-    document.getElementById('s-total-subs').textContent = subs.total || 0;
-    document.getElementById('s-active-subs').textContent = subs.active || 0;
 
-    var trialText = (subs.trialing || 0) + ' trialing';
-    document.getElementById('s-active-sub-detail').textContent = trialText;
+    // --- Revenue: Gross MRR/ARR ---
+    var grossMrrDisplay = subs.mrr_display || '$0.00';
+    var grossArrDisplay = subs.arr_display || '$0.00';
+    document.getElementById('s-mrr').textContent = grossMrrDisplay;
+    document.getElementById('s-arr').textContent = grossArrDisplay;
 
-    document.getElementById('s-conversion').textContent = (subs.trial_conversion_rate || 0) + '%';
-
-    var churnVal = subs.churn_rate_30d || 0;
-    var churnEl = document.getElementById('s-churn');
-    churnEl.textContent = churnVal + '%';
-    churnEl.className = 'value' + (churnVal > 10 ? ' red' : churnVal > 5 ? ' orange' : ' green');
-    document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d';
-
-    // --- Net MRR & Platform Fees ---
+    // --- Revenue: Platform Fees ---
     var mrrBySource = subs.mrr_by_source || [];
     var grossMrrCents = 0;
     var appleMrrCents = 0;
@@ -706,43 +728,62 @@ function loadStats() {
     var stripeFees = Math.round(stripeMrrCents * 0.029);
     var totalFees = appleFees + googleFees + stripeFees;
     var netMrrCents = grossMrrCents - totalFees;
-    var fmtDollars = function(cents) { return '$' + (cents / 100).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}); };
+    var netArrCents = netMrrCents * 12;
+
     document.getElementById('s-net-mrr').textContent = fmtDollars(netMrrCents);
+    document.getElementById('s-net-arr').textContent = fmtDollars(netArrCents);
     document.getElementById('s-total-fees').textContent = fmtDollars(totalFees);
     var feesPct = grossMrrCents > 0 ? ((totalFees / grossMrrCents) * 100).toFixed(1) : '0.0';
-    document.getElementById('s-fees-pct').textContent = feesPct + '% of gross MRR (incl Stripe 2.9%)';
+    document.getElementById('s-fees-pct').textContent = feesPct + '% of gross MRR';
     document.getElementById('s-apple-fees').textContent = fmtDollars(appleFees);
     document.getElementById('s-google-fees').textContent = fmtDollars(googleFees);
+    document.getElementById('s-stripe-fees').textContent = fmtDollars(stripeFees);
 
-    // Subscription status chart
-    var statusColors = {active:'green', trialing:'mid', canceled:'red', past_due:'orange', incomplete:'mid'};
-    renderBarChart('chart-sub-status', (subs.by_status || []).map(function(r) {
-      return {label: r.status, value: r.count, color: statusColors[r.status] || 'navy'};
-    }));
+    // --- Subscribers ---
+    document.getElementById('s-total-subs').textContent = subs.total || 0;
+    document.getElementById('s-active-subs').textContent = subs.active || 0;
+    document.getElementById('s-active-sub-detail').textContent = (subs.trialing || 0) + ' trialing';
+    document.getElementById('s-conversion').textContent = (subs.trial_conversion_rate || 0) + '%';
 
-    // Subscribers by source chart
+    var churnVal = subs.churn_rate_30d || 0;
+    var churnEl = document.getElementById('s-churn');
+    churnEl.textContent = churnVal + '%';
+    churnEl.className = 'value' + (churnVal > 10 ? ' red' : churnVal > 5 ? ' orange' : ' green');
+    document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d';
+
+    document.getElementById('s-ltv').textContent = subs.est_ltv_display || '$0.00';
+    var ltv_months = ((subs.avg_sub_age_days || 30) / 30).toFixed(1);
+    document.getElementById('s-ltv-detail').textContent = 'Based on ~' + ltv_months + ' mo avg lifetime';
+    document.getElementById('s-sub-age').textContent = Math.round(subs.avg_sub_age_days || 0);
+
+    // --- Revenue charts ---
     var sourceColors = {stripe:'navy', apple:'mid', google:'green'};
-    renderBarChart('chart-sub-source', (subs.by_source || []).map(function(r) {
-      return {label: r.source, value: r.active, color: sourceColors[r.source] || 'navy'};
-    }));
 
-    // MRR trend chart
     renderBarChart('chart-mrr-trend', (subs.mrr_trend || []).map(function(r) {
       var dollars = (r.mrr_cents / 100).toFixed(0);
       return {label: r.month.slice(5), value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
     }));
 
-    // MRR by source chart
     renderBarChart('chart-mrr-source', (subs.mrr_by_source || []).map(function(r) {
       var dollars = (r.mrr_cents / 100).toFixed(0);
       return {label: r.source, value: r.mrr_cents, color: sourceColors[r.source] || 'navy', displayValue: '$' + dollars};
+    }));
+
+    // --- Subscriber charts ---
+    var statusColors = {active:'green', trialing:'mid', canceled:'red', past_due:'orange', incomplete:'mid'};
+    renderBarChart('chart-sub-status', (subs.by_status || []).map(function(r) {
+      return {label: r.status, value: r.count, color: statusColors[r.status] || 'navy'};
+    }));
+
+    renderBarChart('chart-sub-source', (subs.by_source || []).map(function(r) {
+      return {label: r.source, value: r.active, color: sourceColors[r.source] || 'navy'};
     }));
 
     // Recent events table
     var evtBody = document.getElementById('events-tbody');
     var events = subs.recent_events || [];
     if (events.length === 0) {
-      evtBody.innerHTML = '<tr><td colspan="4" class="empty-msg">No events yet. Connect Stripe to see activity.</td></tr>';
+      evtBody.innerHTML = '<tr><td colspan="4" class="empty-msg">No events yet.</td></tr>';
     } else {
       evtBody.innerHTML = events.map(function(e) {
         var evtName = (e.event_type || '').replace('customer.subscription.', 'sub.');
@@ -762,7 +803,6 @@ function loadStats() {
     var chatSub = d.chats.by_type.map(function(c){return c.session_type+': '+c.count}).join(', ');
     document.getElementById('s-chats-sub').textContent = chatSub || 'No sessions yet';
 
-    // Bar charts
     renderBarChart('chart-by-page', d.page_views.by_page.map(function(r){
       return {label: r.page, value: r.views, color: 'navy'};
     }));
@@ -770,7 +810,7 @@ function loadStats() {
       return {label: r.day.slice(5), value: r.views, color: 'navy'};
     }));
 
-    // --- Channel Attribution charts ---
+    // --- Attribution charts ---
     var srcColors = ['navy','green','orange','mid','red'];
     renderBarChart('chart-leads-source', (d.leads.by_source || []).map(function(r, i) {
       return {label: r.channel, value: r.count, color: srcColors[i % srcColors.length]};
@@ -782,12 +822,11 @@ function loadStats() {
       var lbl = r.campaign.length > 15 ? r.campaign.slice(0,14) + '...' : r.campaign;
       return {label: lbl, value: r.count, color: srcColors[i % srcColors.length]};
     }));
-    // Attribution breakdown table
     var attrBody = document.getElementById('attribution-tbody');
     var bySrc = d.leads.by_source || [];
     var totalLeadsForPct = d.leads.total || 1;
     if (bySrc.length === 0) {
-      attrBody.innerHTML = '<tr><td colspan="3" class="empty-msg">No UTM data yet. Add ?utm_source=... to your ad links.</td></tr>';
+      attrBody.innerHTML = '<tr><td colspan="3" class="empty-msg">No UTM data yet. Use the link generator above!</td></tr>';
     } else {
       attrBody.innerHTML = bySrc.map(function(r) {
         var pct = ((r.count / totalLeadsForPct) * 100).toFixed(1);
@@ -802,8 +841,8 @@ function loadStats() {
       return;
     }
     tbody.innerHTML = d.leads.recent.map(function(l){
-      var dt = l.created_at ? new Date(l.created_at).toLocaleDateString() : '—';
-      return '<tr><td>'+dt+'</td><td>'+(l.first_name||'—')+'</td><td>'+(l.email||'—')+'</td><td>'+(l.experience_level||'—')+'</td><td>'+(l.goals||'—')+'</td><td>'+(l.recommended_plan||'—')+'</td><td>'+(l.referral_source||'—')+'</td></tr>';
+      var dt = l.created_at ? new Date(l.created_at).toLocaleDateString() : '--';
+      return '<tr><td>'+dt+'</td><td>'+(l.first_name||'--')+'</td><td>'+(l.email||'--')+'</td><td>'+(l.experience_level||'--')+'</td><td>'+(l.goals||'--')+'</td><td>'+(l.recommended_plan||'--')+'</td><td>'+(l.referral_source||'--')+'</td></tr>';
     }).join('');
   }).catch(function(err) {
     console.error('Stats error:', err);
@@ -993,6 +1032,7 @@ function doReconcile() {
     btn.disabled = false;
   });
 }
+
 function exportCSV() {
   fetch('/api/admin/leads-csv', {
     headers: {'X-Admin-Password': adminPw}
