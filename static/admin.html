@@ -335,6 +335,30 @@
       </div>
     </div>
 
+    <!-- Net MRR & Platform Fees -->
+    <div class="stat-cards">
+      <div class="stat-card">
+        <div class="label">Net MRR</div>
+        <div class="value green" id="s-net-mrr">—</div>
+        <div class="sub">After platform fees</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Platform Fees / Mo</div>
+        <div class="value orange" id="s-total-fees">—</div>
+        <div class="sub" id="s-fees-pct"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Apple Fees / Mo</div>
+        <div class="value" id="s-apple-fees">—</div>
+        <div class="sub">15% of Apple MRR</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Google Fees / Mo</div>
+        <div class="value" id="s-google-fees">—</div>
+        <div class="sub">15% of Google MRR</div>
+      </div>
+    </div>
+
     <!-- Subscription Charts Row 1 -->
     <div class="views-grid">
       <div class="card">
@@ -664,6 +688,31 @@ function loadStats() {
     churnEl.textContent = churnVal + '%';
     churnEl.className = 'value' + (churnVal > 10 ? ' red' : churnVal > 5 ? ' orange' : ' green');
     document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d';
+
+    // --- Net MRR & Platform Fees ---
+    var mrrBySource = subs.mrr_by_source || [];
+    var grossMrrCents = 0;
+    var appleMrrCents = 0;
+    var googleMrrCents = 0;
+    var stripeMrrCents = 0;
+    mrrBySource.forEach(function(r) {
+      grossMrrCents += r.mrr_cents || 0;
+      if (r.source === 'apple') appleMrrCents = r.mrr_cents || 0;
+      if (r.source === 'google') googleMrrCents = r.mrr_cents || 0;
+      if (r.source === 'stripe') stripeMrrCents = r.mrr_cents || 0;
+    });
+    var appleFees = Math.round(appleMrrCents * 0.15);
+    var googleFees = Math.round(googleMrrCents * 0.15);
+    var stripeFees = Math.round(stripeMrrCents * 0.029);
+    var totalFees = appleFees + googleFees + stripeFees;
+    var netMrrCents = grossMrrCents - totalFees;
+    var fmtDollars = function(cents) { return '$' + (cents / 100).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}); };
+    document.getElementById('s-net-mrr').textContent = fmtDollars(netMrrCents);
+    document.getElementById('s-total-fees').textContent = fmtDollars(totalFees);
+    var feesPct = grossMrrCents > 0 ? ((totalFees / grossMrrCents) * 100).toFixed(1) : '0.0';
+    document.getElementById('s-fees-pct').textContent = feesPct + '% of gross MRR (incl Stripe 2.9%)';
+    document.getElementById('s-apple-fees').textContent = fmtDollars(appleFees);
+    document.getElementById('s-google-fees').textContent = fmtDollars(googleFees);
 
     // Subscription status chart
     var statusColors = {active:'green', trialing:'mid', canceled:'red', past_due:'orange', incomplete:'mid'};
