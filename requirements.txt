@@ -6,3 +6,4 @@ aiofiles==24.1.0
 asyncpg==0.30.0
 stripe==8.0.0
 python-multipart==0.0.9
+apscheduler==3.10.4
