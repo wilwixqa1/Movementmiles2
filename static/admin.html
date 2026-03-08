@@ -276,27 +276,6 @@
       <button class="export-btn" onclick="exportJourneyCSV()">Export User Journey CSV</button>
     </div>
 
-    <!-- Session 11: Manual Email Attach for Apple/Google subs -->
-    <div class="card" style="margin-bottom:24px">
-      <div class="section-title" style="margin-bottom:4px">Attach Email to Apple/Google Subscriber</div>
-      <p style="font-size:.8rem;color:var(--navy-mid);margin-bottom:16px;line-height:1.4">Look up an Apple/Google subscriber in ymove, then enter their email here. This permanently links their identity so they get full attribution in exports.</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end">
-        <div>
-          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Subscription ID</label>
-          <input type="text" id="attach-sub-id" placeholder="e.g. import_apple_3f8a... or search" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" oninput="searchSubs()" />
-        </div>
-        <div>
-          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Email Address</label>
-          <input type="email" id="attach-email" placeholder="user@example.com" style="width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none" />
-        </div>
-        <div>
-          <button class="export-btn" style="margin-bottom:0;white-space:nowrap" onclick="doAttachEmail()">Attach Email</button>
-        </div>
-      </div>
-      <div id="attach-search-results" style="margin-top:8px;max-height:160px;overflow-y:auto;display:none"></div>
-      <div id="attach-msg" style="margin-top:10px;font-size:.82rem;display:none"></div>
-    </div>
-
     <!-- Session 11: Manual Email Attach -->
     <div class="card" style="margin-bottom:24px">
       <div class="section-title" style="margin-bottom:4px">Attach Email to Apple/Google Subscriber</div>
@@ -576,7 +555,7 @@
     <div class="section-toggle" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
-      <span class="toggle-hint">(7 tools)</span>
+      <span class="toggle-hint">(8 tools)</span>
     </div>
     <div class="collapsible" id="body-tools">
       <div class="tools-grid">
@@ -628,6 +607,12 @@
           <p>Manually trigger a daily digest email right now. Sends to configured recipients with [TEST] prefix.</p>
           <button class="tool-btn tool-btn-green" id="btn-test-digest" onclick="doTestDigest()">Send Test Digest</button>
           <div class="tool-result" id="res-test-digest"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Backfill Conversions</h3>
+          <p>Stamp converted_at on historical subs that converted from trial to paid. Safe to re-run multiple times.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-backfill-conv" onclick="doBackfillConversions()">Backfill Conversions</button>
+          <div class="tool-result" id="res-backfill-conv"></div>
         </div>
       </div>
     </div>
@@ -998,73 +983,6 @@ function renderBarChart(containerId, data) {
 
 // --- Session 11: Attach Email to Apple/Google subscriber ---
 
-var searchTimeout = null;
-function searchSubs() {
-  var q = document.getElementById('attach-sub-id').value.trim();
-  var resultsEl = document.getElementById('attach-search-results');
-  if (q.length < 3) { resultsEl.style.display = 'none'; return; }
-  clearTimeout(searchTimeout);
-  searchTimeout = setTimeout(function() {
-    fetch('/api/admin/search-subscriptions?q=' + encodeURIComponent(q), {
-      headers: {'X-Admin-Password': adminPw}
-    }).then(function(r) { return r.json(); }).then(function(d) {
-      var results = d.results || [];
-      if (results.length === 0) {
-        resultsEl.style.display = 'none';
-        return;
-      }
-      resultsEl.style.display = 'block';
-      resultsEl.innerHTML = '<table style="width:100%"><thead><tr><th>ID</th><th>Source</th><th>Status</th><th>Email</th><th>Plan</th><th></th></tr></thead><tbody>' +
-        results.map(function(r) {
-          var idShort = r.id.length > 30 ? r.id.slice(0,28) + '...' : r.id;
-          var srcTag = '<span class="tag tag-src-' + r.source + '">' + r.source + '</span>';
-          var statusTag = '<span class="tag tag-' + r.status + '">' + r.status + '</span>';
-          return '<tr><td title="' + escHtml(r.id) + '">' + escHtml(idShort) + '</td><td>' + srcTag + '</td><td>' + statusTag + '</td><td>' + (r.email || '<em style="color:var(--navy-mid)">none</em>') + '</td><td>' + r.plan + '</td><td><a href="#" onclick="pickSub(\'' + escHtml(r.id).replace(/'/g, "\\'") + '\');return false" style="color:var(--navy);font-weight:600;text-decoration:none">Select</a></td></tr>';
-        }).join('') + '</tbody></table>';
-    }).catch(function() { resultsEl.style.display = 'none'; });
-  }, 400);
-}
-
-function pickSub(id) {
-  document.getElementById('attach-sub-id').value = id;
-  document.getElementById('attach-search-results').style.display = 'none';
-  document.getElementById('attach-email').focus();
-}
-
-function doAttachEmail() {
-  var subId = document.getElementById('attach-sub-id').value.trim();
-  var email = document.getElementById('attach-email').value.trim();
-  var msg = document.getElementById('attach-msg');
-  if (!subId) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter a subscription ID.'; return; }
-  if (!email || email.indexOf('@') < 0) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Enter a valid email.'; return; }
-  if (!confirm('Attach ' + email + ' to subscription ' + subId + '?')) return;
-  fetch('/api/admin/attach-email', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
-    body: JSON.stringify({subscription_id: subId, email: email})
-  }).then(function(r) {
-    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || 'Failed'); });
-    return r.json();
-  }).then(function(d) {
-    msg.style.display = 'block';
-    msg.style.color = 'var(--green)';
-    var txt = 'Email attached! ' + d.email + ' -> ' + d.subscription_id + ' (' + d.source + ')';
-    if (d.matched_lead) {
-      txt += ' | Matched lead: ' + (d.matched_lead.name || 'no name');
-      if (d.matched_lead.utm_source) txt += ', utm_source=' + d.matched_lead.utm_source;
-    } else {
-      txt += ' | No matching lead found (email not in leads table)';
-    }
-    msg.textContent = txt;
-    document.getElementById('attach-sub-id').value = '';
-    document.getElementById('attach-email').value = '';
-    document.getElementById('attach-search-results').style.display = 'none';
-  }).catch(function(e) {
-    msg.style.display = 'block';
-    msg.style.color = 'var(--red)';
-    msg.textContent = 'Error: ' + e.message;
-  });
-}
 
 // --- Session 11: CSV Exports ---
 
@@ -1171,7 +1089,7 @@ function searchSubs() {
   var resultsEl = document.getElementById('attach-results');
   if (q.length < 3) { resultsEl.innerHTML = ''; return; }
   searchTimer = setTimeout(function() {
-    fetch('/api/admin/search-subs?q=' + encodeURIComponent(q), {
+    fetch('/api/admin/search-subscriptions?q=' + encodeURIComponent(q), {
       headers: {'X-Admin-Password': adminPw}
     }).then(function(r) { return r.json(); }).then(function(d) {
       var results = d.results || [];
@@ -1211,7 +1129,7 @@ function doAttachEmail() {
   fetch('/api/admin/attach-email', {
     method: 'POST',
     headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
-    body: JSON.stringify({subscriber_id: subId, email: email})
+    body: JSON.stringify({subscription_id: subId, email: email})
   }).then(function(r) {
     if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || 'Failed'); });
     return r.json();
