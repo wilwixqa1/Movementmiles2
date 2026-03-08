@@ -8,7 +8,8 @@ import os
 import json
 import asyncpg
 import stripe
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 app = FastAPI(title="Movement & Miles")
 
@@ -26,15 +27,21 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "mmadmin2026")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+DIGEST_RECIPIENTS = os.environ.get("DIGEST_RECIPIENTS", "")
+DIGEST_FROM_EMAIL = os.environ.get("DIGEST_FROM_EMAIL", "onboarding@resend.dev")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
 # --- Database ---
 db_pool = None
 
+# --- Scheduler ---
+scheduler = None
+
 @app.on_event("startup")
 async def startup():
-    global db_pool
+    global db_pool, scheduler
     if DATABASE_URL:
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -124,9 +131,36 @@ async def startup():
     else:
         print("No DATABASE_URL — running without database")
 
+    # Start daily digest scheduler
+    if RESEND_API_KEY and DIGEST_RECIPIENTS:
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from apscheduler.triggers.cron import CronTrigger
+            scheduler = AsyncIOScheduler()
+            et = ZoneInfo("America/New_York")
+            scheduler.add_job(
+                run_daily_digest,
+                CronTrigger(hour=9, minute=0, timezone=et),
+                id="daily_digest",
+                replace_existing=True,
+            )
+            scheduler.start()
+            print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS})")
+        except Exception as e:
+            print(f"Scheduler startup error: {e}")
+    else:
+        missing = []
+        if not RESEND_API_KEY:
+            missing.append("RESEND_API_KEY")
+        if not DIGEST_RECIPIENTS:
+            missing.append("DIGEST_RECIPIENTS")
+        print(f"Daily digest disabled — missing: {', '.join(missing)}")
+
 @app.on_event("shutdown")
 async def shutdown():
-    global db_pool
+    global db_pool, scheduler
+    if scheduler:
+        scheduler.shutdown(wait=False)
     if db_pool:
         await db_pool.close()
 
@@ -245,6 +279,22 @@ The lead tag must be valid JSON inside the [[LEAD:...]] wrapper. Include all fie
 Keep responses SHORT (2-3 sentences). One question at a time. Be conversational, not robotic."""
 
 
+DIGEST_SYSTEM_PROMPT = """You are an analytics advisor for Movement & Miles, a fitness subscription app. You receive daily metrics and generate a brief, actionable morning digest for the business owner.
+
+RULES:
+- Be concise: 3-5 bullet points max for insights
+- Lead with the most important finding
+- Compare to context when possible (e.g. "above/below your typical daily rate")
+- Flag anything unusual or concerning
+- Suggest ONE specific action if data warrants it
+- Use plain language, not jargon
+- If a day had zero activity in some area, just note it briefly, don't over-analyze
+- Be encouraging when metrics are positive
+- Platform fee context: Apple and Google take 15%, Stripe takes ~2.9%
+
+FORMAT your response as a short paragraph overview, then bullet points for key insights. Keep total response under 200 words."""
+
+
 # --- Shared Helpers ---
 
 async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 800) -> str:
@@ -273,6 +323,33 @@ async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 8
             raise HTTPException(status_code=502, detail=f"Anthropic API error: {e.response.status_code}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
+async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int = 800) -> str:
+    """Like call_anthropic but doesn't raise HTTPException — returns error string instead."""
+    if not ANTHROPIC_API_KEY:
+        return "[Error: ANTHROPIC_API_KEY not configured]"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": max_tokens,
+                    "system": system_prompt,
+                    "messages": messages,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["content"][0]["text"]
+        except Exception as e:
+            return f"[AI insights unavailable: {str(e)}]"
 
 
 def require_admin(password: str):
@@ -807,6 +884,352 @@ async def google_webhook(request: Request):
     return {"status": "ok"}
 
 
+# --- Daily Digest System ---
+
+async def gather_daily_stats() -> dict:
+    """Query database for last 24 hours of activity."""
+    if not db_pool:
+        return {"error": "No database"}
+
+    async with db_pool.acquire() as conn:
+        # New subscriptions in last 24h
+        new_subs = await conn.fetch(
+            """SELECT source, status, plan_interval, plan_amount, email, created_at
+               FROM subscriptions WHERE created_at > NOW() - INTERVAL '24 hours'
+               ORDER BY created_at DESC"""
+        )
+        new_subs_by_source = await conn.fetch(
+            """SELECT source, COUNT(*) as count FROM subscriptions
+               WHERE created_at > NOW() - INTERVAL '24 hours'
+               GROUP BY source ORDER BY count DESC"""
+        )
+
+        # Cancellations in last 24h
+        cancellations = await conn.fetch(
+            """SELECT source, email, canceled_at FROM subscriptions
+               WHERE canceled_at > NOW() - INTERVAL '24 hours'
+               ORDER BY canceled_at DESC"""
+        )
+
+        # Current MRR
+        mrr_monthly = await conn.fetchval(
+            "SELECT COALESCE(SUM(plan_amount), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'month'"
+        )
+        mrr_annual = await conn.fetchval(
+            "SELECT COALESCE(SUM(plan_amount / 12), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'year'"
+        )
+        current_mrr_cents = (mrr_monthly or 0) + (mrr_annual or 0)
+
+        # MRR by source (for fee calc)
+        mrr_by_source = await conn.fetch(
+            """SELECT source,
+                COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) +
+                COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_cents
+               FROM subscriptions WHERE status = 'active' GROUP BY source"""
+        )
+
+        # Active subs count
+        active_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing')"
+        )
+        trialing_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE status = 'trialing'"
+        )
+        total_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+        # New leads in last 24h
+        new_leads = await conn.fetch(
+            """SELECT first_name, email, utm_source, utm_medium, utm_campaign, created_at
+               FROM leads WHERE created_at > NOW() - INTERVAL '24 hours'
+               ORDER BY created_at DESC"""
+        )
+        leads_by_source_24h = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source,''), 'direct') as source, COUNT(*) as count
+               FROM leads WHERE created_at > NOW() - INTERVAL '24 hours'
+               GROUP BY source ORDER BY count DESC"""
+        )
+
+        # Page views last 24h
+        pv_24h = await conn.fetchval(
+            "SELECT COUNT(*) FROM page_views WHERE created_at > NOW() - INTERVAL '24 hours'"
+        )
+        pv_by_page = await conn.fetch(
+            """SELECT page, COUNT(*) as count FROM page_views
+               WHERE created_at > NOW() - INTERVAL '24 hours'
+               GROUP BY page ORDER BY count DESC LIMIT 5"""
+        )
+
+        # Chat sessions last 24h
+        chats_24h = await conn.fetchval(
+            "SELECT COUNT(*) FROM chat_sessions WHERE created_at > NOW() - INTERVAL '24 hours'"
+        )
+
+        # Subscription events in last 24h
+        recent_events = await conn.fetch(
+            """SELECT event_type, source, created_at FROM subscription_events
+               WHERE created_at > NOW() - INTERVAL '24 hours'
+               ORDER BY created_at DESC LIMIT 30"""
+        )
+
+    # Calculate fees
+    fee_breakdown = {}
+    total_fees_cents = 0
+    for r in mrr_by_source:
+        src = r["source"]
+        mrr = r["mrr_cents"] or 0
+        if src == "apple":
+            fee = round(mrr * 0.15)
+        elif src == "google":
+            fee = round(mrr * 0.15)
+        else:
+            fee = round(mrr * 0.029)
+        fee_breakdown[src] = fee
+        total_fees_cents += fee
+    net_mrr_cents = current_mrr_cents - total_fees_cents
+
+    return {
+        "new_subscriptions": len(new_subs),
+        "new_subs_by_source": [{"source": r["source"], "count": r["count"]} for r in new_subs_by_source],
+        "new_sub_details": [{"email": r["email"] or "n/a", "source": r["source"], "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}"} for r in new_subs],
+        "cancellations": len(cancellations),
+        "cancel_details": [{"email": r["email"] or "n/a", "source": r["source"]} for r in cancellations],
+        "gross_mrr": f"${current_mrr_cents/100:,.2f}",
+        "gross_mrr_cents": current_mrr_cents,
+        "net_mrr": f"${net_mrr_cents/100:,.2f}",
+        "net_mrr_cents": net_mrr_cents,
+        "total_fees": f"${total_fees_cents/100:,.2f}",
+        "fee_breakdown": fee_breakdown,
+        "active_subscribers": active_count or 0,
+        "trialing": trialing_count or 0,
+        "total_subscribers": total_count or 0,
+        "new_leads": len(new_leads),
+        "leads_by_source": [{"source": r["source"], "count": r["count"]} for r in leads_by_source_24h],
+        "page_views_24h": pv_24h or 0,
+        "top_pages": [{"page": r["page"], "count": r["count"]} for r in pv_by_page],
+        "chat_sessions_24h": chats_24h or 0,
+        "events_24h": len(recent_events),
+        "mrr_by_source": [{"source": r["source"], "mrr_cents": r["mrr_cents"] or 0} for r in mrr_by_source],
+    }
+
+
+async def generate_digest_insights(stats: dict) -> str:
+    """Send daily stats to Claude for analysis and insights."""
+    stats_text = json.dumps(stats, indent=2, default=str)
+    prompt = f"Here are today's metrics for Movement & Miles (fitness subscription app). Generate a brief morning digest with key insights and any recommended actions.\n\n{stats_text}"
+    return await call_anthropic_raw(DIGEST_SYSTEM_PROMPT, [{"role": "user", "content": prompt}], max_tokens=500)
+
+
+def build_digest_html(stats: dict, insights: str) -> str:
+    """Build branded HTML email for the daily digest."""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    date_str = now_et.strftime("%A, %B %d, %Y")
+
+    # Build new subs detail rows
+    sub_rows = ""
+    for s in stats.get("new_sub_details", [])[:10]:
+        sub_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{s["email"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{s["source"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{s["plan"]}</td></tr>'
+
+    cancel_rows = ""
+    for c in stats.get("cancel_details", [])[:10]:
+        cancel_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["email"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["source"]}</td></tr>'
+
+    lead_source_rows = ""
+    for ls in stats.get("leads_by_source", []):
+        lead_source_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{ls["source"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{ls["count"]}</td></tr>'
+
+    # Format insights — convert newlines and bullet points to HTML
+    insights_html = insights.replace("\n\n", "</p><p style='margin:0 0 12px'>").replace("\n- ", "<br>&#8226; ").replace("\n", "<br>")
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f7f7f7;font-family:Arial,Helvetica,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f7f7f7;padding:24px 0">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+
+<!-- Header -->
+<tr><td style="background:#182241;padding:28px 32px">
+  <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:600">Movement &amp; Miles</h1>
+  <p style="margin:6px 0 0;color:rgba(255,255,255,0.7);font-size:13px">Daily Digest &mdash; {date_str}</p>
+</td></tr>
+
+<!-- AI Insights -->
+<tr><td style="padding:28px 32px 20px">
+  <h2 style="margin:0 0 12px;color:#182241;font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Today&rsquo;s Insights</h2>
+  <div style="background:#f0f4f8;border-left:4px solid #182241;border-radius:0 8px 8px 0;padding:16px 20px;font-size:14px;line-height:1.6;color:#333">
+    <p style="margin:0 0 12px">{insights_html}</p>
+  </div>
+</td></tr>
+
+<!-- Key Metrics -->
+<tr><td style="padding:0 32px 24px">
+  <h2 style="margin:0 0 16px;color:#182241;font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Revenue Snapshot</h2>
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td style="padding:16px;background:#f7f7f7;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:11px;color:#536c7c;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Gross MRR</div>
+        <div style="font-size:24px;font-weight:700;color:#2d6a2d;margin-top:4px">{stats.get('gross_mrr','$0')}</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:16px;background:#f7f7f7;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:11px;color:#536c7c;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Net MRR</div>
+        <div style="font-size:24px;font-weight:700;color:#2d6a2d;margin-top:4px">{stats.get('net_mrr','$0')}</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:16px;background:#f7f7f7;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:11px;color:#536c7c;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Active Subs</div>
+        <div style="font-size:24px;font-weight:700;color:#182241;margin-top:4px">{stats.get('active_subscribers',0)}</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:16px;background:#f7f7f7;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:11px;color:#536c7c;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Fees / Mo</div>
+        <div style="font-size:24px;font-weight:700;color:#b35a00;margin-top:4px">{stats.get('total_fees','$0')}</div>
+      </td>
+    </tr>
+  </table>
+</td></tr>
+
+<!-- 24h Activity -->
+<tr><td style="padding:0 32px 24px">
+  <h2 style="margin:0 0 16px;color:#182241;font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Last 24 Hours</h2>
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td style="padding:12px 16px;background:#e8f4e8;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:28px;font-weight:700;color:#2d6a2d">{stats.get('new_subscriptions',0)}</div>
+        <div style="font-size:11px;color:#2d6a2d;font-weight:600;margin-top:2px">New Subs</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:12px 16px;background:#fde8e8;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:28px;font-weight:700;color:#c0392b">{stats.get('cancellations',0)}</div>
+        <div style="font-size:11px;color:#c0392b;font-weight:600;margin-top:2px">Cancellations</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:12px 16px;background:#e8eaf6;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:28px;font-weight:700;color:#3949ab">{stats.get('new_leads',0)}</div>
+        <div style="font-size:11px;color:#3949ab;font-weight:600;margin-top:2px">New Leads</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:12px 16px;background:#f7f7f7;border-radius:8px;text-align:center;width:25%">
+        <div style="font-size:28px;font-weight:700;color:#182241">{stats.get('page_views_24h',0)}</div>
+        <div style="font-size:11px;color:#536c7c;font-weight:600;margin-top:2px">Page Views</div>
+      </td>
+    </tr>
+  </table>
+</td></tr>"""
+
+    # New subscriptions detail table (only if there are any)
+    if stats.get("new_subscriptions", 0) > 0:
+        html += f"""
+<!-- New Subscriptions Detail -->
+<tr><td style="padding:0 32px 24px">
+  <h3 style="margin:0 0 8px;color:#2d6a2d;font-size:14px;font-weight:600">New Subscriptions</h3>
+  <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
+    <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Email</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Plan</th></tr>
+    {sub_rows}
+  </table>
+</td></tr>"""
+
+    # Cancellations detail (only if there are any)
+    if stats.get("cancellations", 0) > 0:
+        html += f"""
+<!-- Cancellations Detail -->
+<tr><td style="padding:0 32px 24px">
+  <h3 style="margin:0 0 8px;color:#c0392b;font-size:14px;font-weight:600">Cancellations</h3>
+  <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
+    <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Email</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th></tr>
+    {cancel_rows}
+  </table>
+</td></tr>"""
+
+    # Lead sources (only if there are leads)
+    if stats.get("new_leads", 0) > 0 and lead_source_rows:
+        html += f"""
+<!-- Lead Sources -->
+<tr><td style="padding:0 32px 24px">
+  <h3 style="margin:0 0 8px;color:#3949ab;font-size:14px;font-weight:600">Lead Sources (24h)</h3>
+  <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
+    <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Count</th></tr>
+    {lead_source_rows}
+  </table>
+</td></tr>"""
+
+    html += f"""
+<!-- Footer -->
+<tr><td style="padding:20px 32px 28px;border-top:1px solid #e0e0e0">
+  <p style="margin:0;font-size:12px;color:#536c7c;text-align:center">
+    Movement &amp; Miles Admin Dashboard &mdash;
+    <a href="https://movementmiles2-production.up.railway.app/mm-admin" style="color:#182241;text-decoration:underline">Open Dashboard</a>
+  </p>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+    return html
+
+
+async def send_digest_email(html: str, subject: str) -> dict:
+    """Send email via Resend API."""
+    if not RESEND_API_KEY:
+        return {"error": "RESEND_API_KEY not configured"}
+    if not DIGEST_RECIPIENTS:
+        return {"error": "DIGEST_RECIPIENTS not configured"}
+
+    recipients = [e.strip() for e in DIGEST_RECIPIENTS.split(",") if e.strip()]
+    if not recipients:
+        return {"error": "No valid recipients"}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": DIGEST_FROM_EMAIL,
+                    "to": recipients,
+                    "subject": subject,
+                    "html": html,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {"status": "sent", "id": data.get("id", ""), "recipients": recipients}
+        except Exception as e:
+            return {"error": f"Resend API error: {str(e)}"}
+
+
+async def run_daily_digest():
+    """Orchestrator: gather stats -> AI insights -> build email -> send."""
+    print(f"[Digest] Starting daily digest at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
+    try:
+        stats = await gather_daily_stats()
+        if "error" in stats:
+            print(f"[Digest] Error gathering stats: {stats['error']}")
+            return
+
+        insights = await generate_digest_insights(stats)
+
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        subject = f"M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('new_subscriptions',0)} new subs, {stats.get('cancellations',0)} cancellations"
+
+        html = build_digest_html(stats, insights)
+        result = await send_digest_email(html, subject)
+
+        if "error" in result:
+            print(f"[Digest] Send error: {result['error']}")
+        else:
+            print(f"[Digest] Sent successfully to {result['recipients']} (id: {result.get('id','')})")
+    except Exception as e:
+        print(f"[Digest] Unexpected error: {e}")
+
+
 # --- Admin Endpoints ---
 
 @app.post("/api/admin/login")
@@ -814,6 +1237,41 @@ async def admin_login(req: LoginRequest):
     if req.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid password")
     return {"status": "ok"}
+
+
+@app.post("/api/admin/send-test-digest")
+async def send_test_digest(request: Request):
+    """Manually trigger a daily digest email (for testing)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    if not RESEND_API_KEY:
+        raise HTTPException(status_code=500, detail="RESEND_API_KEY not configured")
+    if not DIGEST_RECIPIENTS:
+        raise HTTPException(status_code=500, detail="DIGEST_RECIPIENTS not configured")
+
+    stats = await gather_daily_stats()
+    if "error" in stats:
+        raise HTTPException(status_code=500, detail=stats["error"])
+
+    insights = await generate_digest_insights(stats)
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    subject = f"[TEST] M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('new_subscriptions',0)} new subs, {stats.get('cancellations',0)} cancellations"
+
+    html = build_digest_html(stats, insights)
+    result = await send_digest_email(html, subject)
+
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return {"status": "sent", "recipients": result["recipients"], "stats_summary": {
+        "new_subs": stats.get("new_subscriptions", 0),
+        "cancellations": stats.get("cancellations", 0),
+        "new_leads": stats.get("new_leads", 0),
+        "gross_mrr": stats.get("gross_mrr", "$0"),
+        "net_mrr": stats.get("net_mrr", "$0"),
+    }}
 
 
 # --- Admin Data Tools ---
@@ -1105,7 +1563,6 @@ async def admin_stats(request: Request):
         return {"error": "No database connected"}
 
     # Date range filtering (optional query params)
-    from datetime import timedelta
     date_from_str = request.query_params.get("from", "")
     date_to_str = request.query_params.get("to", "")
     date_from_dt = None
@@ -1221,7 +1678,7 @@ async def admin_stats(request: Request):
         )
         mrr_cents = (mrr_monthly or 0) + (mrr_annual or 0)
 
-        # Trial → paid conversion
+        # Trial -> paid conversion
         total_ever_trialed = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE trial_start IS NOT NULL"
         )
@@ -1390,12 +1847,15 @@ async def admin_leads_csv(request: Request):
 async def health():
     db_status = "connected" if db_pool else "not connected"
     stripe_status = "configured" if STRIPE_SECRET_KEY else "not configured"
+    digest_status = "active" if (RESEND_API_KEY and DIGEST_RECIPIENTS and scheduler) else "disabled"
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "9.0.0",
+        "version": "10.0.0",
         "database": db_status,
         "stripe": stripe_status,
+        "daily_digest": digest_status,
+        "digest_recipients": DIGEST_RECIPIENTS if DIGEST_RECIPIENTS else "none",
     }
 
 
