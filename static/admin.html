@@ -555,7 +555,7 @@
     <div class="section-toggle" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
-      <span class="toggle-hint">(8 tools)</span>
+      <span class="toggle-hint">(9 tools)</span>
     </div>
     <div class="collapsible" id="body-tools">
       <div class="tools-grid">
@@ -613,6 +613,12 @@
           <p>Stamp converted_at on historical subs that converted from trial to paid. Safe to re-run multiple times.</p>
           <button class="tool-btn tool-btn-navy" id="btn-backfill-conv" onclick="doBackfillConversions()">Backfill Conversions</button>
           <div class="tool-result" id="res-backfill-conv"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Backfill Readable IDs</h3>
+          <p>Assign persistent readable IDs (APPLE-0001, GOOGLE-0001, STRIPE-0001) to all existing subscribers. Safe to re-run.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-backfill-ids" onclick="doBackfillIds()">Backfill Readable IDs</button>
+          <div class="tool-result" id="res-backfill-ids"></div>
         </div>
       </div>
     </div>
