@@ -1969,11 +1969,13 @@ async def admin_subscriptions_csv(request: Request):
     )
 
 
+
 # --- Session 11: Multi-Tab XLSX Export (Meg format) ---
 
 @app.get("/api/admin/subscriptions-xlsx")
 async def admin_subscriptions_xlsx(request: Request):
-    """Export subscribers as multi-tab XLSX matching Meg's spreadsheet layout."""
+    """Export subscribers as multi-tab XLSX matching Meg spreadsheet layout."""
+    from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -1984,7 +1986,6 @@ async def admin_subscriptions_xlsx(request: Request):
         raise HTTPException(status_code=500, detail="No database")
 
     async with db_pool.acquire() as conn:
-        # All subscriptions with lead data
         all_subs = await conn.fetch("""
             SELECT s.*,
                    l.first_name as lead_name,
@@ -2002,7 +2003,6 @@ async def admin_subscriptions_xlsx(request: Request):
             ORDER BY s.created_at
         """)
 
-        # Leads without an active subscription (offered trial but not subscribed)
         offered_leads = await conn.fetch("""
             SELECT l.first_name, l.extra as last_name, l.email,
                    l.experience_level, l.goals, l.recommended_plan,
@@ -2014,14 +2014,13 @@ async def admin_subscriptions_xlsx(request: Request):
                 WHERE lower(s.email) = lower(l.email)
                 AND s.status IN ('active', 'trialing')
             )
-            AND l.email NOT IN (
+            AND lower(l.email) NOT IN (
                 SELECT DISTINCT lower(email) FROM subscriptions
                 WHERE email != '' AND status = 'canceled'
             )
             ORDER BY l.created_at DESC
         """)
 
-    # Split subs into tabs
     apple_google_active = []
     stripe_active = []
     trialing = []
@@ -2040,22 +2039,17 @@ async def admin_subscriptions_xlsx(request: Request):
             else:
                 stripe_active.append(r)
 
-    # Build workbook
     wb = Workbook()
 
-    # Style definitions
     hdr_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     hdr_fill_navy = PatternFill("solid", fgColor="182241")
     hdr_fill_green = PatternFill("solid", fgColor="2d6a2d")
     hdr_fill_blue = PatternFill("solid", fgColor="3949ab")
     hdr_fill_orange = PatternFill("solid", fgColor="b35a00")
     hdr_fill_red = PatternFill("solid", fgColor="c0392b")
-    cancel_fill = PatternFill("solid", fgColor="FF6666")
     data_font = Font(name="Arial", size=10)
     center = Alignment(horizontal="center")
-    thin_border = Border(
-        bottom=Side(style="thin", color="E0E0E0")
-    )
+    thin_border = Border(bottom=Side(style="thin", color="E0E0E0"))
 
     SUB_HEADERS = [
         "Readable ID", "First Name", "Last Name", "Email", "Sign-up Date",
@@ -2118,7 +2112,6 @@ async def admin_subscriptions_xlsx(request: Request):
                 c = ws.cell(row=ri, column=ci, value=v)
                 c.font = data_font
                 c.border = thin_border
-        # Auto-width
         for ci in range(1, len(SUB_HEADERS) + 1):
             max_len = len(SUB_HEADERS[ci-1])
             for ri in range(2, min(len(rows)+2, 100)):
@@ -2129,20 +2122,16 @@ async def admin_subscriptions_xlsx(request: Request):
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions if len(rows) > 0 else "A1:S1"
 
-    # Tab 1: Apple & Google Members
     ws1 = wb.active
     ws1.title = "Apple & Google Members"
     write_sub_sheet(ws1, apple_google_active, hdr_fill_navy)
 
-    # Tab 2: Stripe Members
     ws2 = wb.create_sheet("Stripe Members")
     write_sub_sheet(ws2, stripe_active, hdr_fill_green)
 
-    # Tab 3: Free Month Trial
     ws3 = wb.create_sheet("Free Month Trial")
     write_sub_sheet(ws3, trialing, hdr_fill_blue)
 
-    # Tab 4: Downloaded & Offered Trial (leads without active sub)
     ws4 = wb.create_sheet("Downloaded & Offered Trial")
     lead_headers = [
         "First Name", "Last Name", "Email", "Date",
@@ -2182,16 +2171,12 @@ async def admin_subscriptions_xlsx(request: Request):
     if len(offered_leads) > 0:
         ws4.auto_filter.ref = ws4.dimensions
 
-    # Tab 5: Cancelled Subscription
     ws5 = wb.create_sheet("Cancelled Subscription")
     write_sub_sheet(ws5, cancelled, hdr_fill_red)
-    # Highlight cancelled rows in red
     for ri in range(2, len(cancelled) + 2):
         for ci in range(1, len(SUB_HEADERS) + 1):
-            cell = ws5.cell(row=ri, column=ci)
-            cell.fill = PatternFill("solid", fgColor="FFE0E0")
+            ws5.cell(row=ri, column=ci).fill = PatternFill("solid", fgColor="FFE0E0")
 
-    # Save to bytes
     output = BytesIO()
     wb.save(output)
     output.seek(0)
@@ -2201,6 +2186,7 @@ async def admin_subscriptions_xlsx(request: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=mm-subscribers.xlsx"}
     )
+
 
 # --- Session 11: User Journey CSV (lead -> subscriber timeline) ---
 
