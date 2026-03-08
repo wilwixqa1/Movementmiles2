@@ -8,6 +8,7 @@ import os
 import json
 import asyncpg
 import stripe
+import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -108,6 +109,9 @@ async def startup():
                 await conn.execute("""
                     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'
                 """)
+                # Session 11: trial-to-paid conversion tracking
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ")
+
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
                         id SERIAL PRIMARY KEY,
@@ -123,6 +127,19 @@ async def startup():
                 # Phase 4: add source column if table already existed without it
                 await conn.execute("""
                     ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'
+                """)
+
+                # Session 11: Ad spend tracking table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ad_spend (
+                        id SERIAL PRIMARY KEY,
+                        month TEXT NOT NULL,
+                        channel TEXT NOT NULL,
+                        amount_cents INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(month, channel)
+                    )
                 """)
             print("Database connected, all tables ready")
         except Exception as e:
@@ -391,6 +408,11 @@ class PageViewRequest(BaseModel):
 class LoginRequest(BaseModel):
     password: str
 
+class AdSpendRequest(BaseModel):
+    month: str = ""
+    channel: str = ""
+    amount_dollars: float = 0.0
+
 
 # --- API Routes ---
 
@@ -598,6 +620,19 @@ async def stripe_webhook(request: Request):
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
 
+            # Session 11: Detect trial-to-paid conversion (trialing -> active)
+            if event_type == "customer.subscription.updated":
+                prev_attrs = event.get("data", {}).get("previous_attributes", {})
+                if prev_attrs.get("status") == "trialing" and status == "active":
+                    try:
+                        await conn.execute(
+                            "UPDATE subscriptions SET converted_at = NOW() WHERE stripe_subscription_id = $1 AND converted_at IS NULL",
+                            sub_id
+                        )
+                        print(f"Trial conversion stamped for {sub_id}")
+                    except Exception as e:
+                        print(f"Conversion stamp error: {e}")
+
         # Handle one-time payments (checkout.session.completed for initial signup)
         elif event_type == "checkout.session.completed":
             session = data_obj
@@ -759,6 +794,18 @@ async def apple_webhook(request: Request):
             )
         except Exception as e:
             print(f"Apple subscription upsert error: {e}")
+
+        # Apple trial-to-paid: DID_RENEW after SUBSCRIBED = converted
+        if notification_type == "DID_RENEW":
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions SET converted_at = NOW()
+                       WHERE stripe_subscription_id = $1 AND converted_at IS NULL
+                       AND trial_start IS NOT NULL""",
+                    original_transaction_id
+                )
+            except Exception:
+                pass
 
     return {"status": "ok"}
 
@@ -1061,8 +1108,10 @@ def build_digest_html(stats: dict, insights: str) -> str:
     for ls in stats.get("leads_by_source", []):
         lead_source_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{ls["source"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{ls["count"]}</td></tr>'
 
+    # Session 11: Convert markdown bold **text** to <strong>text</strong>
+    insights_clean = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', insights)
     # Format insights — convert newlines and bullet points to HTML
-    insights_html = insights.replace("\n\n", "</p><p style='margin:0 0 12px'>").replace("\n- ", "<br>&#8226; ").replace("\n", "<br>")
+    insights_html = insights_clean.replace("\n\n", "</p><p style='margin:0 0 12px'>").replace("\n- ", "<br>&#8226; ").replace("\n", "<br>")
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1401,7 +1450,7 @@ async def reset_data(request: Request):
         raise HTTPException(status_code=500, detail="No database connected")
 
     async with db_pool.acquire() as conn:
-        await conn.execute("TRUNCATE leads, page_views, chat_sessions, subscriptions, subscription_events RESTART IDENTITY")
+        await conn.execute("TRUNCATE leads, page_views, chat_sessions, subscriptions, subscription_events, ad_spend RESTART IDENTITY")
 
     return {"status": "ok", "message": "All data cleared"}
 
@@ -1578,6 +1627,298 @@ async def reconcile_cancellations(request: Request, file: UploadFile = File(...)
     return {"status": "ok", "matched": matched, "total_emails": len(cancelled_emails)}
 
 
+@app.post("/api/admin/backfill-trial-dates")
+async def backfill_trial_dates(request: Request):
+    """Sets trial_start/end on imported subs missing trial data."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        updated = await conn.execute(
+            """UPDATE subscriptions
+               SET trial_start = created_at,
+                   trial_end = created_at + INTERVAL '30 days'
+               WHERE trial_start IS NULL
+               AND source IN ('apple', 'google')
+               AND created_at IS NOT NULL"""
+        )
+
+    count = int(updated.split(" ")[-1]) if updated else 0
+    return {"status": "ok", "updated": count}
+
+
+# --- Session 11: Subscriptions CSV Export ---
+
+@app.get("/api/admin/subscriptions-csv")
+async def admin_subscriptions_csv(request: Request):
+    """Export all subscribers (Stripe + Apple + Google) as CSV with lead attribution."""
+    import io as io_mod
+    import csv as csv_mod
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT s.*,
+                   l.first_name as lead_name,
+                   l.utm_source as lead_utm_source,
+                   l.utm_medium as lead_utm_medium,
+                   l.utm_campaign as lead_utm_campaign,
+                   l.created_at as lead_date
+            FROM subscriptions s
+            LEFT JOIN LATERAL (
+                SELECT first_name, utm_source, utm_medium, utm_campaign, created_at
+                FROM leads
+                WHERE lower(leads.email) = lower(s.email) AND s.email != ''
+                ORDER BY created_at DESC LIMIT 1
+            ) l ON true
+            ORDER BY s.created_at DESC
+        """)
+
+    apple_counter = 0
+    google_counter = 0
+
+    output = io_mod.StringIO()
+    writer = csv_mod.writer(output)
+    writer.writerow([
+        "readable_id", "email", "first_name", "source", "status",
+        "plan_interval", "plan_amount", "currency",
+        "trial_start", "trial_end", "converted_at",
+        "current_period_start", "current_period_end",
+        "canceled_at", "created_at",
+        "utm_source", "utm_medium", "utm_campaign",
+        "email_known", "est_lifetime_revenue", "lead_date"
+    ])
+
+    for r in rows:
+        source = r.get("source", "stripe") or "stripe"
+        sub_id = r.get("stripe_subscription_id", "") or ""
+
+        if source == "apple":
+            apple_counter += 1
+            readable_id = f"APPLE-{apple_counter:04d}"
+        elif source == "google":
+            google_counter += 1
+            readable_id = f"GOOGLE-{google_counter:04d}"
+        else:
+            readable_id = sub_id or f"STRIPE-{r['id']}"
+
+        email = r.get("email", "") or ""
+        email_known = "yes" if email and "@" in email else "no"
+
+        plan_amount = r.get("plan_amount", 0) or 0
+        plan_interval = r.get("plan_interval", "") or ""
+        created = r.get("created_at")
+        canceled = r.get("canceled_at")
+
+        est_revenue = 0
+        if created and plan_amount:
+            end_date = canceled if canceled else datetime.now(timezone.utc)
+            months_active = max(1, (end_date - created).days / 30)
+            monthly_equiv = plan_amount / 12 if plan_interval == "year" else plan_amount
+            est_revenue = round(monthly_equiv * months_active)
+
+        writer.writerow([
+            readable_id,
+            email,
+            r.get("lead_name", "") or "",
+            source,
+            r.get("status", ""),
+            plan_interval,
+            f"${plan_amount / 100:.2f}" if plan_amount else "$0.00",
+            r.get("currency", "usd"),
+            str(r.get("trial_start", "") or ""),
+            str(r.get("trial_end", "") or ""),
+            str(r.get("converted_at", "") or ""),
+            str(r.get("current_period_start", "") or ""),
+            str(r.get("current_period_end", "") or ""),
+            str(canceled or ""),
+            str(created or ""),
+            r.get("lead_utm_source", "") or "",
+            r.get("lead_utm_medium", "") or "",
+            r.get("lead_utm_campaign", "") or "",
+            email_known,
+            f"${est_revenue / 100:.2f}",
+            str(r.get("lead_date", "") or ""),
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=mm-subscriptions.csv"}
+    )
+
+
+# --- Session 11: User Journey CSV (lead -> subscriber timeline) ---
+
+@app.get("/api/admin/user-journey-csv")
+async def admin_user_journey_csv(request: Request):
+    """Export lead-to-subscriber journey: joins leads + subscriptions by email."""
+    import io as io_mod
+    import csv as csv_mod
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                l.email,
+                l.first_name,
+                l.created_at as lead_date,
+                l.utm_source, l.utm_medium, l.utm_campaign,
+                l.experience_level, l.goals, l.recommended_plan,
+                s.source as sub_source,
+                s.status as sub_status,
+                s.plan_interval, s.plan_amount,
+                s.trial_start, s.trial_end, s.converted_at,
+                s.created_at as sub_date,
+                s.canceled_at,
+                s.current_period_start, s.current_period_end
+            FROM leads l
+            LEFT JOIN LATERAL (
+                SELECT * FROM subscriptions
+                WHERE lower(subscriptions.email) = lower(l.email) AND l.email != ''
+                ORDER BY created_at DESC LIMIT 1
+            ) s ON true
+            WHERE l.email != ''
+            ORDER BY l.created_at DESC
+        """)
+
+    output = io_mod.StringIO()
+    writer = csv_mod.writer(output)
+    writer.writerow([
+        "email", "first_name",
+        "lead_date", "utm_source", "utm_medium", "utm_campaign",
+        "experience_level", "goals", "recommended_plan",
+        "subscribed", "sub_source", "sub_status", "sub_date",
+        "plan_interval", "plan_amount",
+        "trial_start", "trial_end", "converted_at", "canceled_at",
+        "days_lead_to_sub", "est_lifetime_revenue"
+    ])
+
+    for r in rows:
+        subscribed = "yes" if r.get("sub_source") else "no"
+
+        days_to_sub = ""
+        if r.get("lead_date") and r.get("sub_date"):
+            delta = r["sub_date"] - r["lead_date"]
+            days_to_sub = max(0, delta.days)
+
+        plan_amount = r.get("plan_amount", 0) or 0
+        plan_interval = r.get("plan_interval", "") or ""
+        sub_date = r.get("sub_date")
+        canceled = r.get("canceled_at")
+        est_revenue = 0
+        if sub_date and plan_amount:
+            end_date = canceled if canceled else datetime.now(timezone.utc)
+            months_active = max(1, (end_date - sub_date).days / 30)
+            monthly_equiv = plan_amount / 12 if plan_interval == "year" else plan_amount
+            est_revenue = round(monthly_equiv * months_active)
+
+        writer.writerow([
+            r.get("email", ""),
+            r.get("first_name", ""),
+            str(r.get("lead_date", "") or ""),
+            r.get("utm_source", "") or "",
+            r.get("utm_medium", "") or "",
+            r.get("utm_campaign", "") or "",
+            r.get("experience_level", "") or "",
+            r.get("goals", "") or "",
+            r.get("recommended_plan", "") or "",
+            subscribed,
+            r.get("sub_source", "") or "",
+            r.get("sub_status", "") or "",
+            str(r.get("sub_date", "") or ""),
+            plan_interval,
+            f"${plan_amount / 100:.2f}" if plan_amount else "$0.00",
+            str(r.get("trial_start", "") or ""),
+            str(r.get("trial_end", "") or ""),
+            str(r.get("converted_at", "") or ""),
+            str(canceled or ""),
+            str(days_to_sub),
+            f"${est_revenue / 100:.2f}",
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=mm-user-journey.csv"}
+    )
+
+
+# --- Session 11: Ad Spend CRUD ---
+
+@app.post("/api/admin/ad-spend")
+async def save_ad_spend(req: AdSpendRequest, request: Request):
+    """Save or update ad spend for a month/channel combination."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    if not req.month or not req.channel:
+        raise HTTPException(status_code=400, detail="month and channel required")
+
+    amount_cents = round(req.amount_dollars * 100)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO ad_spend (month, channel, amount_cents, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (month, channel) DO UPDATE SET
+                amount_cents = EXCLUDED.amount_cents,
+                updated_at = NOW()
+        """, req.month, req.channel.lower().strip(), amount_cents)
+
+    return {"status": "ok", "month": req.month, "channel": req.channel, "amount_cents": amount_cents}
+
+
+@app.get("/api/admin/ad-spend")
+async def get_ad_spend(request: Request):
+    """Retrieve all ad spend records."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM ad_spend ORDER BY month DESC, channel")
+
+    return {"spend": [
+        {"month": r["month"], "channel": r["channel"], "amount_cents": r["amount_cents"]}
+        for r in rows
+    ]}
+
+
+@app.delete("/api/admin/ad-spend")
+async def delete_ad_spend(request: Request):
+    """Delete a specific ad spend entry."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    body = await request.json()
+    month = body.get("month", "")
+    channel = body.get("channel", "")
+    if not month or not channel:
+        raise HTTPException(status_code=400, detail="month and channel required")
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM ad_spend WHERE month = $1 AND channel = $2", month, channel)
+
+    return {"status": "ok"}
+
+
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
@@ -1702,13 +2043,16 @@ async def admin_stats(request: Request):
         )
         mrr_cents = (mrr_monthly or 0) + (mrr_annual or 0)
 
-        # Trial -> paid conversion
+        # Session 11: Fixed trial -> paid conversion
+        # "Ever converted" = has converted_at OR (had trial and current_period moved past trial_end)
         total_ever_trialed = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE trial_start IS NOT NULL"
         )
         converted_from_trial = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
-               WHERE trial_start IS NOT NULL AND status = 'active'"""
+               WHERE trial_start IS NOT NULL
+               AND (converted_at IS NOT NULL
+                    OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end))"""
         )
 
         # Churn: canceled in last 30 days vs active at start of period
@@ -1774,6 +2118,9 @@ async def admin_stats(request: Request):
         # ARR
         arr_cents = mrr_cents * 12
 
+        # Session 11: Ad spend data
+        ad_spend_rows = await conn.fetch("SELECT * FROM ad_spend ORDER BY month DESC, channel")
+
     # Build response
     trial_conversion_rate = 0
     if total_ever_trialed and total_ever_trialed > 0:
@@ -1837,6 +2184,10 @@ async def admin_stats(request: Request):
                 for r in recent_events
             ],
         },
+        "ad_spend": [
+            {"month": r["month"], "channel": r["channel"], "amount_cents": r["amount_cents"]}
+            for r in ad_spend_rows
+        ],
     }
 
 
@@ -1875,7 +2226,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "10.0.0",
+        "version": "11.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
