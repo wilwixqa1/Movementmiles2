@@ -110,11 +110,37 @@
   .reset-confirm input{width:100%;border:1px solid var(--border);padding:8px 12px;border-radius:6px;font-family:inherit;font-size:.84rem;margin-bottom:8px}
   .csv-upload{margin-bottom:12px}
   .csv-upload input[type=file]{font-size:.82rem;font-family:inherit}
+
+  /* Data Tools Toggle */
+  .tools-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;margin-bottom:12px;margin-top:8px}
+  .tools-toggle .section-label{margin:0;cursor:pointer}
+  .tools-toggle .chevron{font-size:.65rem;color:var(--navy-mid);transition:transform .2s}
+  .tools-toggle .chevron.open{transform:rotate(90deg)}
+  .tools-toggle .tool-count{font-size:.7rem;color:var(--navy-mid);font-weight:400;margin-left:4px}
+  .tools-body{overflow:hidden;max-height:0;transition:max-height .3s ease-out}
+  .tools-body.open{max-height:2000px;transition:max-height .4s ease-in}
+
+  /* UTM Link Generator */
+  .utm-gen{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px}
+  .utm-gen h3{font-size:1rem;font-weight:600;margin-bottom:4px;color:var(--navy)}
+  .utm-gen .utm-sub{font-size:.8rem;color:var(--navy-mid);margin-bottom:20px}
+  .utm-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
+  .utm-field label{display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px}
+  .utm-field select,.utm-field input{width:100%;border:1px solid var(--border);padding:10px 12px;border-radius:8px;font-family:inherit;font-size:.84rem;color:var(--navy);outline:none;background:var(--white)}
+  .utm-field select:focus,.utm-field input:focus{border-color:var(--navy-mid)}
+  .utm-output{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-size:.84rem;color:var(--navy);word-break:break-all;margin-bottom:12px;min-height:44px;line-height:1.5}
+  .utm-output .utm-param{color:var(--green);font-weight:600}
+  .utm-actions{display:flex;gap:12px}
+  .utm-copy-btn{background:var(--navy);color:var(--white);border:none;padding:10px 28px;border-radius:8px;font-family:inherit;font-size:.84rem;font-weight:600;cursor:pointer}
+  .utm-copy-btn:hover{background:#2a3a5c}
+  .utm-copy-btn.copied{background:var(--green)}
+
   @media(max-width:768px){
     .stat-cards{grid-template-columns:repeat(2,1fr)}
     .views-grid{grid-template-columns:1fr}
     .dash-body{padding:20px 16px}
     .dash-nav{padding:16px}
+    .utm-row{grid-template-columns:1fr}
   }
 </style>
 </head>
@@ -157,45 +183,108 @@
       <span class="date-range-label" id="range-label">Showing: All Time</span>
     </div>
 
-    <!-- Data Tools -->
-    <div class="section-label">Data Tools</div>
-    <div class="tools-grid">
-      <div class="tool-card">
-        <h3>Backfill Stripe</h3>
-        <p>Pull all existing Stripe subscriptions into the dashboard. Safe to run multiple times (upserts by subscription ID).</p>
-        <button class="tool-btn tool-btn-navy" id="btn-backfill" onclick="doBackfill()">Backfill Stripe Subscriptions</button>
-        <div class="tool-result" id="res-backfill"></div>
-      </div>
-      <div class="tool-card">
-        <h3>Reset Test Data</h3>
-        <p>Wipe ALL data from every table (leads, page views, chats, subscriptions, events). Use on launch day to clear test data.</p>
-        <button class="tool-btn tool-btn-red" id="btn-reset" onclick="showResetConfirm()">Reset All Data</button>
-        <div class="reset-confirm" id="reset-confirm">
-          <input type="text" id="reset-input" placeholder="Type RESET to confirm" />
-          <button class="tool-btn tool-btn-red" onclick="doReset()">Confirm Reset</button>
+    <!-- UTM Link Generator -->
+    <div class="utm-gen">
+      <h3>UTM Link Generator</h3>
+      <div class="utm-sub">Build tracked links for your campaigns. The UTM tags show up in Channel Attribution below.</div>
+      <div class="utm-row">
+        <div class="utm-field">
+          <label>Base URL</label>
+          <select id="utm-base" onchange="updateUtmPreview()">
+            <option value="https://www.movementandmiles.com">movementandmiles.com</option>
+            <option value="https://www.movementandmiles.com/get-started">movementandmiles.com/get-started</option>
+          </select>
         </div>
-        <div class="tool-result" id="res-reset"></div>
+        <div class="utm-field">
+          <label>Source (where)</label>
+          <select id="utm-source" onchange="handleUtmSelect(this,'utm-source-custom');updateUtmPreview()">
+            <option value="">-- pick or type below --</option>
+            <option value="instagram">instagram</option>
+            <option value="facebook">facebook</option>
+            <option value="tiktok">tiktok</option>
+            <option value="google">google</option>
+            <option value="email">email</option>
+            <option value="referral">referral</option>
+            <option value="__custom__">Custom...</option>
+          </select>
+          <input type="text" id="utm-source-custom" placeholder="Custom source" style="margin-top:6px;display:none" oninput="updateUtmPreview()" />
+        </div>
+        <div class="utm-field">
+          <label>Medium (how)</label>
+          <select id="utm-medium" onchange="handleUtmSelect(this,'utm-medium-custom');updateUtmPreview()">
+            <option value="">-- pick or type below --</option>
+            <option value="social">social</option>
+            <option value="paid">paid</option>
+            <option value="email">email</option>
+            <option value="organic">organic</option>
+            <option value="referral">referral</option>
+            <option value="story">story</option>
+            <option value="bio_link">bio_link</option>
+            <option value="__custom__">Custom...</option>
+          </select>
+          <input type="text" id="utm-medium-custom" placeholder="Custom medium" style="margin-top:6px;display:none" oninput="updateUtmPreview()" />
+        </div>
       </div>
-      <div class="tool-card">
-        <h3>Import Leads CSV</h3>
-        <p>Upload a CSV with email, first_name, last_name columns. Skips duplicate emails already in the database.</p>
-        <div class="csv-upload"><input type="file" id="csv-file" accept=".csv" /></div>
-        <button class="tool-btn tool-btn-green" id="btn-import" onclick="doImport()">Import Leads</button>
-        <div class="tool-result" id="res-import"></div>
+      <div class="utm-row" style="grid-template-columns:1fr 2fr">
+        <div class="utm-field">
+          <label>Campaign (what)</label>
+          <input type="text" id="utm-campaign" placeholder="e.g. spring_promo, march_reel_1" oninput="updateUtmPreview()" />
+        </div>
+        <div style="display:flex;flex-direction:column;justify-content:flex-end">
+          <label style="font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--navy-mid);margin-bottom:6px">Generated URL</label>
+          <div class="utm-output" id="utm-output">Pick a source to get started</div>
+        </div>
       </div>
-      <div class="tool-card">
-        <h3>Import Subscribers CSV</h3>
-        <p>Upload Apple/Google subscriber CSV. Creates records with synthetic IDs. Safe to re-run (skips existing).</p>
-        <div class="csv-upload"><input type="file" id="sub-csv-file" accept=".csv" /></div>
-        <button class="tool-btn tool-btn-navy" id="btn-import-subs" onclick="doImportSubs()">Import Subscribers</button>
-        <div class="tool-result" id="res-import-subs"></div>
+      <div class="utm-actions">
+        <button class="utm-copy-btn" id="utm-copy-btn" onclick="copyUtmUrl()">Copy Link</button>
       </div>
-      <div class="tool-card">
-        <h3>Reconcile Cancellations</h3>
-        <p>Upload CSV of cancelled emails. Matches against active subscribers and flips them to canceled.</p>
-        <div class="csv-upload"><input type="file" id="cancel-csv-file" accept=".csv" /></div>
-        <button class="tool-btn tool-btn-red" id="btn-reconcile" onclick="doReconcile()">Reconcile Cancellations</button>
-        <div class="tool-result" id="res-reconcile"></div>
+    </div>
+
+    <!-- Data Tools (collapsed) -->
+    <div class="tools-toggle" onclick="toggleDataTools()">
+      <div class="section-label">Data Tools</div>
+      <span class="chevron" id="tools-chevron">&#9654;</span>
+      <span class="tool-count">(5 tools)</span>
+    </div>
+    <div class="tools-body" id="tools-body">
+      <div class="tools-grid">
+        <div class="tool-card">
+          <h3>Backfill Stripe</h3>
+          <p>Pull all existing Stripe subscriptions into the dashboard. Safe to run multiple times (upserts by subscription ID).</p>
+          <button class="tool-btn tool-btn-navy" id="btn-backfill" onclick="doBackfill()">Backfill Stripe Subscriptions</button>
+          <div class="tool-result" id="res-backfill"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Reset Test Data</h3>
+          <p>Wipe ALL data from every table (leads, page views, chats, subscriptions, events). Use on launch day to clear test data.</p>
+          <button class="tool-btn tool-btn-red" id="btn-reset" onclick="showResetConfirm()">Reset All Data</button>
+          <div class="reset-confirm" id="reset-confirm">
+            <input type="text" id="reset-input" placeholder="Type RESET to confirm" />
+            <button class="tool-btn tool-btn-red" onclick="doReset()">Confirm Reset</button>
+          </div>
+          <div class="tool-result" id="res-reset"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Import Leads CSV</h3>
+          <p>Upload a CSV with email, first_name, last_name columns. Skips duplicate emails already in the database.</p>
+          <div class="csv-upload"><input type="file" id="csv-file" accept=".csv" /></div>
+          <button class="tool-btn tool-btn-green" id="btn-import" onclick="doImport()">Import Leads</button>
+          <div class="tool-result" id="res-import"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Import Subscribers CSV</h3>
+          <p>Upload Apple/Google subscriber CSV. Creates records with synthetic IDs. Safe to re-run (skips existing).</p>
+          <div class="csv-upload"><input type="file" id="sub-csv-file" accept=".csv" /></div>
+          <button class="tool-btn tool-btn-navy" id="btn-import-subs" onclick="doImportSubs()">Import Subscribers</button>
+          <div class="tool-result" id="res-import-subs"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Reconcile Cancellations</h3>
+          <p>Upload CSV of cancelled emails. Matches against active subscribers and flips them to canceled.</p>
+          <div class="csv-upload"><input type="file" id="cancel-csv-file" accept=".csv" /></div>
+          <button class="tool-btn tool-btn-red" id="btn-reconcile" onclick="doReconcile()">Reconcile Cancellations</button>
+          <div class="tool-result" id="res-reconcile"></div>
+        </div>
       </div>
     </div>
 
@@ -393,6 +482,106 @@ function doLogin() {
     document.getElementById('admin-pw').value = '';
     document.getElementById('admin-pw').focus();
   });
+}
+
+// --- Data Tools Toggle ---
+function toggleDataTools() {
+  var body = document.getElementById('tools-body');
+  var chevron = document.getElementById('tools-chevron');
+  body.classList.toggle('open');
+  chevron.classList.toggle('open');
+}
+
+// --- UTM Link Generator ---
+function handleUtmSelect(sel, customId) {
+  var custom = document.getElementById(customId);
+  if (sel.value === '__custom__') {
+    custom.style.display = 'block';
+    custom.value = '';
+    custom.focus();
+  } else {
+    custom.style.display = 'none';
+    custom.value = '';
+  }
+}
+
+function getUtmValue(selectId, customId) {
+  var sel = document.getElementById(selectId);
+  if (sel.value === '__custom__') {
+    return document.getElementById(customId).value.trim().toLowerCase().replace(/\s+/g, '_');
+  }
+  return sel.value;
+}
+
+function updateUtmPreview() {
+  var base = document.getElementById('utm-base').value;
+  var source = getUtmValue('utm-source', 'utm-source-custom');
+  var medium = getUtmValue('utm-medium', 'utm-medium-custom');
+  var campaign = document.getElementById('utm-campaign').value.trim().toLowerCase().replace(/\s+/g, '_');
+
+  var output = document.getElementById('utm-output');
+  var copyBtn = document.getElementById('utm-copy-btn');
+
+  if (!source) {
+    output.innerHTML = 'Pick a source to get started';
+    copyBtn.textContent = 'Copy Link';
+    copyBtn.className = 'utm-copy-btn';
+    return;
+  }
+
+  var params = [];
+  if (source) params.push('utm_source=' + encodeURIComponent(source));
+  if (medium) params.push('utm_medium=' + encodeURIComponent(medium));
+  if (campaign) params.push('utm_campaign=' + encodeURIComponent(campaign));
+
+  var sep = base.indexOf('?') > -1 ? '&' : '?';
+  var url = base + sep + params.join('&');
+
+  // Highlight the UTM params in green
+  var baseDisplay = escHtml(base + sep);
+  var paramsDisplay = params.map(function(p) {
+    return '<span class="utm-param">' + escHtml(p) + '</span>';
+  }).join('<span class="utm-param">&amp;</span>');
+
+  output.innerHTML = baseDisplay + paramsDisplay;
+
+  copyBtn.textContent = 'Copy Link';
+  copyBtn.className = 'utm-copy-btn';
+}
+
+function copyUtmUrl() {
+  var base = document.getElementById('utm-base').value;
+  var source = getUtmValue('utm-source', 'utm-source-custom');
+  var medium = getUtmValue('utm-medium', 'utm-medium-custom');
+  var campaign = document.getElementById('utm-campaign').value.trim().toLowerCase().replace(/\s+/g, '_');
+
+  if (!source) { alert('Pick a source first.'); return; }
+
+  var params = [];
+  if (source) params.push('utm_source=' + encodeURIComponent(source));
+  if (medium) params.push('utm_medium=' + encodeURIComponent(medium));
+  if (campaign) params.push('utm_campaign=' + encodeURIComponent(campaign));
+
+  var sep = base.indexOf('?') > -1 ? '&' : '?';
+  var url = base + sep + params.join('&');
+
+  navigator.clipboard.writeText(url).then(function() {
+    var btn = document.getElementById('utm-copy-btn');
+    btn.textContent = 'Copied!';
+    btn.className = 'utm-copy-btn copied';
+    setTimeout(function() {
+      btn.textContent = 'Copy Link';
+      btn.className = 'utm-copy-btn';
+    }, 2000);
+  }).catch(function() {
+    prompt('Copy this URL:', url);
+  });
+}
+
+function escHtml(s) {
+  var d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 // --- Date range filter ---
