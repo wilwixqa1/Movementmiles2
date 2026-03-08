@@ -111,6 +111,9 @@ async def startup():
                 """)
                 # Session 11: trial-to-paid conversion tracking
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS readable_id TEXT")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS renewal_count INTEGER DEFAULT 0")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_renewed_at TIMESTAMPTZ")
 
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
@@ -379,6 +382,26 @@ def require_admin(password: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+# --- Readable ID Assignment ---
+
+async def assign_readable_id(conn, source: str) -> str:
+    """Generate next persistent readable ID for a source (APPLE-0001, GOOGLE-0001, STRIPE-0001)."""
+    prefix = source.upper()  # APPLE, GOOGLE, STRIPE
+    row = await conn.fetchrow(
+        "SELECT readable_id FROM subscriptions WHERE source = $1 AND readable_id IS NOT NULL ORDER BY readable_id DESC LIMIT 1",
+        source
+    )
+    if row and row["readable_id"]:
+        # Extract number from e.g. APPLE-0042
+        try:
+            num = int(row["readable_id"].split("-")[-1]) + 1
+        except (ValueError, IndexError):
+            num = 1
+    else:
+        num = 1
+    return f"{prefix}-{num:04d}"
+
+
 # --- Pydantic Models ---
 
 class ChatRequest(BaseModel):
@@ -620,6 +643,37 @@ async def stripe_webhook(request: Request):
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
 
+            # Session 11: Assign readable_id if not yet set
+            try:
+                existing = await conn.fetchrow(
+                    "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
+                    sub_id
+                )
+                if existing and not existing["readable_id"]:
+                    rid = await assign_readable_id(conn, "stripe")
+                    await conn.execute(
+                        "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
+                        rid, sub_id
+                    )
+            except Exception as e:
+                print(f"Readable ID assign error: {e}")
+
+            # Session 11: Track renewals (invoice.paid-like events)
+            if event_type == "customer.subscription.updated" and status == "active":
+                prev_attrs = event.get("data", {}).get("previous_attributes", {})
+                prev_period = prev_attrs.get("current_period_start")
+                if prev_period and prev_period != sub.get("current_period_start"):
+                    try:
+                        await conn.execute(
+                            """UPDATE subscriptions SET
+                               renewal_count = COALESCE(renewal_count, 0) + 1,
+                               last_renewed_at = NOW()
+                               WHERE stripe_subscription_id = $1""",
+                            sub_id
+                        )
+                    except Exception:
+                        pass
+
             # Session 11: Detect trial-to-paid conversion (trialing -> active)
             if event_type == "customer.subscription.updated":
                 prev_attrs = event.get("data", {}).get("previous_attributes", {})
@@ -795,6 +849,34 @@ async def apple_webhook(request: Request):
         except Exception as e:
             print(f"Apple subscription upsert error: {e}")
 
+        # Session 11: Assign readable_id if not yet set
+        try:
+            existing = await conn.fetchrow(
+                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
+                original_transaction_id
+            )
+            if existing and not existing["readable_id"]:
+                rid = await assign_readable_id(conn, "apple")
+                await conn.execute(
+                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
+                    rid, original_transaction_id
+                )
+        except Exception as e:
+            print(f"Apple readable ID error: {e}")
+
+        # Session 11: Track renewals on DID_RENEW
+        if notification_type == "DID_RENEW":
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions SET
+                       renewal_count = COALESCE(renewal_count, 0) + 1,
+                       last_renewed_at = NOW()
+                       WHERE stripe_subscription_id = $1""",
+                    original_transaction_id
+                )
+            except Exception:
+                pass
+
         # Apple trial-to-paid: DID_RENEW after SUBSCRIBED = converted
         if notification_type == "DID_RENEW":
             try:
@@ -932,6 +1014,34 @@ async def google_webhook(request: Request):
             )
         except Exception as e:
             print(f"Google subscription upsert error: {e}")
+
+        # Session 11: Assign readable_id if not yet set
+        try:
+            existing = await conn.fetchrow(
+                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
+                external_id
+            )
+            if existing and not existing["readable_id"]:
+                rid = await assign_readable_id(conn, "google")
+                await conn.execute(
+                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
+                    rid, external_id
+                )
+        except Exception as e:
+            print(f"Google readable ID error: {e}")
+
+        # Session 11: Track renewals on RENEWED (2) or RECOVERED (1)
+        if notification_type in (1, 2):
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions SET
+                       renewal_count = COALESCE(renewal_count, 0) + 1,
+                       last_renewed_at = NOW()
+                       WHERE stripe_subscription_id = $1""",
+                    external_id
+                )
+            except Exception:
+                pass
 
         # Session 11: Google trial-to-paid conversion
         # RENEWED (type 2) or RECOVERED (type 1) after initial purchase = likely converted
@@ -1703,6 +1813,55 @@ async def backfill_conversions(request: Request):
     }
 
 
+@app.post("/api/admin/backfill-readable-ids")
+async def backfill_readable_ids(request: Request):
+    """Assign persistent readable_id to all existing subscriptions that lack one."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        # Get all subs without readable_id, ordered by created_at so IDs are chronological
+        rows = await conn.fetch(
+            """SELECT id, stripe_subscription_id, source FROM subscriptions
+               WHERE readable_id IS NULL
+               ORDER BY source, created_at"""
+        )
+
+        # Get current max ID per source
+        counters = {}
+        for src in ("stripe", "apple", "google"):
+            row = await conn.fetchrow(
+                "SELECT readable_id FROM subscriptions WHERE source = $1 AND readable_id IS NOT NULL ORDER BY readable_id DESC LIMIT 1",
+                src
+            )
+            if row and row["readable_id"]:
+                try:
+                    counters[src] = int(row["readable_id"].split("-")[-1])
+                except (ValueError, IndexError):
+                    counters[src] = 0
+            else:
+                counters[src] = 0
+
+        assigned = 0
+        for r in rows:
+            src = r["source"] or "stripe"
+            counters[src] = counters.get(src, 0) + 1
+            rid = f"{src.upper()}-{counters[src]:04d}"
+            await conn.execute(
+                "UPDATE subscriptions SET readable_id = $1 WHERE id = $2",
+                rid, r["id"]
+            )
+            assigned += 1
+
+    return {
+        "status": "ok",
+        "assigned": assigned,
+        "counters": {k: v for k, v in counters.items()},
+    }
+
+
 # --- Session 11: Subscriptions CSV Export ---
 
 @app.get("/api/admin/subscriptions-csv")
@@ -1734,8 +1893,7 @@ async def admin_subscriptions_csv(request: Request):
             ORDER BY s.created_at DESC
         """)
 
-    apple_counter = 0
-    google_counter = 0
+    # readable_id now comes from DB (assigned persistently)
 
     output = io_mod.StringIO()
     writer = csv_mod.writer(output)
@@ -1745,21 +1903,16 @@ async def admin_subscriptions_csv(request: Request):
         "trial_start", "trial_end", "converted_at", "cancel_date",
         "months_active", "est_lifetime_revenue",
         "utm_source", "utm_medium", "utm_campaign",
-        "email_known"
+        "email_known",
+        "renewal_count",
+        "last_renewed_at"
     ])
 
     for r in rows:
         source = r.get("source", "stripe") or "stripe"
         sub_id = r.get("stripe_subscription_id", "") or ""
 
-        if source == "apple":
-            apple_counter += 1
-            readable_id = f"APPLE-{apple_counter:04d}"
-        elif source == "google":
-            google_counter += 1
-            readable_id = f"GOOGLE-{google_counter:04d}"
-        else:
-            readable_id = sub_id or f"STRIPE-{r['id']}"
+        readable_id = r.get("readable_id", "") or sub_id or f"{source.upper()}-{r['id']}"
 
         email = r.get("email", "") or ""
         email_known = "TRUE" if email and "@" in email else "FALSE"
@@ -1804,6 +1957,8 @@ async def admin_subscriptions_csv(request: Request):
             r.get("lead_utm_medium", "") or "",
             r.get("lead_utm_campaign", "") or "",
             email_known,
+            r.get("renewal_count", 0) or 0,
+            str(r.get("last_renewed_at", "").date() if r.get("last_renewed_at") else ""),
         ])
 
     output.seek(0)
