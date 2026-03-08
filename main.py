@@ -1686,13 +1686,12 @@ async def admin_subscriptions_csv(request: Request):
     output = io_mod.StringIO()
     writer = csv_mod.writer(output)
     writer.writerow([
-        "readable_id", "email", "first_name", "source", "status",
-        "plan_interval", "plan_amount", "currency",
-        "trial_start", "trial_end", "converted_at",
-        "current_period_start", "current_period_end",
-        "canceled_at", "created_at",
+        "readable_id", "email", "name", "source", "status",
+        "plan", "signup_date",
+        "trial_start", "trial_end", "converted_at", "cancel_date",
+        "months_active", "est_lifetime_revenue",
         "utm_source", "utm_medium", "utm_campaign",
-        "email_known", "est_lifetime_revenue", "lead_date"
+        "email_known"
     ])
 
     for r in rows:
@@ -1709,17 +1708,27 @@ async def admin_subscriptions_csv(request: Request):
             readable_id = sub_id or f"STRIPE-{r['id']}"
 
         email = r.get("email", "") or ""
-        email_known = "yes" if email and "@" in email else "no"
+        email_known = "TRUE" if email and "@" in email else "FALSE"
 
         plan_amount = r.get("plan_amount", 0) or 0
         plan_interval = r.get("plan_interval", "") or ""
         created = r.get("created_at")
         canceled = r.get("canceled_at")
 
+        # Plan display
+        if plan_interval == "year":
+            plan_display = f"${plan_amount / 100:.2f}/yr"
+        elif plan_interval == "month":
+            plan_display = f"${plan_amount / 100:.2f}/mo"
+        else:
+            plan_display = f"${plan_amount / 100:.2f}" if plan_amount else "$0.00"
+
+        # Months active
+        months_active = 0
         est_revenue = 0
         if created and plan_amount:
             end_date = canceled if canceled else datetime.now(timezone.utc)
-            months_active = max(1, (end_date - created).days / 30)
+            months_active = round(max(1, (end_date - created).days / 30), 1)
             monthly_equiv = plan_amount / 12 if plan_interval == "year" else plan_amount
             est_revenue = round(monthly_equiv * months_active)
 
@@ -1729,22 +1738,18 @@ async def admin_subscriptions_csv(request: Request):
             r.get("lead_name", "") or "",
             source,
             r.get("status", ""),
-            plan_interval,
-            f"${plan_amount / 100:.2f}" if plan_amount else "$0.00",
-            r.get("currency", "usd"),
-            str(r.get("trial_start", "") or ""),
-            str(r.get("trial_end", "") or ""),
-            str(r.get("converted_at", "") or ""),
-            str(r.get("current_period_start", "") or ""),
-            str(r.get("current_period_end", "") or ""),
-            str(canceled or ""),
-            str(created or ""),
+            plan_display,
+            str(created.date()) if created else "",
+            str(r.get("trial_start", "").date() if r.get("trial_start") else ""),
+            str(r.get("trial_end", "").date() if r.get("trial_end") else ""),
+            str(r.get("converted_at", "").date() if r.get("converted_at") else ""),
+            str(canceled.date()) if canceled else "",
+            months_active,
+            f"${est_revenue / 100:.2f}",
             r.get("lead_utm_source", "") or "",
             r.get("lead_utm_medium", "") or "",
             r.get("lead_utm_campaign", "") or "",
             email_known,
-            f"${est_revenue / 100:.2f}",
-            str(r.get("lead_date", "") or ""),
         ])
 
     output.seek(0)
@@ -1917,6 +1922,177 @@ async def delete_ad_spend(request: Request):
         await conn.execute("DELETE FROM ad_spend WHERE month = $1 AND channel = $2", month, channel)
 
     return {"status": "ok"}
+
+
+# --- Session 11: Manual Email Attach for Apple/Google Subscribers ---
+
+@app.post("/api/admin/attach-email")
+async def attach_email(request: Request):
+    """Attach an email to an Apple/Google subscriber. Enables full attribution via leads join."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    body = await request.json()
+    sub_id = (body.get("subscriber_id", "") or "").strip()
+    email = (body.get("email", "") or "").strip().lower()
+
+    if not sub_id or not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="subscriber_id and valid email required")
+
+    async with db_pool.acquire() as conn:
+        # Find the subscription by readable-style ID or raw ID
+        row = await conn.fetchrow(
+            "SELECT id, stripe_subscription_id, source, email FROM subscriptions WHERE stripe_subscription_id = $1",
+            sub_id
+        )
+        if not row:
+            # Try partial match for imported IDs
+            row = await conn.fetchrow(
+                "SELECT id, stripe_subscription_id, source, email FROM subscriptions WHERE stripe_subscription_id ILIKE $1 LIMIT 1",
+                f"%{sub_id}%"
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"No subscription found matching '{sub_id}'")
+
+        old_email = row["email"] or ""
+        await conn.execute(
+            "UPDATE subscriptions SET email = $1, updated_at = NOW() WHERE id = $2",
+            email, row["id"]
+        )
+
+    return {
+        "status": "ok",
+        "subscription_id": row["stripe_subscription_id"],
+        "source": row["source"],
+        "old_email": old_email,
+        "new_email": email,
+    }
+
+
+@app.get("/api/admin/search-subs")
+async def search_subs(request: Request):
+    """Search subscriptions by ID or email fragment for the attach-email UI."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    q = request.query_params.get("q", "").strip()
+    if not q or len(q) < 3:
+        return {"results": []}
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, stripe_subscription_id, source, email, status, plan_amount, plan_interval, created_at
+            FROM subscriptions
+            WHERE stripe_subscription_id ILIKE $1 OR email ILIKE $1
+            ORDER BY created_at DESC LIMIT 10
+        """, f"%{q}%")
+
+    return {"results": [
+        {
+            "id": r["id"],
+            "sub_id": r["stripe_subscription_id"],
+            "source": r["source"],
+            "email": r["email"] or "",
+            "status": r["status"],
+            "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}",
+            "created": str(r["created_at"].date()) if r["created_at"] else "",
+        }
+        for r in rows
+    ]}
+
+
+# --- Session 11: Manual Email Attach for Apple/Google subscribers ---
+
+@app.post("/api/admin/attach-email")
+async def attach_email(request: Request):
+    """Permanently attach an email to an Apple/Google subscription.
+    Once attached, leads-table matching gives full name + UTM attribution."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    body = await request.json()
+    sub_id = (body.get("subscription_id") or "").strip()
+    email = (body.get("email") or "").strip().lower()
+
+    if not sub_id or not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid subscription_id and email required")
+
+    async with db_pool.acquire() as conn:
+        # Find the subscription
+        row = await conn.fetchrow(
+            "SELECT id, source, email as current_email FROM subscriptions WHERE stripe_subscription_id = $1",
+            sub_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Subscription '{sub_id}' not found")
+
+        await conn.execute(
+            "UPDATE subscriptions SET email = $1, updated_at = NOW() WHERE stripe_subscription_id = $2",
+            email, sub_id
+        )
+
+        # Check if we can match to a lead now
+        lead = await conn.fetchrow(
+            "SELECT first_name, utm_source, utm_medium, utm_campaign FROM leads WHERE lower(email) = $1 ORDER BY created_at DESC LIMIT 1",
+            email
+        )
+
+    result = {
+        "status": "ok",
+        "subscription_id": sub_id,
+        "email": email,
+        "source": row["source"],
+        "previous_email": row["current_email"] or "(none)",
+    }
+    if lead:
+        result["matched_lead"] = {
+            "name": lead["first_name"] or "",
+            "utm_source": lead["utm_source"] or "",
+            "utm_medium": lead["utm_medium"] or "",
+            "utm_campaign": lead["utm_campaign"] or "",
+        }
+    else:
+        result["matched_lead"] = None
+
+    return result
+
+
+@app.get("/api/admin/search-subscriptions")
+async def search_subscriptions(request: Request):
+    """Search subscriptions by ID prefix or email for the attach-email UI."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    q = request.query_params.get("q", "").strip()
+    if len(q) < 2:
+        return {"results": []}
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT stripe_subscription_id, email, source, status, plan_amount, plan_interval
+            FROM subscriptions
+            WHERE stripe_subscription_id ILIKE $1 OR email ILIKE $1
+            ORDER BY created_at DESC LIMIT 10
+        """, f"%{q}%")
+
+    return {"results": [
+        {
+            "id": r["stripe_subscription_id"],
+            "email": r["email"] or "",
+            "source": r["source"],
+            "status": r["status"],
+            "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}",
+        }
+        for r in rows
+    ]}
 
 
 @app.get("/api/admin/stats")
