@@ -348,7 +348,12 @@ async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int
             resp.raise_for_status()
             data = resp.json()
             return data["content"][0]["text"]
+        except httpx.HTTPStatusError as e:
+            body = e.response.text if hasattr(e.response, 'text') else 'no body'
+            print(f"[Anthropic API error] Status: {e.response.status_code}, Body: {body}")
+            return f"[AI insights unavailable: {e.response.status_code} - {body[:200]}]"
         except Exception as e:
+            print(f"[Anthropic API error] {type(e).__name__}: {str(e)}")
             return f"[AI insights unavailable: {str(e)}]"
 
 
@@ -1014,8 +1019,27 @@ async def gather_daily_stats() -> dict:
 
 async def generate_digest_insights(stats: dict) -> str:
     """Send daily stats to Claude for analysis and insights."""
-    stats_text = json.dumps(stats, indent=2, default=str)
+    # Trim to key metrics only (avoid oversized prompt)
+    slim = {
+        "new_subscriptions": stats.get("new_subscriptions", 0),
+        "new_subs_by_source": stats.get("new_subs_by_source", []),
+        "cancellations": stats.get("cancellations", 0),
+        "gross_mrr": stats.get("gross_mrr", "$0"),
+        "net_mrr": stats.get("net_mrr", "$0"),
+        "total_fees": stats.get("total_fees", "$0"),
+        "active_subscribers": stats.get("active_subscribers", 0),
+        "trialing": stats.get("trialing", 0),
+        "new_leads": stats.get("new_leads", 0),
+        "leads_by_source": stats.get("leads_by_source", []),
+        "page_views_24h": stats.get("page_views_24h", 0),
+        "top_pages": stats.get("top_pages", []),
+        "chat_sessions_24h": stats.get("chat_sessions_24h", 0),
+        "mrr_by_source": stats.get("mrr_by_source", []),
+        "fee_breakdown": stats.get("fee_breakdown", {}),
+    }
+    stats_text = json.dumps(slim, indent=2, default=str)
     prompt = f"Here are today's metrics for Movement & Miles (fitness subscription app). Generate a brief morning digest with key insights and any recommended actions.\n\n{stats_text}"
+    print(f"[Digest] Prompt length: {len(prompt)} chars")
     return await call_anthropic_raw(DIGEST_SYSTEM_PROMPT, [{"role": "user", "content": prompt}], max_tokens=500)
 
 
