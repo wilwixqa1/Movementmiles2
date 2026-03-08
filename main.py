@@ -933,6 +933,19 @@ async def google_webhook(request: Request):
         except Exception as e:
             print(f"Google subscription upsert error: {e}")
 
+        # Session 11: Google trial-to-paid conversion
+        # RENEWED (type 2) or RECOVERED (type 1) after initial purchase = likely converted
+        if notification_type in (1, 2):
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions SET converted_at = NOW()
+                       WHERE stripe_subscription_id = $1 AND converted_at IS NULL
+                       AND trial_start IS NOT NULL""",
+                    external_id
+                )
+            except Exception:
+                pass
+
     return {"status": "ok"}
 
 
@@ -1649,6 +1662,47 @@ async def backfill_trial_dates(request: Request):
     return {"status": "ok", "updated": count}
 
 
+# --- Session 11: Backfill converted_at for historical data ---
+
+@app.post("/api/admin/backfill-conversions")
+async def backfill_conversions(request: Request):
+    """One-time backfill: stamp converted_at on subs that clearly converted from trial.
+    Uses heuristic: had a trial (trial_end set) AND current_period_start moved past trial_end."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        # Stripe subs: trial_end exists and current_period moved past it
+        stripe_result = await conn.execute(
+            """UPDATE subscriptions
+               SET converted_at = trial_end
+               WHERE converted_at IS NULL
+               AND trial_end IS NOT NULL
+               AND current_period_start IS NOT NULL
+               AND current_period_start > trial_end
+               AND source = 'stripe'""")
+        stripe_count = int(stripe_result.split(" ")[-1]) if stripe_result else 0
+
+        # Apple/Google imported subs: if active and trial_end is set, they converted
+        appgoogle_result = await conn.execute(
+            """UPDATE subscriptions
+               SET converted_at = trial_end
+               WHERE converted_at IS NULL
+               AND trial_end IS NOT NULL
+               AND status = 'active'
+               AND source IN ('apple', 'google')""")
+        appgoogle_count = int(appgoogle_result.split(" ")[-1]) if appgoogle_result else 0
+
+    return {
+        "status": "ok",
+        "stripe_backfilled": stripe_count,
+        "apple_google_backfilled": appgoogle_count,
+        "total": stripe_count + appgoogle_count,
+    }
+
+
 # --- Session 11: Subscriptions CSV Export ---
 
 @app.get("/api/admin/subscriptions-csv")
@@ -1924,88 +1978,7 @@ async def delete_ad_spend(request: Request):
     return {"status": "ok"}
 
 
-# --- Session 11: Manual Email Attach for Apple/Google Subscribers ---
-
-@app.post("/api/admin/attach-email")
-async def attach_email(request: Request):
-    """Attach an email to an Apple/Google subscriber. Enables full attribution via leads join."""
-    pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="No database")
-
-    body = await request.json()
-    sub_id = (body.get("subscriber_id", "") or "").strip()
-    email = (body.get("email", "") or "").strip().lower()
-
-    if not sub_id or not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="subscriber_id and valid email required")
-
-    async with db_pool.acquire() as conn:
-        # Find the subscription by readable-style ID or raw ID
-        row = await conn.fetchrow(
-            "SELECT id, stripe_subscription_id, source, email FROM subscriptions WHERE stripe_subscription_id = $1",
-            sub_id
-        )
-        if not row:
-            # Try partial match for imported IDs
-            row = await conn.fetchrow(
-                "SELECT id, stripe_subscription_id, source, email FROM subscriptions WHERE stripe_subscription_id ILIKE $1 LIMIT 1",
-                f"%{sub_id}%"
-            )
-        if not row:
-            raise HTTPException(status_code=404, detail=f"No subscription found matching '{sub_id}'")
-
-        old_email = row["email"] or ""
-        await conn.execute(
-            "UPDATE subscriptions SET email = $1, updated_at = NOW() WHERE id = $2",
-            email, row["id"]
-        )
-
-    return {
-        "status": "ok",
-        "subscription_id": row["stripe_subscription_id"],
-        "source": row["source"],
-        "old_email": old_email,
-        "new_email": email,
-    }
-
-
-@app.get("/api/admin/search-subs")
-async def search_subs(request: Request):
-    """Search subscriptions by ID or email fragment for the attach-email UI."""
-    pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="No database")
-
-    q = request.query_params.get("q", "").strip()
-    if not q or len(q) < 3:
-        return {"results": []}
-
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, stripe_subscription_id, source, email, status, plan_amount, plan_interval, created_at
-            FROM subscriptions
-            WHERE stripe_subscription_id ILIKE $1 OR email ILIKE $1
-            ORDER BY created_at DESC LIMIT 10
-        """, f"%{q}%")
-
-    return {"results": [
-        {
-            "id": r["id"],
-            "sub_id": r["stripe_subscription_id"],
-            "source": r["source"],
-            "email": r["email"] or "",
-            "status": r["status"],
-            "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}",
-            "created": str(r["created_at"].date()) if r["created_at"] else "",
-        }
-        for r in rows
-    ]}
-
-
-# --- Session 11: Manual Email Attach for Apple/Google subscribers ---
+# --- Session 11: Attach Email + Search (consolidated) ---
 
 @app.post("/api/admin/attach-email")
 async def attach_email(request: Request):
