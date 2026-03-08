@@ -1409,6 +1409,63 @@ function exportCSV() {
 }
 
 document.getElementById('admin-pw').focus();
+
+function doBackfillConversions() {
+  if (!confirm("Backfill converted_at on historical subscribers?")) return;
+  var btn = document.getElementById("btn-backfill-conv");
+  var res = document.getElementById("res-backfill-conv");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Scanning subscriptions...";
+  fetch("/api/admin/backfill-conversions", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    res.textContent = "Done! Stripe: " + d.stripe_backfilled + ", Apple/Google: " + d.apple_google_backfilled + " (total: " + d.total + ")";
+    btn.disabled = false;
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doBackfillIds() {
+  if (!confirm("Assign persistent readable IDs to all subscribers?")) return;
+  var btn = document.getElementById("btn-backfill-ids");
+  var res = document.getElementById("res-backfill-ids");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Assigning readable IDs...";
+  fetch("/api/admin/backfill-readable-ids", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    var detail = "Assigned " + d.assigned + " IDs.";
+    if (d.counters) {
+      var parts = [];
+      for (var k in d.counters) parts.push(k.toUpperCase() + ": " + d.counters[k]);
+      detail += " Counters: " + parts.join(", ");
+    }
+    res.className = "tool-result ok";
+    res.textContent = detail;
+    btn.disabled = false;
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
 </script>
 </body>
 </html>
