@@ -11,6 +11,7 @@ import stripe
 import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+import gzip
 
 app = FastAPI(title="Movement & Miles")
 
@@ -33,6 +34,12 @@ DIGEST_RECIPIENTS = os.environ.get("DIGEST_RECIPIENTS", "")
 DIGEST_FROM_EMAIL = os.environ.get("DIGEST_FROM_EMAIL", "onboarding@resend.dev")
 
 stripe.api_key = STRIPE_SECRET_KEY
+
+# Apple App Store Connect API
+APPLE_KEY_ID = os.environ.get("APPLE_KEY_ID", "")
+APPLE_ISSUER_ID = os.environ.get("APPLE_ISSUER_ID", "")
+APPLE_KEY_CONTENT = os.environ.get("APPLE_KEY_CONTENT", "")
+APPLE_VENDOR_NUMBER = os.environ.get("APPLE_VENDOR_NUMBER", "")
 
 # --- Database ---
 db_pool = None
@@ -145,6 +152,28 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW(),
                         UNIQUE(month, channel)
+                    )
+                """)
+                # Session 13: Apple/Google aggregate metrics
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS platform_metrics (
+                        id SERIAL PRIMARY KEY,
+                        date DATE NOT NULL,
+                        source TEXT NOT NULL,
+                        metric_type TEXT NOT NULL,
+                        active_subscriptions INTEGER DEFAULT 0,
+                        active_free_trials INTEGER DEFAULT 0,
+                        new_subscriptions INTEGER DEFAULT 0,
+                        renewals INTEGER DEFAULT 0,
+                        conversions INTEGER DEFAULT 0,
+                        cancellations INTEGER DEFAULT 0,
+                        reactivations INTEGER DEFAULT 0,
+                        revenue_cents INTEGER DEFAULT 0,
+                        proceeds_cents INTEGER DEFAULT 0,
+                        report_data JSONB,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(date, source, metric_type)
                     )
                 """)
             print("Database connected, all tables ready")
@@ -2705,7 +2734,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "12.0.0",
+        "version": "13.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
