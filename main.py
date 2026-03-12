@@ -2742,6 +2742,432 @@ async def health():
     }
 
 
+
+# --- Apple App Store Connect Integration (Session 13) ---
+
+import jwt as pyjwt
+
+def generate_apple_jwt() -> str:
+    """Generate a short-lived JWT for App Store Connect API."""
+    if not all([APPLE_KEY_ID, APPLE_ISSUER_ID, APPLE_KEY_CONTENT]):
+        raise ValueError("Apple API credentials not configured (APPLE_KEY_ID, APPLE_ISSUER_ID, APPLE_KEY_CONTENT)")
+    import time as _time
+    now = int(_time.time())
+    payload = {
+        "iss": APPLE_ISSUER_ID,
+        "iat": now,
+        "exp": now + (20 * 60),
+        "aud": "appstoreconnect-v1",
+    }
+    headers = {"alg": "ES256", "kid": APPLE_KEY_ID, "typ": "JWT"}
+    return pyjwt.encode(payload, APPLE_KEY_CONTENT, algorithm="ES256", headers=headers)
+
+
+async def apple_api_get(path: str, params: dict = None, expect_binary: bool = False):
+    """Authenticated GET to App Store Connect API."""
+    token = generate_apple_jwt()
+    url = f"https://api.appstoreconnect.apple.com{path}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params or {})
+        print(f"[Apple API] GET {path} -> {resp.status_code}")
+        if expect_binary and resp.status_code == 200:
+            return resp.content
+        if resp.status_code != 200:
+            try:
+                error_data = resp.json()
+            except Exception:
+                error_data = {"raw": resp.text[:500]}
+            print(f"[Apple API] Error: {json.dumps(error_data, indent=2)[:500]}")
+            return {"error": True, "status": resp.status_code, "data": error_data}
+        return resp.json()
+
+
+def parse_apple_tsv(gzipped_content: bytes) -> list:
+    """Decompress gzipped TSV from Apple and return list of row dicts."""
+    try:
+        decompressed = gzip.decompress(gzipped_content)
+        text = decompressed.decode("utf-8").strip()
+    except Exception:
+        text = gzipped_content.decode("utf-8").strip()
+    lines = text.split("\n")
+    if not lines:
+        return []
+    headers = lines[0].split("\t")
+    rows = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        values = line.split("\t")
+        row = {}
+        for i, h in enumerate(headers):
+            row[h.strip()] = values[i].strip() if i < len(values) else ""
+        rows.append(row)
+    return rows
+
+
+def aggregate_apple_subscription_rows(rows: list) -> dict:
+    """Sum active subscriptions and free trials across all products/countries."""
+    total_active = 0
+    total_trials = 0
+    for row in rows:
+        try:
+            total_active += int(row.get("Active Subscriptions",
+                row.get("Active Standard Price Subscriptions", "0")) or 0)
+            total_trials += int(row.get("Active Free Trial Introductory Offer Subscriptions",
+                row.get("Active Free Trials", "0")) or 0)
+        except (ValueError, TypeError):
+            pass
+    return {"active_subscriptions": total_active, "active_free_trials": total_trials}
+
+
+def aggregate_apple_event_rows(rows: list) -> dict:
+    """Categorize subscription events and sum revenue."""
+    new_subs = renewals = conversions = cancellations = reactivations = 0
+    revenue_cents = proceeds_cents = 0
+    for row in rows:
+        event = row.get("Event", "").lower()
+        try:
+            units = int(row.get("Quantity", row.get("Units", "0")) or 0)
+        except (ValueError, TypeError):
+            units = 0
+        try:
+            dev_proceeds = float(row.get("Developer Proceeds", row.get("Proceeds", "0")) or 0)
+            cust_price = float(row.get("Customer Price", "0") or 0)
+        except (ValueError, TypeError):
+            dev_proceeds = cust_price = 0
+        if any(x in event for x in ["new", "subscribe", "initial"]):
+            new_subs += units
+        if "renew" in event:
+            renewals += units
+        if any(x in event for x in ["convert", "paid from"]):
+            conversions += units
+        if any(x in event for x in ["cancel", "churn", "refund"]):
+            cancellations += units
+        if "reactivat" in event:
+            reactivations += units
+        revenue_cents += round(cust_price * 100 * units) if cust_price else 0
+        proceeds_cents += round(dev_proceeds * 100 * units) if dev_proceeds else 0
+    return {
+        "new_subscriptions": new_subs, "renewals": renewals,
+        "conversions": conversions, "cancellations": cancellations,
+        "reactivations": reactivations,
+        "revenue_cents": revenue_cents, "proceeds_cents": proceeds_cents,
+    }
+
+
+async def store_apple_subscription_metric(conn, report_date, totals: dict, raw_rows: list):
+    """Upsert subscription snapshot into platform_metrics."""
+    await conn.execute("""
+        INSERT INTO platform_metrics (date, source, metric_type,
+            active_subscriptions, active_free_trials, report_data, updated_at)
+        VALUES ($1, 'apple', 'subscription', $2, $3, $4, NOW())
+        ON CONFLICT (date, source, metric_type) DO UPDATE SET
+            active_subscriptions = EXCLUDED.active_subscriptions,
+            active_free_trials = EXCLUDED.active_free_trials,
+            report_data = EXCLUDED.report_data,
+            updated_at = NOW()
+    """, report_date, totals["active_subscriptions"], totals["active_free_trials"],
+        json.dumps(raw_rows[:50]))
+
+
+async def store_apple_event_metric(conn, report_date, totals: dict, raw_rows: list):
+    """Upsert event data into platform_metrics."""
+    await conn.execute("""
+        INSERT INTO platform_metrics (date, source, metric_type,
+            new_subscriptions, renewals, conversions, cancellations,
+            reactivations, revenue_cents, proceeds_cents, report_data, updated_at)
+        VALUES ($1, 'apple', 'subscription_event', $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (date, source, metric_type) DO UPDATE SET
+            new_subscriptions = EXCLUDED.new_subscriptions,
+            renewals = EXCLUDED.renewals,
+            conversions = EXCLUDED.conversions,
+            cancellations = EXCLUDED.cancellations,
+            reactivations = EXCLUDED.reactivations,
+            revenue_cents = EXCLUDED.revenue_cents,
+            proceeds_cents = EXCLUDED.proceeds_cents,
+            report_data = EXCLUDED.report_data,
+            updated_at = NOW()
+    """, report_date, totals["new_subscriptions"], totals["renewals"],
+        totals["conversions"], totals["cancellations"], totals["reactivations"],
+        totals["revenue_cents"], totals["proceeds_cents"],
+        json.dumps(raw_rows[:50]))
+
+
+@app.get("/api/admin/apple-discover")
+async def apple_discover(request: Request):
+    """Discover Apple app details: ID, bundle, subscription groups, test vendor."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    result = {"steps": []}
+
+    # Step 1: List apps
+    apps_resp = await apple_api_get("/v1/apps")
+    if isinstance(apps_resp, dict) and apps_resp.get("error"):
+        return {"error": "Failed to list apps", "detail": apps_resp}
+
+    apps = apps_resp.get("data", [])
+    result["apps"] = []
+    for a in apps:
+        attrs = a.get("attributes", {})
+        app_info = {
+            "id": a.get("id"),
+            "name": attrs.get("name"),
+            "bundleId": attrs.get("bundleId"),
+            "sku": attrs.get("sku"),
+        }
+        result["apps"].append(app_info)
+
+        # Step 2: Get subscription groups
+        groups_resp = await apple_api_get(f"/v1/apps/{a['id']}/subscriptionGroups")
+        if isinstance(groups_resp, dict) and not groups_resp.get("error"):
+            groups = groups_resp.get("data", [])
+            app_info["subscription_groups"] = []
+            for g in groups:
+                group_info = {
+                    "id": g.get("id"),
+                    "name": g.get("attributes", {}).get("referenceName"),
+                }
+                subs_resp = await apple_api_get(f"/v1/subscriptionGroups/{g['id']}/subscriptions")
+                if isinstance(subs_resp, dict) and not subs_resp.get("error"):
+                    group_info["subscriptions"] = [
+                        {"id": s.get("id"), "name": s.get("attributes", {}).get("name"),
+                         "productId": s.get("attributes", {}).get("productId"),
+                         "state": s.get("attributes", {}).get("state")}
+                        for s in subs_resp.get("data", [])
+                    ]
+                app_info["subscription_groups"].append(group_info)
+
+    result["steps"].append("Listed apps and subscription groups")
+
+    # Step 3: Test vendor number if configured
+    if APPLE_VENDOR_NUMBER:
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        test_resp = await apple_api_get("/v1/salesReports", params={
+            "filter[reportType]": "SALES",
+            "filter[reportSubType]": "SUMMARY",
+            "filter[frequency]": "DAILY",
+            "filter[reportDate]": yesterday,
+            "filter[vendorNumber]": APPLE_VENDOR_NUMBER,
+        }, expect_binary=True)
+        if isinstance(test_resp, dict) and test_resp.get("error"):
+            result["vendor_test"] = {"status": "failed", "detail": test_resp}
+        else:
+            result["vendor_test"] = {"status": "success", "vendor": APPLE_VENDOR_NUMBER, "report_size_bytes": len(test_resp)}
+        result["steps"].append(f"Tested vendor number: {APPLE_VENDOR_NUMBER}")
+    else:
+        result["vendor_number_help"] = "NOT SET. Set APPLE_VENDOR_NUMBER env var. Find it in App Store Connect > Payments and Financial Reports > top left gray bar."
+        result["steps"].append("No vendor number configured")
+
+    return result
+
+
+@app.post("/api/admin/apple-pull-report")
+async def apple_pull_report(request: Request):
+    """Pull Apple subscription reports for a date and store in platform_metrics.
+    Body: {"date": "2026-03-10"} — defaults to 2 days ago (Apple ~2 day lag)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    if not APPLE_VENDOR_NUMBER:
+        raise HTTPException(status_code=400, detail="APPLE_VENDOR_NUMBER not configured. Run /api/admin/apple-discover first.")
+
+    body = await request.json()
+    report_date_str = body.get("date", "")
+    if not report_date_str:
+        report_date_str = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+
+    report_date = datetime.strptime(report_date_str, "%Y-%m-%d").date()
+    results = {"date": report_date_str, "reports": {}}
+
+    # --- SUBSCRIPTION report (active counts snapshot) ---
+    print(f"[Apple] Pulling SUBSCRIPTION report for {report_date_str}")
+    sub_resp = await apple_api_get("/v1/salesReports", params={
+        "filter[reportType]": "SUBSCRIPTION",
+        "filter[reportSubType]": "SUMMARY",
+        "filter[frequency]": "DAILY",
+        "filter[reportDate]": report_date_str,
+        "filter[vendorNumber]": APPLE_VENDOR_NUMBER,
+    }, expect_binary=True)
+
+    if isinstance(sub_resp, dict) and sub_resp.get("error"):
+        results["reports"]["subscription"] = {"error": sub_resp}
+    elif isinstance(sub_resp, bytes):
+        rows = parse_apple_tsv(sub_resp)
+        totals = aggregate_apple_subscription_rows(rows)
+        results["reports"]["subscription"] = {"rows": len(rows), "totals": totals, "sample": rows[:3]}
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await store_apple_subscription_metric(conn, report_date, totals, rows)
+                results["reports"]["subscription"]["stored"] = True
+            except Exception as e:
+                results["reports"]["subscription"]["store_error"] = str(e)
+
+    # --- SUBSCRIPTION_EVENT report (daily activity) ---
+    print(f"[Apple] Pulling SUBSCRIPTION_EVENT report for {report_date_str}")
+    event_resp = await apple_api_get("/v1/salesReports", params={
+        "filter[reportType]": "SUBSCRIPTION_EVENT",
+        "filter[reportSubType]": "SUMMARY",
+        "filter[frequency]": "DAILY",
+        "filter[reportDate]": report_date_str,
+        "filter[vendorNumber]": APPLE_VENDOR_NUMBER,
+    }, expect_binary=True)
+
+    if isinstance(event_resp, dict) and event_resp.get("error"):
+        results["reports"]["subscription_event"] = {"error": event_resp}
+    elif isinstance(event_resp, bytes):
+        rows = parse_apple_tsv(event_resp)
+        totals = aggregate_apple_event_rows(rows)
+        results["reports"]["subscription_event"] = {"rows": len(rows), "totals": totals, "sample": rows[:5]}
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await store_apple_event_metric(conn, report_date, totals, rows)
+                results["reports"]["subscription_event"]["stored"] = True
+            except Exception as e:
+                results["reports"]["subscription_event"]["store_error"] = str(e)
+
+    return results
+
+
+@app.post("/api/admin/apple-backfill")
+async def apple_backfill(request: Request):
+    """Pull Apple reports for a date range. Max 90 days per run.
+    Body: {"start_date": "2026-01-01", "end_date": "2026-03-10"}"""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    if not APPLE_VENDOR_NUMBER:
+        raise HTTPException(status_code=400, detail="APPLE_VENDOR_NUMBER not configured")
+
+    body = await request.json()
+    start = body.get("start_date", "")
+    end = body.get("end_date", "")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start_date and end_date required (YYYY-MM-DD)")
+
+    start_dt = datetime.strptime(start, "%Y-%m-%d")
+    end_dt = datetime.strptime(end, "%Y-%m-%d")
+    if (end_dt - start_dt).days > 90:
+        raise HTTPException(status_code=400, detail="Max 90 days per backfill run")
+
+    results = {"days_processed": 0, "errors": [], "success": []}
+    current = start_dt
+    while current <= end_dt:
+        date_str = current.strftime("%Y-%m-%d")
+        rd = current.date()
+
+        for report_type, metric_type in [("SUBSCRIPTION", "subscription"), ("SUBSCRIPTION_EVENT", "subscription_event")]:
+            try:
+                resp = await apple_api_get("/v1/salesReports", params={
+                    "filter[reportType]": report_type,
+                    "filter[reportSubType]": "SUMMARY",
+                    "filter[frequency]": "DAILY",
+                    "filter[reportDate]": date_str,
+                    "filter[vendorNumber]": APPLE_VENDOR_NUMBER,
+                }, expect_binary=True)
+
+                if isinstance(resp, dict) and resp.get("error"):
+                    status = resp.get("status", 0)
+                    if status != 404:
+                        results["errors"].append(f"{date_str} {report_type}: {status}")
+                elif isinstance(resp, bytes) and db_pool:
+                    rows = parse_apple_tsv(resp)
+                    async with db_pool.acquire() as conn:
+                        if metric_type == "subscription":
+                            totals = aggregate_apple_subscription_rows(rows)
+                            await store_apple_subscription_metric(conn, rd, totals, rows)
+                        else:
+                            totals = aggregate_apple_event_rows(rows)
+                            await store_apple_event_metric(conn, rd, totals, rows)
+            except Exception as e:
+                results["errors"].append(f"{date_str} {report_type}: {str(e)}")
+
+        results["days_processed"] += 1
+        results["success"].append(date_str)
+        current += timedelta(days=1)
+
+    return results
+
+
+@app.get("/api/admin/apple-metrics")
+async def apple_metrics(request: Request):
+    """Get aggregated Apple metrics for dashboard. Optional date range."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    date_from = request.query_params.get("from", "")
+    date_to = request.query_params.get("to", "")
+
+    async with db_pool.acquire() as conn:
+        # Latest subscription snapshot
+        latest_sub = await conn.fetchrow("""
+            SELECT * FROM platform_metrics
+            WHERE source = 'apple' AND metric_type = 'subscription'
+            ORDER BY date DESC LIMIT 1
+        """)
+
+        # Event totals for date range or last 30 days
+        if date_from and date_to:
+            events = await conn.fetch("""
+                SELECT * FROM platform_metrics
+                WHERE source = 'apple' AND metric_type = 'subscription_event'
+                AND date >= $1 AND date <= $2 ORDER BY date
+            """, datetime.strptime(date_from, "%Y-%m-%d").date(),
+                datetime.strptime(date_to, "%Y-%m-%d").date())
+        else:
+            events = await conn.fetch("""
+                SELECT * FROM platform_metrics
+                WHERE source = 'apple' AND metric_type = 'subscription_event'
+                AND date > CURRENT_DATE - INTERVAL '30 days' ORDER BY date
+            """)
+
+        total_new = total_renewals = total_conversions = total_cancellations = 0
+        total_revenue = total_proceeds = 0
+        daily_data = []
+        for e in events:
+            total_new += e["new_subscriptions"] or 0
+            total_renewals += e["renewals"] or 0
+            total_conversions += e["conversions"] or 0
+            total_cancellations += e["cancellations"] or 0
+            total_revenue += e["revenue_cents"] or 0
+            total_proceeds += e["proceeds_cents"] or 0
+            daily_data.append({
+                "date": str(e["date"]),
+                "new_subs": e["new_subscriptions"] or 0,
+                "renewals": e["renewals"] or 0,
+                "conversions": e["conversions"] or 0,
+                "cancellations": e["cancellations"] or 0,
+                "revenue_cents": e["revenue_cents"] or 0,
+                "proceeds_cents": e["proceeds_cents"] or 0,
+            })
+
+    return {
+        "current_snapshot": {
+            "date": str(latest_sub["date"]) if latest_sub else None,
+            "active_subscriptions": latest_sub["active_subscriptions"] if latest_sub else 0,
+            "active_free_trials": latest_sub["active_free_trials"] if latest_sub else 0,
+        } if latest_sub else None,
+        "period_totals": {
+            "new_subscriptions": total_new,
+            "renewals": total_renewals,
+            "conversions": total_conversions,
+            "cancellations": total_cancellations,
+            "revenue_cents": total_revenue,
+            "revenue_display": f"${total_revenue / 100:,.2f}",
+            "proceeds_cents": total_proceeds,
+            "proceeds_display": f"${total_proceeds / 100:,.2f}",
+            "apple_fee_cents": total_revenue - total_proceeds,
+        },
+        "daily": daily_data,
+        "days_with_data": len(daily_data),
+    }
+
+
+
 # --- Static + Routing ---
 
 @app.get("/mm-admin")
