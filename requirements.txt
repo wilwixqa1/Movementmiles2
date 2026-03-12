@@ -8,3 +8,4 @@ stripe==8.0.0
 python-multipart==0.0.9
 apscheduler==3.10.4
 openpyxl==3.1.5
+PyJWT[crypto]==2.9.0
