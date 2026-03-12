@@ -417,7 +417,21 @@
           <div class="utm-output" id="utm-output">Pick a source to get started</div>
         </div>
       </div>
-      <div class="utm-actions">
+      <div class="utm-row">
+        <div class="utm-field">
+          <label>Term (keyword)</label>
+          <input type="text" id="utm-term" placeholder="e.g. running_shoes, beginner" oninput="updateUtmPreview()" />
+        </div>
+        <div class="utm-field">
+          <label>Content (variant)</label>
+          <input type="text" id="utm-content" placeholder="e.g. cta_button, hero_image" oninput="updateUtmPreview()" />
+        </div>
+        <div class="utm-field">
+          <label>YM Source (ymove tracking)</label>
+          <input type="text" id="ym-source" placeholder="e.g. ig_bio, fb_ad" oninput="updateUtmPreview()" />
+        </div>
+      </div>
+            <div class="utm-actions">
         <button class="utm-copy-btn" id="utm-copy-btn" onclick="copyUtmUrl()">Copy Link</button>
       </div>
     </div>
@@ -703,6 +717,12 @@ function updateUtmPreview() {
   if (source) params.push('utm_source=' + encodeURIComponent(source));
   if (medium) params.push('utm_medium=' + encodeURIComponent(medium));
   if (campaign) params.push('utm_campaign=' + encodeURIComponent(campaign));
+  var term = document.getElementById('utm-term') ? document.getElementById('utm-term').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  var content = document.getElementById('utm-content') ? document.getElementById('utm-content').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  var ymSource = document.getElementById('ym-source') ? document.getElementById('ym-source').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  if (term) params.push('utm_term=' + encodeURIComponent(term));
+  if (content) params.push('utm_content=' + encodeURIComponent(content));
+  if (ymSource) params.push('ym_source=' + encodeURIComponent(ymSource));
 
   var sep = base.indexOf('?') > -1 ? '&' : '?';
 
@@ -729,6 +749,12 @@ function copyUtmUrl() {
   if (source) params.push('utm_source=' + encodeURIComponent(source));
   if (medium) params.push('utm_medium=' + encodeURIComponent(medium));
   if (campaign) params.push('utm_campaign=' + encodeURIComponent(campaign));
+  var term = document.getElementById('utm-term') ? document.getElementById('utm-term').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  var content = document.getElementById('utm-content') ? document.getElementById('utm-content').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  var ymSource = document.getElementById('ym-source') ? document.getElementById('ym-source').value.trim().toLowerCase().replace(/\s+/g, '_') : '';
+  if (term) params.push('utm_term=' + encodeURIComponent(term));
+  if (content) params.push('utm_content=' + encodeURIComponent(content));
+  if (ymSource) params.push('ym_source=' + encodeURIComponent(ymSource));
 
   var sep = base.indexOf('?') > -1 ? '&' : '?';
   var url = base + sep + params.join('&');
