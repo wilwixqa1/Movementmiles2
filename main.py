@@ -378,6 +378,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
     source: str = "widget"
+    source: str = "widget"
 
 class ChatResponse(BaseModel):
     reply: str
