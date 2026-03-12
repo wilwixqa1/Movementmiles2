@@ -1,14 +1,9 @@
-/* Movement & Miles -- onboard.js -- Get-started onboarding chat (Session 12) */
-/* Uses same /api/chat endpoint as widget Nelly. No lead capture -- attribution
-   comes from UTM + Stripe/ymove pipeline. Checkout button is always visible. */
+/* Movement & Miles -- onboard.js -- Session 12 */
+/* Uses /api/chat (same as widget). No lead capture. */
 
 var GS_API = '/api/chat';
 var gsHistory = [];
 
-/* -- STRIPE CHECKOUT URL --
-   Replace this placeholder with your real Stripe Payment Link.
-   Use the "1-Month Free" link (30-day trial then $19.99/month).
-*/
 var STRIPE_CHECKOUT_URL = 'https://buy.stripe.com/test_cNiaEWajyfKq9xa47R0kE00';
 
 function gsParseButtons(text) {
@@ -22,8 +17,7 @@ function gsParseButtons(text) {
 }
 
 function gsParsePageLinks(text) {
-  /* Convert [[page:PageName]] to clickable links */
-  return text.replace(/\[\[page:([^\]]+)\]\]/g, function(match, pageName) {
+  return text.replace(/\[\[page:([^\]]+)\]\]/g, function(m, pageName) {
     var slug = pageName.toLowerCase().replace(/\s+/g, '-');
     return '<a href="#' + slug + '" class="gs-page-link" onclick="if(window.showPage)window.showPage(\'' + slug + '\')">' + pageName + '</a>';
   });
