@@ -269,36 +269,6 @@ MISSED WORKOUTS: 1-2 = continue. 3-5 = resume easier. Week+ = repeat previous we
 FINAL RECOMMENDATIONS: Always present exactly 3 options with one-sentence explanations. Use button format."""
 
 
-ONBOARD_SYSTEM_PROMPT = """You are Nelly, the AI coaching assistant for Movement & Miles. You're greeting someone on the get-started page and your job is to have a friendly onboarding conversation.
-
-PERSONALITY: Warm, encouraging, casual. Like a friend who coaches on the side.
-
-YOUR GOAL: Collect their info through natural conversation, then recommend a plan. Collect these ONE AT A TIME:
-1. First name
-2. Email address
-3. Primary goals (running, strength, race training, weight loss, injury recovery)
-4. Experience level (beginner, intermediate, advanced)
-5. Equipment access (weights, treadmill)
-6. How they heard about M&M
-
-BUTTON FORMAT: End messages with options when appropriate:
-[Option A | Option B | Option C]
-
-FLOW:
-- Start by asking their name
-- Then email
-- Then walk through goals, level, equipment naturally
-- After collecting everything, recommend 3 programs with brief reasoning
-- End with the LEAD tag (user won't see this)
-
-LEAD TAG: After your final recommendation, emit this EXACT format on its own line:
-[[LEAD:{"first_name":"...","email":"...","experience_level":"...","goals":"...","referral_source":"...","recommended_plan":"..."}]]
-
-The lead tag must be valid JSON inside the [[LEAD:...]] wrapper. Include all fields even if empty string.
-
-Keep responses SHORT (2-3 sentences). One question at a time. Be conversational, not robotic."""
-
-
 DIGEST_SYSTEM_PROMPT = """You are an analytics advisor for Movement & Miles, a fitness subscription app. You receive daily metrics and generate a brief, actionable morning digest for the business owner.
 
 RULES:
@@ -407,6 +377,7 @@ async def assign_readable_id(conn, source: str) -> str:
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+    source: str = "widget"
 
 class ChatResponse(BaseModel):
     reply: str
@@ -456,37 +427,13 @@ async def chat(req: ChatRequest):
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO chat_sessions (session_type, message_count) VALUES ($1, $2)",
-                    "widget", 1
+                    req.source or "widget", 1
                 )
         except Exception:
             pass
     return ChatResponse(reply=reply)
 
 
-@app.post("/api/onboard-chat", response_model=ChatResponse)
-async def onboard_chat(req: ChatRequest):
-    if not req.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-    messages = []
-    for msg in req.history[-20:]:
-        if msg.get("role") in ("user", "assistant") and msg.get("content"):
-            messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": req.message})
-    reply = await call_anthropic(ONBOARD_SYSTEM_PROMPT, messages)
-    # Track chat session
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO chat_sessions (session_type, message_count) VALUES ($1, $2)",
-                    "onboard", 1
-                )
-        except Exception:
-            pass
-    return ChatResponse(reply=reply)
-
-
-# Lead capture
 @app.post("/api/lead")
 async def save_lead(lead: LeadRequest):
     if db_pool:
@@ -2749,7 +2696,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "11.0.0",
+        "version": "12.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
