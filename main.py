@@ -75,6 +75,9 @@ async def startup():
                 await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_source TEXT DEFAULT ''")
                 await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_medium TEXT DEFAULT ''")
                 await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_campaign TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_term TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_content TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS ym_source TEXT DEFAULT ''")
 
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -395,6 +398,9 @@ class LeadRequest(BaseModel):
     utm_source: str = ""
     utm_medium: str = ""
     utm_campaign: str = ""
+    utm_term: str = ""
+    utm_content: str = ""
+    ym_source: str = ""
 
 class PageViewRequest(BaseModel):
     page: str = ""
@@ -442,11 +448,12 @@ async def save_lead(lead: LeadRequest):
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra, utm_source, utm_medium, utm_campaign)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)""",
                     lead.first_name, lead.email, lead.experience_level,
                     lead.goals, lead.referral_source, lead.recommended_plan, lead.extra,
-                    lead.utm_source, lead.utm_medium, lead.utm_campaign
+                    lead.utm_source, lead.utm_medium, lead.utm_campaign,
+                    lead.utm_term, lead.utm_content, lead.ym_source
                 )
             return {"status": "saved", "storage": "postgres"}
         except Exception as e:
@@ -2678,9 +2685,9 @@ async def admin_leads_csv(request: Request):
     import csv
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "first_name", "email", "experience_level", "goals", "referral_source", "recommended_plan", "extra", "utm_source", "utm_medium", "utm_campaign", "created_at"])
+    writer.writerow(["id", "first_name", "email", "experience_level", "goals", "referral_source", "recommended_plan", "extra", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ym_source", "created_at"])
     for r in rows:
-        writer.writerow([r["id"], r["first_name"], r["email"], r["experience_level"], r["goals"], r["referral_source"], r["recommended_plan"], r["extra"], r.get("utm_source",""), r.get("utm_medium",""), r.get("utm_campaign",""), str(r["created_at"])])
+        writer.writerow([r["id"], r["first_name"], r["email"], r["experience_level"], r["goals"], r["referral_source"], r["recommended_plan"], r["extra"], r.get("utm_source",""), r.get("utm_medium",""), r.get("utm_campaign",""), r.get("utm_term",""), r.get("utm_content",""), r.get("ym_source",""), str(r["created_at"])])
 
     output.seek(0)
     return StreamingResponse(
