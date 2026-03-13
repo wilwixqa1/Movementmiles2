@@ -2794,6 +2794,36 @@ async def admin_stats(request: Request):
         # Session 11: Ad spend data
         ad_spend_rows = await conn.fetch("SELECT * FROM ad_spend ORDER BY month DESC, channel")
 
+        # Session 15: Conversion funnel by UTM source
+        funnel_rows = await conn.fetch("""
+            SELECT
+              COALESCE(NULLIF(l.utm_source, ''), 'unknown') as channel,
+              COUNT(*)::int as trials,
+              SUM(CASE WHEN s.converted_at IS NOT NULL
+                   OR (s.trial_end IS NOT NULL AND s.current_period_start IS NOT NULL
+                       AND s.current_period_start > s.trial_end)
+                   THEN 1 ELSE 0 END)::int as converted,
+              SUM(CASE WHEN NOT (s.converted_at IS NOT NULL
+                   OR (s.trial_end IS NOT NULL AND s.current_period_start IS NOT NULL
+                       AND s.current_period_start > s.trial_end))
+                   AND s.status = 'trialing' AND s.trial_end IS NOT NULL AND s.trial_end > NOW()
+                   THEN 1 ELSE 0 END)::int as still_trialing
+            FROM subscriptions s
+            LEFT JOIN LATERAL (
+              SELECT utm_source FROM leads
+              WHERE lower(leads.email) = lower(s.email) AND s.email != ''
+              ORDER BY created_at DESC LIMIT 1
+            ) l ON true
+            WHERE s.trial_start IS NOT NULL
+            GROUP BY channel
+            ORDER BY trials DESC
+        """)
+
+        # Ad spend totals by channel (all months summed)
+        ad_spend_totals = await conn.fetch(
+            "SELECT channel, SUM(amount_cents)::int as total_cents FROM ad_spend GROUP BY channel"
+        )
+
     # Build response
     trial_conversion_rate = 0
     if total_ever_trialed and total_ever_trialed > 0:
@@ -2844,6 +2874,53 @@ async def admin_stats(request: Request):
     churn_rate = 0
     if active_subs and active_subs > 0:
         churn_rate = round((churned_30d / (active_subs + churned_30d)) * 100, 1)
+
+    # Session 15: Build conversion funnel data
+    spend_by_channel = {r["channel"]: r["total_cents"] for r in ad_spend_totals}
+    conversion_funnel = []
+    all_trials = all_converted = all_canceled = all_trialing = 0
+    all_spend = sum(spend_by_channel.values())
+
+    for fr in funnel_rows:
+        ch = fr["channel"]
+        trials = fr["trials"]
+        converted = fr["converted"]
+        st = fr["still_trialing"]
+        canceled = trials - converted - st
+        decided = converted + canceled
+        rate = round((converted / decided) * 100, 1) if decided > 0 else None
+        spend = spend_by_channel.get(ch, 0)
+        cpa = round(spend / converted) if converted > 0 and spend > 0 else None
+
+        all_trials += trials
+        all_converted += converted
+        all_canceled += canceled
+        all_trialing += st
+
+        conversion_funnel.append({
+            "channel": ch,
+            "trials": trials,
+            "converted": converted,
+            "canceled": canceled,
+            "still_trialing": st,
+            "conv_rate": rate,
+            "ad_spend_cents": spend,
+            "cpa_cents": cpa,
+        })
+
+    all_decided = all_converted + all_canceled
+    all_rate = round((all_converted / all_decided) * 100, 1) if all_decided > 0 else None
+    all_cpa = round(all_spend / all_converted) if all_converted > 0 and all_spend > 0 else None
+    conversion_funnel.insert(0, {
+        "channel": "__all__",
+        "trials": all_trials,
+        "converted": all_converted,
+        "canceled": all_canceled,
+        "still_trialing": all_trialing,
+        "conv_rate": all_rate,
+        "ad_spend_cents": all_spend,
+        "cpa_cents": all_cpa,
+    })
 
     return {
         "leads": {
@@ -2902,6 +2979,7 @@ async def admin_stats(request: Request):
                 for r in recent_events
             ],
         },
+        "conversion_funnel": conversion_funnel,
         "ad_spend": [
             {"month": r["month"], "channel": r["channel"], "amount_cents": r["amount_cents"]}
             for r in ad_spend_rows
