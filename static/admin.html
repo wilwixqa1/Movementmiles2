@@ -305,9 +305,9 @@
         <div class="sub" id="s-active-sub-detail"></div>
       </div>
       <div class="stat-card">
-        <div class="label">Trial to Paid</div>
-        <div class="value" id="s-conversion">--</div>
-        <div class="sub">Conversion rate (ever converted)</div>
+        <div class="label">Paid Conversions</div>
+        <div class="value green" id="s-conversions-30d">--</div>
+        <div class="sub" id="s-conversions-detail">last 30 days</div>
       </div>
       <div class="stat-card">
         <div class="label">30-Day Churn</div>
@@ -896,7 +896,10 @@ function loadStats() {
     document.getElementById('s-total-subs').textContent = subs.total || 0;
     document.getElementById('s-active-subs').textContent = subs.active || 0;
     document.getElementById('s-active-sub-detail').textContent = (subs.trialing || 0) + ' trialing';
-    document.getElementById('s-conversion').textContent = (subs.trial_conversion_rate || 0) + '%';
+    var conv30 = subs.conversions_30d || 0;
+    var conv7 = subs.conversions_7d || 0;
+    document.getElementById('s-conversions-30d').textContent = conv30;
+    document.getElementById('s-conversions-detail').textContent = conv7 + ' in last 7d / ' + conv30 + ' in last 30d';
 
     // Render cohort conversion windows table
     var cohorts = subs.conversion_cohorts || [];
