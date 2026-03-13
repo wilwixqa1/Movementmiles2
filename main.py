@@ -2766,19 +2766,23 @@ async def admin_stats(request: Request):
                GROUP BY month ORDER BY month"""
         )
 
-        # Avg subscription age (days)
+        # Avg subscriber lifetime (all who ever converted — includes churned for honest LTV)
         avg_sub_age = await conn.fetchval(
-            """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0)
-               FROM subscriptions WHERE status IN ('active', 'trialing')"""
+            """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (COALESCE(canceled_at, NOW()) - created_at)) / 86400), 0)
+               FROM subscriptions
+               WHERE converted_at IS NOT NULL
+               OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end)"""
         )
 
-        # Estimated LTV = avg monthly revenue per sub * avg lifetime months
+        # Avg monthly revenue per converted sub (includes churned for honest LTV)
         avg_monthly_per_sub = await conn.fetchval(
             """SELECT COALESCE(AVG(
                 CASE WHEN plan_interval='month' THEN plan_amount
                      WHEN plan_interval='year' THEN plan_amount/12
                      ELSE 0 END
-               ), 0) FROM subscriptions WHERE status = 'active'"""
+               ), 0) FROM subscriptions
+               WHERE converted_at IS NOT NULL
+               OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end)"""
         )
 
         # Total subscribers ever (for lifetime calc)
@@ -2822,8 +2826,10 @@ async def admin_stats(request: Request):
                 converted += 1
             elif s["status"] == "canceled":
                 canceled += 1
-            else:
+            elif s["status"] == "trialing" and s["trial_end"] and s["trial_end"] > now_utc:
                 still_trialing += 1
+            else:
+                canceled += 1
         decided = converted + canceled
         conversion_cohorts.append({
             "window": w["label"],
