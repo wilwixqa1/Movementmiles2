@@ -2584,6 +2584,12 @@ async def admin_stats(request: Request):
                     OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end))"""
         )
 
+        # Rolling cohort data for conversion windows
+        cohort_subs = await conn.fetch(
+            """SELECT created_at, converted_at, canceled_at, status, trial_start, trial_end, current_period_start
+               FROM subscriptions WHERE trial_start IS NOT NULL"""
+        )
+
         # Churn: canceled in last 30 days vs active at start of period
         churned_30d = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
@@ -2655,6 +2661,46 @@ async def admin_stats(request: Request):
     if total_ever_trialed and total_ever_trialed > 0:
         trial_conversion_rate = round((converted_from_trial / total_ever_trialed) * 100, 1)
 
+    # Rolling cohort conversion windows (7d, 30d, 60d, 90d, all)
+    now_utc = datetime.now(timezone.utc)
+    cohort_windows = [
+        {"label": "7d", "days": 7},
+        {"label": "30d", "days": 30},
+        {"label": "60d", "days": 60},
+        {"label": "90d", "days": 90},
+        {"label": "all", "days": None},
+    ]
+    conversion_cohorts = []
+    for w in cohort_windows:
+        cutoff = now_utc - timedelta(days=w["days"]) if w["days"] else None
+        trials = converted = canceled = still_trialing = mature = 0
+        for s in cohort_subs:
+            created = s["created_at"]
+            if not created:
+                continue
+            if cutoff and created < cutoff:
+                continue
+            trials += 1
+            if (now_utc - created).days >= 30:
+                mature += 1
+            has_converted = (s["converted_at"] is not None) or (s["trial_end"] and s["current_period_start"] and s["current_period_start"] > s["trial_end"])
+            if has_converted:
+                converted += 1
+            elif s["status"] == "canceled":
+                canceled += 1
+            else:
+                still_trialing += 1
+        decided = converted + canceled
+        conversion_cohorts.append({
+            "window": w["label"],
+            "trials": trials,
+            "converted": converted,
+            "canceled": canceled,
+            "still_trialing": still_trialing,
+            "conversion_rate": round((converted / decided) * 100, 1) if decided > 0 else None,
+            "maturity_pct": round((mature / trials) * 100, 1) if trials > 0 else 0,
+        })
+
     churn_rate = 0
     if active_subs and active_subs > 0:
         churn_rate = round((churned_30d / (active_subs + churned_30d)) * 100, 1)
@@ -2685,6 +2731,7 @@ async def admin_stats(request: Request):
             "mrr_cents": mrr_cents,
             "mrr_display": f"${mrr_cents / 100:,.2f}",
             "trial_conversion_rate": trial_conversion_rate,
+            "conversion_cohorts": conversion_cohorts,
             "churn_rate_30d": churn_rate,
             "churned_30d": churned_30d or 0,
             "by_status": [{"status": r["status"], "count": r["count"]} for r in subs_by_status],
