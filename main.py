@@ -177,6 +177,21 @@ async def startup():
                     )
                 """)
             print("Database connected, all tables ready")
+
+            # ymove webhook log table (separate connection block - S16)
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS ymove_webhook_log (
+                            id SERIAL PRIMARY KEY,
+                            event_type TEXT,
+                            payload JSONB,
+                            created_at TIMESTAMPTZ DEFAULT NOW()
+                        )
+                    """)
+                print("ymove webhook log table ready")
+            except Exception as e:
+                print(f"ymove log table creation deferred: {e}")
         except Exception as e:
             print(f"Database connection failed: {e}")
             db_pool = None
@@ -1050,6 +1065,35 @@ async def google_webhook(request: Request):
     return {"status": "ok"}
 
 
+# --- ymove Webhook (Session 16) ---
+
+@app.post("/webhooks/ymove")
+async def ymove_webhook(request: Request):
+    """Receive subscription events from ymove Actions system.
+    Phase 1: Log raw payload for inspection. Phase 2 will process into subscriptions table."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {"raw": (await request.body()).decode("utf-8", errors="replace")[:5000]}
+
+    event_type = body.get("event", body.get("type", body.get("event_type", "unknown")))
+
+    print(f"[ymove webhook] Received event: {event_type}")
+    print(f"[ymove webhook] Payload: {json.dumps(body, indent=2, default=str)[:2000]}")
+
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO ymove_webhook_log (event_type, payload) VALUES ($1, $2)",
+                    str(event_type), json.dumps(body, default=str)
+                )
+        except Exception as e:
+            print(f"[ymove webhook] Log store error: {e}")
+
+    return {"status": "ok", "received": event_type}
+
+
 # --- Daily Digest System ---
 
 async def gather_daily_stats() -> dict:
@@ -1473,6 +1517,25 @@ async def fix_future_dates(request: Request):
                 details.append({"email": s["email"] or "n/a", "source": s["source"], "old_date": str(s["created_at"])})
 
     return {"status": "ok", "fixed": fixed, "total_found": len(future_subs), "details": details}
+
+
+@app.get("/api/admin/ymove-log")
+async def admin_ymove_log(request: Request):
+    """View recent ymove webhook payloads for debugging."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM ymove_webhook_log ORDER BY created_at DESC LIMIT 50"
+        )
+
+    return {"events": [
+        {"id": r["id"], "event_type": r["event_type"], "payload": r["payload"], "created_at": str(r["created_at"])}
+        for r in rows
+    ]}
 
 
 @app.post("/api/admin/send-test-digest")
@@ -3056,7 +3119,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "14.0.0",
+        "version": "16.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
