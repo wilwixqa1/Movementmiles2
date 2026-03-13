@@ -303,15 +303,21 @@ FINAL RECOMMENDATIONS: Always present exactly 3 options with one-sentence explan
 
 DIGEST_SYSTEM_PROMPT = """You are an analytics advisor for Movement & Miles, a fitness subscription app. You receive daily metrics and generate a brief, actionable morning digest for the business owner.
 
+CRITICAL CONTEXT — TRIAL vs PAID:
+- "new_subscriptions_trial_starts" are TRIAL STARTS — these are $0 revenue. The checkout flow gives 1 month free, then $19.99/month.
+- "conversions_today" are the real revenue events — people whose free trial ended and converted to paid.
+- Do NOT celebrate new subscriptions as revenue. Frame them as "pipeline" or "trial starts."
+- Conversions are what matter for revenue. Highlight them prominently when they occur.
+- A healthy business needs both: new trials (top of funnel) AND conversions (actual revenue).
+
 RULES:
 - Be concise: 3-5 bullet points max for insights
-- Lead with the most important finding
+- Lead with conversions and revenue, then trial starts as pipeline
 - Compare to context when possible (e.g. "above/below your typical daily rate")
 - Flag anything unusual or concerning
 - Suggest ONE specific action if data warrants it
 - Use plain language, not jargon
 - If a day had zero activity in some area, just note it briefly, don't over-analyze
-- Be encouraging when metrics are positive
 - Platform fee context: Apple and Google take 15%, Stripe takes ~2.9%
 
 FORMAT your response as a short paragraph overview, then bullet points for key insights. Keep total response under 200 words."""
@@ -1064,6 +1070,13 @@ async def gather_daily_stats() -> dict:
                GROUP BY source ORDER BY count DESC"""
         )
 
+        # Conversions (trial → paid) in last 24h
+        conversions_today = await conn.fetch(
+            """SELECT source, email, plan_interval, plan_amount, converted_at
+               FROM subscriptions WHERE converted_at > NOW() - INTERVAL '24 hours'
+               ORDER BY converted_at DESC"""
+        )
+
         # Cancellations in last 24h
         cancellations = await conn.fetch(
             """SELECT source, email, canceled_at FROM subscriptions
@@ -1148,6 +1161,8 @@ async def gather_daily_stats() -> dict:
     net_mrr_cents = current_mrr_cents - total_fees_cents
 
     return {
+        "conversions_today": len(conversions_today),
+        "conversion_details": [{"email": r["email"] or "n/a", "source": r["source"], "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}"} for r in conversions_today],
         "new_subscriptions": len(new_subs),
         "new_subs_by_source": [{"source": r["source"], "count": r["count"]} for r in new_subs_by_source],
         "new_sub_details": [{"email": r["email"] or "n/a", "source": r["source"], "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}"} for r in new_subs],
@@ -1176,7 +1191,8 @@ async def generate_digest_insights(stats: dict) -> str:
     """Send daily stats to Claude for analysis and insights."""
     # Trim to key metrics only (avoid oversized prompt)
     slim = {
-        "new_subscriptions": stats.get("new_subscriptions", 0),
+        "conversions_today": stats.get("conversions_today", 0),
+        "new_subscriptions_trial_starts": stats.get("new_subscriptions", 0),
         "new_subs_by_source": stats.get("new_subs_by_source", []),
         "cancellations": stats.get("cancellations", 0),
         "gross_mrr": stats.get("gross_mrr", "$0"),
@@ -1276,17 +1292,22 @@ def build_digest_html(stats: dict, insights: str) -> str:
   <h2 style="margin:0 0 16px;color:#182241;font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Last 24 Hours</h2>
   <table width="100%" cellpadding="0" cellspacing="0">
     <tr>
-      <td style="padding:12px 16px;background:#e8f4e8;border-radius:8px;text-align:center;width:25%">
+      <td style="padding:12px 16px;background:#e8f4e8;border-radius:8px;text-align:center;width:20%">
         <div style="font-size:28px;font-weight:700;color:#2d6a2d">{stats.get('new_subscriptions',0)}</div>
-        <div style="font-size:11px;color:#2d6a2d;font-weight:600;margin-top:2px">New Subs</div>
+        <div style="font-size:11px;color:#2d6a2d;font-weight:600;margin-top:2px">Trial Starts</div>
       </td>
       <td width="12"></td>
-      <td style="padding:12px 16px;background:#fde8e8;border-radius:8px;text-align:center;width:25%">
+      <td style="padding:12px 16px;background:#e8f7e8;border-radius:8px;text-align:center;width:20%">
+        <div style="font-size:28px;font-weight:700;color:#1b7a1b">{stats.get('conversions_today',0)}</div>
+        <div style="font-size:11px;color:#1b7a1b;font-weight:600;margin-top:2px">Paid Conversions</div>
+      </td>
+      <td width="12"></td>
+      <td style="padding:12px 16px;background:#fde8e8;border-radius:8px;text-align:center;width:20%">
         <div style="font-size:28px;font-weight:700;color:#c0392b">{stats.get('cancellations',0)}</div>
         <div style="font-size:11px;color:#c0392b;font-weight:600;margin-top:2px">Cancellations</div>
       </td>
       <td width="12"></td>
-      <td style="padding:12px 16px;background:#e8eaf6;border-radius:8px;text-align:center;width:25%">
+      <td style="padding:12px 16px;background:#e8eaf6;border-radius:8px;text-align:center;width:20%">
         <div style="font-size:28px;font-weight:700;color:#3949ab">{stats.get('new_leads',0)}</div>
         <div style="font-size:11px;color:#3949ab;font-weight:600;margin-top:2px">New Leads</div>
       </td>
@@ -1398,7 +1419,7 @@ async def run_daily_digest():
         insights = await generate_digest_insights(stats)
 
         now_et = datetime.now(ZoneInfo("America/New_York"))
-        subject = f"M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('new_subscriptions',0)} new subs, {stats.get('cancellations',0)} cancellations"
+        subject = f"M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations',0)} cancellations"
 
         html = build_digest_html(stats, insights)
         result = await send_digest_email(html, subject)
@@ -1438,7 +1459,7 @@ async def send_test_digest(request: Request):
     insights = await generate_digest_insights(stats)
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    subject = f"[TEST] M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('new_subscriptions',0)} new subs, {stats.get('cancellations',0)} cancellations"
+    subject = f"[TEST] M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations',0)} cancellations"
 
     html = build_digest_html(stats, insights)
     result = await send_digest_email(html, subject)
@@ -2734,7 +2755,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "13.0.0",
+        "version": "14.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
