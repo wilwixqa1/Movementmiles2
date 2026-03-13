@@ -180,6 +180,10 @@ async def startup():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
+            # Session 15: Email indexes for funnel query performance
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
             print("Database connected, all tables ready")
         except Exception as e:
             print(f"Database connection failed: {e}")
