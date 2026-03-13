@@ -1570,6 +1570,87 @@ async def backfill_stripe(request: Request):
     return {"status": "ok", "imported": count, "errors": errors}
 
 
+@app.post("/api/admin/sync-trialing")
+async def sync_trialing(request: Request):
+    """Sync all Stripe subs stuck as 'trialing' with Stripe's real current status.
+    Fixes zombie records from before the webhook was connected."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    async with db_pool.acquire() as conn:
+        zombies = await conn.fetch(
+            "SELECT id, stripe_subscription_id FROM subscriptions WHERE status = 'trialing' AND source = 'stripe'"
+        )
+
+    results = {"total_checked": len(zombies), "now_active": 0, "now_canceled": 0, "now_past_due": 0, "still_trialing": 0, "not_found": 0, "errors": 0}
+
+    for z in zombies:
+        sub_id = z["stripe_subscription_id"]
+        if not sub_id or not sub_id.startswith("sub_"):
+            results["not_found"] += 1
+            continue
+        try:
+            real_sub = stripe.Subscription.retrieve(sub_id)
+            real_status = real_sub.status
+            if real_status == "trialing":
+                results["still_trialing"] += 1
+                continue
+
+            def ts(v):
+                if v:
+                    return datetime.fromtimestamp(v, tz=timezone.utc)
+                return None
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE subscriptions SET
+                       status = $1,
+                       canceled_at = $2,
+                       current_period_start = $3,
+                       current_period_end = $4,
+                       updated_at = NOW()
+                       WHERE id = $5""",
+                    real_status,
+                    ts(real_sub.canceled_at),
+                    ts(real_sub.current_period_start),
+                    ts(real_sub.current_period_end),
+                    z["id"]
+                )
+
+                # If now active, they converted from trial and we missed it
+                if real_status == "active":
+                    await conn.execute(
+                        "UPDATE subscriptions SET converted_at = COALESCE(trial_end, NOW()) WHERE id = $1 AND converted_at IS NULL",
+                        z["id"]
+                    )
+                    results["now_active"] += 1
+                elif real_status == "canceled":
+                    results["now_canceled"] += 1
+                elif real_status == "past_due":
+                    results["now_past_due"] += 1
+                else:
+                    # incomplete, incomplete_expired, unpaid, paused
+                    results["now_canceled"] += 1
+
+        except stripe.error.InvalidRequestError:
+            # Sub doesn't exist in Stripe anymore
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                    z["id"]
+                )
+            results["not_found"] += 1
+        except Exception as e:
+            print(f"Sync trialing error for {sub_id}: {e}")
+            results["errors"] += 1
+
+    return results
+
+
 @app.post("/api/admin/fix-stripe-dates")
 async def fix_stripe_dates(request: Request):
     """One-time fix: update created_at on all Stripe subs to use Stripe's real created timestamp.
