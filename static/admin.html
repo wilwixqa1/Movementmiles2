@@ -333,6 +333,20 @@
       </div>
     </div>
 
+    <!-- Cohort Conversion Windows -->
+    <div class="card">
+      <div class="section-title">Trial-to-Paid Conversion (Rolling Windows)</div>
+      <p style="font-size:.8rem;color:var(--navy-mid);margin-bottom:16px">Conv Rate = converted / (converted + canceled). Excludes still-trialing since they haven't had their chance yet. Maturity = % of cohort 30+ days old.</p>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>Window</th><th>Trial Starts</th><th>Converted</th><th>Canceled</th><th>Still Trialing</th><th>Conv Rate</th><th>Maturity</th></tr></thead>
+          <tbody id="cohort-tbody">
+            <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Subscriber Charts -->
     <div class="views-grid">
       <div class="card">
@@ -883,6 +897,30 @@ function loadStats() {
     document.getElementById('s-active-subs').textContent = subs.active || 0;
     document.getElementById('s-active-sub-detail').textContent = (subs.trialing || 0) + ' trialing';
     document.getElementById('s-conversion').textContent = (subs.trial_conversion_rate || 0) + '%';
+
+    // Render cohort conversion windows table
+    var cohorts = subs.conversion_cohorts || [];
+    var cohortBody = document.getElementById('cohort-tbody');
+    if (cohorts.length === 0) {
+      cohortBody.innerHTML = '<tr><td colspan="7" class="empty-msg">No cohort data yet.</td></tr>';
+    } else {
+      cohortBody.innerHTML = cohorts.map(function(c) {
+        var windowLabel = c.window === 'all' ? 'All Time' : 'Last ' + c.window;
+        var convRate = c.conversion_rate !== null ? c.conversion_rate + '%' : '\u2014';
+        var maturity = c.maturity_pct + '%';
+        var rateColor = c.conversion_rate === null ? 'var(--navy-mid)' : c.conversion_rate >= 30 ? 'var(--green)' : c.conversion_rate >= 15 ? 'var(--orange)' : 'var(--red)';
+        var matColor = c.maturity_pct >= 80 ? 'var(--green)' : c.maturity_pct >= 40 ? 'var(--orange)' : 'var(--navy-mid)';
+        return '<tr>' +
+          '<td><strong>' + windowLabel + '</strong></td>' +
+          '<td>' + c.trials + '</td>' +
+          '<td style="color:var(--green);font-weight:600">' + c.converted + '</td>' +
+          '<td style="color:var(--red)">' + c.canceled + '</td>' +
+          '<td style="color:var(--navy-mid)">' + c.still_trialing + '</td>' +
+          '<td style="color:' + rateColor + ';font-weight:600">' + convRate + '</td>' +
+          '<td style="color:' + matColor + '">' + maturity + '</td>' +
+          '</tr>';
+      }).join('');
+    }
 
     var churnVal = subs.churn_rate_30d || 0;
     var churnEl = document.getElementById('s-churn');
