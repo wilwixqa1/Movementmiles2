@@ -180,11 +180,13 @@ async def startup():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
-            # Session 15: Email indexes for funnel query performance
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
             print("Database connected, all tables ready")
+            # Session 15: Email indexes for funnel query performance (separate connection to avoid timeout)
+            async with db_pool.acquire() as idx_conn:
+                await idx_conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
+                await idx_conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
+                await idx_conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
+            print("Indexes ready")
         except Exception as e:
             print(f"Database connection failed: {e}")
             db_pool = None
