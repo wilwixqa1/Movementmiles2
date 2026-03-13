@@ -2635,6 +2635,14 @@ async def admin_stats(request: Request):
                FROM subscriptions WHERE trial_start IS NOT NULL"""
         )
 
+        # Recent conversion activity
+        conversions_7d = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE converted_at > NOW() - INTERVAL '7 days'"
+        ) or 0
+        conversions_30d = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE converted_at > NOW() - INTERVAL '30 days'"
+        ) or 0
+
         # Churn: canceled in last 30 days vs active at start of period
         churned_30d = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
@@ -2776,6 +2784,8 @@ async def admin_stats(request: Request):
             "mrr_cents": mrr_cents,
             "mrr_display": f"${mrr_cents / 100:,.2f}",
             "trial_conversion_rate": trial_conversion_rate,
+            "conversions_7d": conversions_7d,
+            "conversions_30d": conversions_30d,
             "conversion_cohorts": conversion_cohorts,
             "churn_rate_30d": churn_rate,
             "churned_30d": churned_30d or 0,
