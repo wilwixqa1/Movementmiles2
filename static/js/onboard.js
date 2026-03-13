@@ -89,3 +89,25 @@ function gsSendMsg() {
   input.value = '';
   gsSendMsgText(text);
 }
+
+/* Seed history with the hardcoded greeting and render initial option buttons */
+(function gsInit() {
+  var initialGreeting = "Hey! I'm Nelly, your Movement & Miles guide. I'm going to ask you a few quick questions to find the perfect training plan for you. What are you looking for?";
+  gsHistory.push({ role: 'assistant', content: initialGreeting + "\n[Running + Strength | Strength Only | Train for a Race]" });
+
+  var msgs = document.getElementById('gs-msgs');
+  if (!msgs) return;
+  var btnRow = document.createElement('div');
+  btnRow.className = 'gs-buttons';
+  ['Running + Strength', 'Strength Only', 'Train for a Race'].forEach(function(label) {
+    var btn = document.createElement('button');
+    btn.className = 'gs-qr';
+    btn.textContent = label;
+    btn.onclick = function() {
+      btnRow.remove();
+      gsSendMsgText(label);
+    };
+    btnRow.appendChild(btn);
+  });
+  msgs.appendChild(btnRow);
+})();
