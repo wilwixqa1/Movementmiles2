@@ -1062,11 +1062,13 @@ async def gather_daily_stats() -> dict:
         new_subs = await conn.fetch(
             """SELECT source, status, plan_interval, plan_amount, email, created_at
                FROM subscriptions WHERE created_at > NOW() - INTERVAL '24 hours'
+               AND created_at <= NOW()
                ORDER BY created_at DESC"""
         )
         new_subs_by_source = await conn.fetch(
             """SELECT source, COUNT(*) as count FROM subscriptions
                WHERE created_at > NOW() - INTERVAL '24 hours'
+               AND created_at <= NOW()
                GROUP BY source ORDER BY count DESC"""
         )
 
@@ -1439,6 +1441,38 @@ async def admin_login(req: LoginRequest):
     if req.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid password")
     return {"status": "ok"}
+
+
+@app.post("/api/admin/fix-future-dates")
+async def fix_future_dates(request: Request):
+    """Fix subscriptions with created_at in the future (e.g. 2026-12-31 from bad import)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        # Find future-dated subs
+        future_subs = await conn.fetch(
+            "SELECT id, stripe_subscription_id, email, source, created_at FROM subscriptions WHERE created_at > NOW()"
+        )
+        if not future_subs:
+            return {"status": "ok", "fixed": 0, "message": "No future-dated subscriptions found"}
+
+        # Set created_at to their trial_start, or current_period_start, or updated_at as fallback
+        fixed = 0
+        details = []
+        for s in future_subs:
+            result = await conn.execute(
+                """UPDATE subscriptions SET created_at = COALESCE(trial_start, current_period_start, updated_at, NOW())
+                   WHERE id = $1 AND created_at > NOW()""",
+                s["id"]
+            )
+            if result and result.endswith("1"):
+                fixed += 1
+                details.append({"email": s["email"] or "n/a", "source": s["source"], "old_date": str(s["created_at"])})
+
+    return {"status": "ok", "fixed": fixed, "total_found": len(future_subs), "details": details}
 
 
 @app.post("/api/admin/send-test-digest")
