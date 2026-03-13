@@ -1530,6 +1530,8 @@ async def backfill_stripe(request: Request):
                         return datetime.fromtimestamp(v, tz=timezone.utc)
                     return None
 
+                real_created = ts(sub.created) if hasattr(sub, 'created') else None
+
                 async with db_pool.acquire() as conn:
                     await conn.execute("""
                         INSERT INTO subscriptions (
@@ -1537,8 +1539,8 @@ async def backfill_stripe(request: Request):
                             plan_interval, plan_amount, currency, source,
                             trial_start, trial_end,
                             current_period_start, current_period_end,
-                            canceled_at, updated_at
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,NOW())
+                            canceled_at, created_at, updated_at
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,COALESCE($13,NOW()),NOW())
                         ON CONFLICT (stripe_subscription_id) DO UPDATE SET
                             status = EXCLUDED.status,
                             plan_interval = EXCLUDED.plan_interval,
@@ -1549,13 +1551,14 @@ async def backfill_stripe(request: Request):
                             current_period_start = EXCLUDED.current_period_start,
                             current_period_end = EXCLUDED.current_period_end,
                             canceled_at = EXCLUDED.canceled_at,
+                            created_at = EXCLUDED.created_at,
                             updated_at = NOW()
                     """,
                         customer_id, sub_id, email, status,
                         plan_interval, plan_amount, sub.currency or "usd",
                         ts(sub.trial_start), ts(sub.trial_end),
                         ts(sub.current_period_start), ts(sub.current_period_end),
-                        ts(sub.canceled_at)
+                        ts(sub.canceled_at), real_created
                     )
                 count += 1
             except Exception as e:
@@ -1565,6 +1568,48 @@ async def backfill_stripe(request: Request):
         raise HTTPException(status_code=500, detail=f"Stripe API error: {str(e)}")
 
     return {"status": "ok", "imported": count, "errors": errors}
+
+
+@app.post("/api/admin/fix-stripe-dates")
+async def fix_stripe_dates(request: Request):
+    """One-time fix: update created_at on all Stripe subs to use Stripe's real created timestamp.
+    This corrects the backfill issue where all subs got created_at = NOW() instead of their real date."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    fixed = 0
+    errors = 0
+    skipped = 0
+    try:
+        subs_iter = stripe.Subscription.list(limit=100, status="all")
+        for sub in subs_iter.auto_paging_iter():
+            try:
+                sub_id = sub.id
+                stripe_created = sub.created
+                if not stripe_created:
+                    skipped += 1
+                    continue
+                real_dt = datetime.fromtimestamp(stripe_created, tz=timezone.utc)
+                async with db_pool.acquire() as conn:
+                    result = await conn.execute(
+                        "UPDATE subscriptions SET created_at = $1 WHERE stripe_subscription_id = $2 AND source = 'stripe'",
+                        real_dt, sub_id
+                    )
+                    if result and result.endswith('1'):
+                        fixed += 1
+                    else:
+                        skipped += 1
+            except Exception as e:
+                print(f"Fix date error for {sub.id}: {e}")
+                errors += 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe API error: {str(e)}")
+
+    return {"status": "ok", "fixed": fixed, "skipped": skipped, "errors": errors}
 
 
 @app.post("/api/admin/reset-data")
