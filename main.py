@@ -1065,33 +1065,302 @@ async def google_webhook(request: Request):
     return {"status": "ok"}
 
 
-# --- ymove Webhook (Session 16) ---
+# --- ymove Webhook (Session 16 — Phase 2 Processor) ---
 
 @app.post("/webhooks/ymove")
 async def ymove_webhook(request: Request):
     """Receive subscription events from ymove Actions system.
-    Phase 1: Log raw payload for inspection. Phase 2 will process into subscriptions table."""
+    Phase 2: Process into subscriptions table with email attribution."""
     try:
         body = await request.json()
     except Exception:
         body = {"raw": (await request.body()).decode("utf-8", errors="replace")[:5000]}
 
-    event_type = body.get("event", body.get("type", body.get("event_type", "unknown")))
+    # Extract event data
+    event_data = body.get("event", {})
+    user_data = body.get("user", {})
 
-    print(f"[ymove webhook] Received event: {event_type}")
-    print(f"[ymove webhook] Payload: {json.dumps(body, indent=2, default=str)[:2000]}")
+    event_type = event_data.get("type", "unknown")
+    category = event_data.get("category", "")
 
+    # User info — available on ALL events (key advantage over direct Apple/Google webhooks)
+    email = user_data.get("email", "")
+    first_name = user_data.get("firstName", "")
+    last_name = user_data.get("lastName", "")
+    ymove_user_id = str(user_data.get("id", ""))
+
+    provider = event_data.get("subscriptionPaymentProvider", "")
+    print(f"[ymove] {event_type} | {email} | provider={provider or 'n/a'}")
+
+    # Always log raw payload
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO ymove_webhook_log (event_type, payload) VALUES ($1, $2)",
-                    str(event_type), json.dumps(body, default=str)
+                    event_type, json.dumps(body, default=str)
                 )
         except Exception as e:
-            print(f"[ymove webhook] Log store error: {e}")
+            print(f"[ymove] Log store error: {e}")
 
-    return {"status": "ok", "received": event_type}
+    if not db_pool or category != "subscription":
+        return {"status": "ok", "received": event_type}
+
+    async with db_pool.acquire() as conn:
+        if event_type == "subscriptionCreated":
+            await _ymove_handle_created(conn, event_data, email, ymove_user_id, provider)
+        elif event_type == "subscriptionCancelled":
+            await _ymove_handle_cancelled(conn, event_data, email, ymove_user_id)
+        else:
+            print(f"[ymove] Unhandled event type: {event_type}")
+
+    return {"status": "ok", "processed": event_type, "email": email}
+
+
+async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_id: str, provider: str):
+    """Process subscriptionCreated from ymove."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    if provider == "stripe":
+        # Stripe subs already arrive via direct Stripe webhook.
+        # ymove adds email + name — attach email if missing.
+        stripe_sub_id = event_data.get("stripeSubscriptionId", "")
+        if not stripe_sub_id:
+            return
+
+        # Store event for audit
+        eid = f"ymove_created_{stripe_sub_id}_{now_ts}"
+        try:
+            await conn.execute(
+                """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_subscription_id, source, data)
+                   VALUES ($1, $2, $3, 'stripe', $4)
+                   ON CONFLICT (stripe_event_id) DO NOTHING""",
+                eid, "ymove.subscriptionCreated", stripe_sub_id,
+                json.dumps({"ymove_user_id": ymove_user_id, "email": email, "provider": provider}, default=str)
+            )
+        except Exception as e:
+            print(f"[ymove] Stripe event store error: {e}")
+
+        # Attach email if subscription exists but has no email
+        if email:
+            try:
+                existing = await conn.fetchrow(
+                    "SELECT id, email FROM subscriptions WHERE stripe_subscription_id = $1",
+                    stripe_sub_id
+                )
+                if existing and not existing["email"]:
+                    await conn.execute(
+                        "UPDATE subscriptions SET email = $1, updated_at = NOW() WHERE stripe_subscription_id = $2",
+                        email, stripe_sub_id
+                    )
+                    print(f"[ymove] Attached email {email} to Stripe sub {stripe_sub_id}")
+            except Exception as e:
+                print(f"[ymove] Stripe email attach error: {e}")
+
+    elif provider == "apple":
+        # Apple subs: ymove is our PRIMARY source (no direct Apple webhook connected)
+        transaction_id = event_data.get("transactionId", "")
+        if not transaction_id:
+            return
+
+        product_id = event_data.get("productId", "")
+        start_str = event_data.get("startDate", "")
+        end_str = event_data.get("endDate", "")
+
+        # Determine plan from productId
+        plan_interval = "month"
+        plan_amount = 1999
+        if product_id and ("annual" in product_id.lower() or "year" in product_id.lower()):
+            plan_interval = "year"
+            plan_amount = 17999
+
+        # Parse ISO dates
+        def _parse_iso(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        period_start = _parse_iso(start_str)
+        period_end = _parse_iso(end_str)
+
+        # Store event
+        eid = f"ymove_created_{transaction_id}_{now_ts}"
+        try:
+            await conn.execute(
+                """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_subscription_id, source, data)
+                   VALUES ($1, $2, $3, 'apple', $4)
+                   ON CONFLICT (stripe_event_id) DO NOTHING""",
+                eid, "ymove.subscriptionCreated", transaction_id,
+                json.dumps({"ymove_user_id": ymove_user_id, "email": email, "product_id": product_id}, default=str)
+            )
+        except Exception as e:
+            print(f"[ymove] Apple event store error: {e}")
+
+        # Upsert subscription — email + period dates are the key value from ymove
+        try:
+            await conn.execute("""
+                INSERT INTO subscriptions (
+                    stripe_customer_id, stripe_subscription_id, email, status,
+                    plan_interval, plan_amount, currency, source,
+                    current_period_start, current_period_end,
+                    trial_start, trial_end,
+                    created_at, updated_at
+                ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', 'apple', $5, $6, $5, $6, COALESCE($5, NOW()), NOW())
+                ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                    email = COALESCE(NULLIF(EXCLUDED.email, ''), subscriptions.email),
+                    status = 'active',
+                    plan_interval = EXCLUDED.plan_interval,
+                    plan_amount = EXCLUDED.plan_amount,
+                    current_period_start = COALESCE(EXCLUDED.current_period_start, subscriptions.current_period_start),
+                    current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
+                    updated_at = NOW()
+            """,
+                transaction_id, email, plan_interval, plan_amount,
+                period_start, period_end
+            )
+            print(f"[ymove] Apple sub upserted: {transaction_id} | {email}")
+        except Exception as e:
+            print(f"[ymove] Apple sub upsert error: {e}")
+
+        # Assign readable_id if not yet set
+        try:
+            existing = await conn.fetchrow(
+                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
+                transaction_id
+            )
+            if existing and not existing["readable_id"]:
+                rid = await assign_readable_id(conn, "apple")
+                await conn.execute(
+                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
+                    rid, transaction_id
+                )
+        except Exception as e:
+            print(f"[ymove] Apple readable ID error: {e}")
+
+    elif provider == "google":
+        # Google subs — same pattern as Apple, using ymove uuid as ID
+        ym_uuid = event_data.get("uuid", "")
+        if not ym_uuid:
+            return
+        external_id = f"ym_google_{ym_uuid}"
+
+        product_id = event_data.get("productId", "")
+        start_str = event_data.get("startDate", "")
+        end_str = event_data.get("endDate", "")
+
+        plan_interval = "month"
+        plan_amount = 1999
+        if product_id and ("annual" in product_id.lower() or "year" in product_id.lower()):
+            plan_interval = "year"
+            plan_amount = 17999
+
+        def _parse_iso_g(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        period_start = _parse_iso_g(start_str)
+        period_end = _parse_iso_g(end_str)
+
+        eid = f"ymove_created_{ym_uuid}_{now_ts}"
+        try:
+            await conn.execute(
+                """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_subscription_id, source, data)
+                   VALUES ($1, $2, $3, 'google', $4)
+                   ON CONFLICT (stripe_event_id) DO NOTHING""",
+                eid, "ymove.subscriptionCreated", external_id,
+                json.dumps({"ymove_user_id": ymove_user_id, "email": email, "product_id": product_id}, default=str)
+            )
+        except Exception as e:
+            print(f"[ymove] Google event store error: {e}")
+
+        try:
+            await conn.execute("""
+                INSERT INTO subscriptions (
+                    stripe_customer_id, stripe_subscription_id, email, status,
+                    plan_interval, plan_amount, currency, source,
+                    current_period_start, current_period_end,
+                    created_at, updated_at
+                ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', 'google', $5, $6, COALESCE($5, NOW()), NOW())
+                ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                    email = COALESCE(NULLIF(EXCLUDED.email, ''), subscriptions.email),
+                    status = 'active',
+                    updated_at = NOW()
+            """,
+                external_id, email, plan_interval, plan_amount,
+                period_start, period_end
+            )
+            print(f"[ymove] Google sub upserted: {external_id} | {email}")
+        except Exception as e:
+            print(f"[ymove] Google sub upsert error: {e}")
+
+        # Assign readable_id
+        try:
+            existing = await conn.fetchrow(
+                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
+                external_id
+            )
+            if existing and not existing["readable_id"]:
+                rid = await assign_readable_id(conn, "google")
+                await conn.execute(
+                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
+                    rid, external_id
+                )
+        except Exception as e:
+            print(f"[ymove] Google readable ID error: {e}")
+
+    else:
+        print(f"[ymove] Unknown provider: {provider}")
+
+
+async def _ymove_handle_cancelled(conn, event_data: dict, email: str, ymove_user_id: str):
+    """Process subscriptionCancelled from ymove.
+    Cancel events have no provider field — we find the sub by email."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    # Store event for audit
+    eid = f"ymove_cancelled_{ymove_user_id}_{now_ts}"
+    try:
+        await conn.execute(
+            """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_customer_id, stripe_subscription_id, source, data)
+               VALUES ($1, $2, '', '', 'ymove', $3)
+               ON CONFLICT (stripe_event_id) DO NOTHING""",
+            eid, "ymove.subscriptionCancelled",
+            json.dumps({"ymove_user_id": ymove_user_id, "email": email, "event": event_data}, default=str)
+        )
+    except Exception as e:
+        print(f"[ymove] Cancel event store error: {e}")
+
+    if not email:
+        print("[ymove] Cancel event has no email — cannot match subscription")
+        return
+
+    # Find most recent active sub for this email and cancel it
+    # For Stripe subs, the direct Stripe webhook will also fire — double-cancel is safe (no-op)
+    # For Apple subs, this is the ONLY cancel signal we get
+    try:
+        active_sub = await conn.fetchrow(
+            """SELECT id, stripe_subscription_id, source FROM subscriptions
+               WHERE lower(email) = lower($1) AND status IN ('active', 'trialing')
+               ORDER BY created_at DESC LIMIT 1""",
+            email
+        )
+        if active_sub:
+            await conn.execute(
+                "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                active_sub["id"]
+            )
+            print(f"[ymove] Cancelled {active_sub['source']} sub {active_sub['stripe_subscription_id']} for {email}")
+        else:
+            print(f"[ymove] No active sub found for {email} to cancel")
+    except Exception as e:
+        print(f"[ymove] Cancel processing error: {e}")
 
 
 # --- Daily Digest System ---
