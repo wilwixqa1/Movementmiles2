@@ -53,8 +53,9 @@ async def startup():
     if DATABASE_URL:
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+            # Block 1: Core tables (leads, page_views, chat_sessions)
             async with db_pool.acquire() as conn:
-                # Phase 2 tables
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS leads (
                         id SERIAL PRIMARY KEY,
@@ -78,14 +79,6 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
-                # Phase 5: UTM tracking columns on leads
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_source TEXT DEFAULT ''")
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_medium TEXT DEFAULT ''")
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_campaign TEXT DEFAULT ''")
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_term TEXT DEFAULT ''")
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_content TEXT DEFAULT ''")
-                await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS ym_source TEXT DEFAULT ''")
-
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS chat_sessions (
                         id SERIAL PRIMARY KEY,
@@ -94,7 +87,13 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
-                # Phase 3 tables
+                # UTM tracking columns on leads
+                for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source']:
+                    await conn.execute(f"ALTER TABLE leads ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+            print("[Startup] Block 1: Core tables ready")
+
+            # Block 2: Subscription tables + ALTER columns
+            async with db_pool.acquire() as conn:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscriptions (
                         id SERIAL PRIMARY KEY,
@@ -115,16 +114,13 @@ async def startup():
                         updated_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
-                # Phase 4: add source column if table already existed without it
-                await conn.execute("""
-                    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'
-                """)
-                # Session 11: trial-to-paid conversion tracking
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS readable_id TEXT")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS renewal_count INTEGER DEFAULT 0")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_renewed_at TIMESTAMPTZ")
-
+                # S16: import batch tracking for safe revert
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS import_batch TEXT")
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
                         id SERIAL PRIMARY KEY,
@@ -137,12 +133,11 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
-                # Phase 4: add source column if table already existed without it
-                await conn.execute("""
-                    ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'
-                """)
+                await conn.execute("ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'stripe'")
+            print("[Startup] Block 2: Subscription tables ready")
 
-                # Session 11: Ad spend tracking table
+            # Block 3: Analytics tables (ad_spend, platform_metrics, ymove_webhook_log)
+            async with db_pool.acquire() as conn:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS ad_spend (
                         id SERIAL PRIMARY KEY,
@@ -154,7 +149,6 @@ async def startup():
                         UNIQUE(month, channel)
                     )
                 """)
-                # Session 13: Apple/Google aggregate metrics
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS platform_metrics (
                         id SERIAL PRIMARY KEY,
@@ -176,22 +170,26 @@ async def startup():
                         UNIQUE(date, source, metric_type)
                     )
                 """)
-            print("Database connected, all tables ready")
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ymove_webhook_log (
+                        id SERIAL PRIMARY KEY,
+                        event_type TEXT,
+                        payload JSONB,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+            print("[Startup] Block 3: Analytics tables ready")
 
-            # ymove webhook log table (separate connection block - S16)
+            # Block 4: Indexes (non-blocking, failure will not kill startup)
             try:
                 async with db_pool.acquire() as conn:
-                    await conn.execute("""
-                        CREATE TABLE IF NOT EXISTS ymove_webhook_log (
-                            id SERIAL PRIMARY KEY,
-                            event_type TEXT,
-                            payload JSONB,
-                            created_at TIMESTAMPTZ DEFAULT NOW()
-                        )
-                    """)
-                print("ymove webhook log table ready")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_email_lower ON leads (lower(email))")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_import_batch ON subscriptions (import_batch) WHERE import_batch IS NOT NULL")
+                print("[Startup] Block 4: Indexes ready")
             except Exception as e:
-                print(f"ymove log table creation deferred: {e}")
+                print(f"[Startup] Index creation deferred (non-fatal): {e}")
         except Exception as e:
             print(f"Database connection failed: {e}")
             db_pool = None
@@ -3388,13 +3386,374 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "16.0.0",
+        "version": "16.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
         "digest_recipients": DIGEST_RECIPIENTS if DIGEST_RECIPIENTS else "none",
     }
 
+
+
+# --- Session 16: Database Health Check ---
+
+@app.get("/api/admin/db-check")
+async def db_check(request: Request):
+    """Verify all tables, columns, and indexes exist after startup refactor."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    checks = {"tables": {}, "indexes": {}, "columns": {}, "all_ok": True}
+
+    async with db_pool.acquire() as conn:
+        expected_tables = ["leads", "page_views", "chat_sessions", "subscriptions",
+                          "subscription_events", "ad_spend", "platform_metrics", "ymove_webhook_log"]
+        for t in expected_tables:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", t
+            )
+            checks["tables"][t] = exists
+            if not exists:
+                checks["all_ok"] = False
+
+        critical_cols = {
+            "subscriptions": ["converted_at", "readable_id", "renewal_count", "last_renewed_at", "source", "import_batch"],
+            "leads": ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ym_source"],
+            "subscription_events": ["source"],
+        }
+        for table, cols in critical_cols.items():
+            checks["columns"][table] = {}
+            for col in cols:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)",
+                    table, col
+                )
+                checks["columns"][table][col] = exists
+                if not exists:
+                    checks["all_ok"] = False
+
+        expected_indexes = ["idx_leads_email_lower", "idx_subs_email_lower", "idx_subs_trial_start", "idx_subs_import_batch"]
+        for idx in expected_indexes:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)", idx
+            )
+            checks["indexes"][idx] = exists
+            if not exists:
+                checks["all_ok"] = False
+
+        checks["row_counts"] = {}
+        for t in expected_tables:
+            if checks["tables"].get(t):
+                count = await conn.fetchval(f"SELECT COUNT(*) FROM {t}")
+                checks["row_counts"][t] = count
+
+    return checks
+
+
+# --- Session 16: Safe Excel/CSV Import with Batch Tracking ---
+
+@app.post("/api/admin/import-preview")
+async def import_preview(request: Request, file: UploadFile = File(...)):
+    """Dry-run import: reads Excel/CSV, shows what would be imported vs skipped."""
+    import csv as csv_mod
+    import io as io_mod
+    import hashlib
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    contents = await file.read()
+    filename = file.filename or ""
+
+    rows_to_check = []
+    if filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
+        from openpyxl import load_workbook
+        from io import BytesIO
+        wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            headers = []
+            for ri, row in enumerate(ws.iter_rows(values_only=True)):
+                if ri == 0:
+                    headers = [str(h or "").strip().lower() for h in row]
+                    continue
+                if not any(row):
+                    continue
+                row_dict = {}
+                for ci, h in enumerate(headers):
+                    row_dict[h] = str(row[ci] or "").strip() if ci < len(row) else ""
+                row_dict["_sheet"] = sheet_name
+                rows_to_check.append(row_dict)
+        wb.close()
+    else:
+        text = contents.decode("utf-8-sig")
+        reader = csv_mod.DictReader(io_mod.StringIO(text))
+        for row in reader:
+            normalized = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
+            normalized["_sheet"] = "csv"
+            rows_to_check.append(normalized)
+
+    def get_email(row):
+        for key in ["email", "e-mail", "email address"]:
+            if key in row and row[key] and "@" in row[key]:
+                return row[key].strip().lower()
+        return ""
+
+    def get_source(row):
+        for key in ["source", "platform"]:
+            if key in row:
+                val = row[key].strip().lower()
+                if val in ("apple", "google", "stripe"):
+                    return val
+        return "unknown"
+
+    async with db_pool.acquire() as conn:
+        existing_emails = await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != ''"
+        )
+        existing_sub_ids = await conn.fetch("SELECT stripe_subscription_id FROM subscriptions")
+        total_before = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+    existing_email_set = set(r["em"] for r in existing_emails)
+    existing_id_set = set(r["stripe_subscription_id"] for r in existing_sub_ids)
+
+    would_import = []
+    would_skip_duplicate = []
+    would_skip_no_email = []
+    by_sheet = {}
+
+    for row in rows_to_check:
+        email = get_email(row)
+        source = get_source(row)
+        sheet = row.get("_sheet", "unknown")
+        if sheet not in by_sheet:
+            by_sheet[sheet] = {"total": 0, "import": 0, "skip_dup": 0, "skip_no_email": 0}
+        by_sheet[sheet]["total"] += 1
+        if not email:
+            would_skip_no_email.append({"sheet": sheet})
+            by_sheet[sheet]["skip_no_email"] += 1
+            continue
+        email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+        syn_id = f"import_{source}_{email_hash}"
+        if email in existing_email_set or syn_id in existing_id_set:
+            would_skip_duplicate.append({"email": email, "source": source, "sheet": sheet})
+            by_sheet[sheet]["skip_dup"] += 1
+        else:
+            would_import.append({"email": email, "source": source, "sheet": sheet})
+            by_sheet[sheet]["import"] += 1
+            existing_email_set.add(email)
+            existing_id_set.add(syn_id)
+
+    return {
+        "status": "preview",
+        "filename": filename,
+        "total_rows_parsed": len(rows_to_check),
+        "would_import": len(would_import),
+        "would_skip_duplicate": len(would_skip_duplicate),
+        "would_skip_no_email": len(would_skip_no_email),
+        "current_db_subscriptions": total_before,
+        "after_import_estimate": total_before + len(would_import),
+        "by_sheet": by_sheet,
+        "sample_imports": would_import[:20],
+        "sample_duplicates": would_skip_duplicate[:20],
+    }
+
+
+@app.post("/api/admin/import-batch")
+async def import_batch(request: Request, file: UploadFile = File(...)):
+    """Import subscribers with batch ID for safe revert. Use /api/admin/revert-batch to undo."""
+    import csv as csv_mod
+    import io as io_mod
+    import hashlib
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    contents = await file.read()
+    filename = file.filename or ""
+    batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    rows_to_import = []
+    if filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
+        from openpyxl import load_workbook
+        from io import BytesIO
+        wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            headers = []
+            for ri, row in enumerate(ws.iter_rows(values_only=True)):
+                if ri == 0:
+                    headers = [str(h or "").strip().lower() for h in row]
+                    continue
+                if not any(row):
+                    continue
+                row_dict = {}
+                for ci, h in enumerate(headers):
+                    row_dict[h] = str(row[ci] or "").strip() if ci < len(row) else ""
+                rows_to_import.append(row_dict)
+        wb.close()
+    else:
+        text = contents.decode("utf-8-sig")
+        reader = csv_mod.DictReader(io_mod.StringIO(text))
+        for row in reader:
+            normalized = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
+            rows_to_import.append(normalized)
+
+    def get_email(row):
+        for key in ["email", "e-mail", "email address"]:
+            if key in row and row[key] and "@" in row[key]:
+                return row[key].strip().lower()
+        return ""
+
+    def get_source(row):
+        for key in ["source", "platform"]:
+            if key in row:
+                val = row[key].strip().lower()
+                if val in ("apple", "google", "stripe"):
+                    return val
+        return "apple"
+
+    def get_date(row):
+        for key in ["date", "sign up date", "signup_date", "signup date", "created_at"]:
+            if key in row and row[key]:
+                val = row[key].strip()
+                for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d %H:%M:%S"]:
+                    try:
+                        return datetime.strptime(val[:19], fmt).replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+        return None
+
+    async with db_pool.acquire() as conn:
+        existing_emails = await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != ''"
+        )
+        existing_ids = await conn.fetch("SELECT stripe_subscription_id FROM subscriptions")
+        existing_email_set = set(r["em"] for r in existing_emails)
+        existing_id_set = set(r["stripe_subscription_id"] for r in existing_ids)
+        count_before = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+        imported = 0
+        skipped = 0
+        errors = 0
+
+        for row in rows_to_import:
+            email = get_email(row)
+            if not email:
+                skipped += 1
+                continue
+            source = get_source(row)
+            email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+            syn_id = f"import_{source}_{email_hash}"
+            if email in existing_email_set or syn_id in existing_id_set:
+                skipped += 1
+                continue
+            period_start = get_date(row)
+            plan_amount = 1999
+            plan_interval = "month"
+            try:
+                await conn.execute("""
+                    INSERT INTO subscriptions (
+                        stripe_customer_id, stripe_subscription_id, email, status,
+                        plan_interval, plan_amount, currency, source,
+                        current_period_start, created_at, updated_at, import_batch
+                    ) VALUES ('', $1, $2, 'active', $3, $4, 'usd', $5, $6, COALESCE($7, NOW()), NOW(), $8)
+                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """,
+                    syn_id, email, plan_interval, plan_amount, source,
+                    period_start, period_start, batch_id
+                )
+                imported += 1
+                existing_email_set.add(email)
+                existing_id_set.add(syn_id)
+            except Exception as e:
+                print(f"[Import] Error: {e}")
+                errors += 1
+
+        count_after = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+    return {
+        "status": "ok",
+        "batch_id": batch_id,
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+        "count_before": count_before,
+        "count_after": count_after,
+    }
+
+
+@app.post("/api/admin/revert-batch")
+async def revert_batch(request: Request):
+    """Revert a batch import by deleting all records with matching import_batch tag."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    batch_id = (body.get("batch_id") or "").strip()
+    if not batch_id:
+        raise HTTPException(status_code=400, detail="batch_id required")
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE import_batch = $1", batch_id
+        )
+        if count == 0:
+            return {"status": "ok", "deleted": 0, "message": f"No records found with batch_id '{batch_id}'"}
+
+        confirm = body.get("confirm", False)
+        if not confirm:
+            sample = await conn.fetch(
+                "SELECT email, source, created_at FROM subscriptions WHERE import_batch = $1 LIMIT 10",
+                batch_id
+            )
+            return {
+                "status": "confirmation_required",
+                "batch_id": batch_id,
+                "records_to_delete": count,
+                "sample": [{"email": r["email"], "source": r["source"], "created_at": str(r["created_at"])} for r in sample],
+                "message": f"This will delete {count} records. Send again with confirm: true to proceed."
+            }
+
+        result = await conn.execute(
+            "DELETE FROM subscriptions WHERE import_batch = $1", batch_id
+        )
+        deleted = int(result.split(" ")[-1]) if result else 0
+
+    return {"status": "ok", "batch_id": batch_id, "deleted": deleted}
+
+
+@app.get("/api/admin/list-batches")
+async def list_batches(request: Request):
+    """List all import batches for the revert UI."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        batches = await conn.fetch("""
+            SELECT import_batch, COUNT(*) as record_count,
+                   MIN(created_at) as earliest, MAX(created_at) as latest
+            FROM subscriptions
+            WHERE import_batch IS NOT NULL
+            GROUP BY import_batch
+            ORDER BY MIN(created_at) DESC
+        """)
+
+    return {"batches": [
+        {"batch_id": r["import_batch"], "records": r["record_count"],
+         "earliest": str(r["earliest"]), "latest": str(r["latest"])}
+        for r in batches
+    ]}
 
 
 # --- Apple App Store Connect Integration (Session 13) ---
