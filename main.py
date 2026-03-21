@@ -3386,13 +3386,221 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "16.1.0",
+        "version": "16.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
         "digest_recipients": DIGEST_RECIPIENTS if DIGEST_RECIPIENTS else "none",
     }
 
+
+
+# --- Session 16: Dedup Active Subscriptions ---
+
+@app.post("/api/admin/dedup-active")
+async def dedup_active(request: Request):
+    """Find and resolve duplicate active subscriptions for the same email.
+    Without confirm=true: preview. With confirm=true: cancel the inferior duplicate."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    confirm = body.get("confirm", False)
+
+    async with db_pool.acquire() as conn:
+        dups = await conn.fetch("""
+            SELECT lower(email) as em,
+                   array_agg(id ORDER BY updated_at DESC) as ids,
+                   array_agg(source ORDER BY updated_at DESC) as sources,
+                   array_agg(stripe_subscription_id ORDER BY updated_at DESC) as sub_ids,
+                   array_agg(plan_amount ORDER BY updated_at DESC) as amounts
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing') AND email != '' AND email IS NOT NULL
+            GROUP BY lower(email) HAVING COUNT(*) > 1
+        """)
+
+        results = []
+        canceled_count = 0
+        for d in dups:
+            # Pick keeper: prefer stripe (live webhooks), then most recently updated
+            keep_idx = 0
+            for i, src in enumerate(d["sources"]):
+                if src == "stripe" and d["sources"][keep_idx] != "stripe":
+                    keep_idx = i
+                    break
+
+            entries = []
+            for i in range(len(d["ids"])):
+                action = "KEEP" if i == keep_idx else "CANCEL"
+                entries.append({"id": d["ids"][i], "sub_id": d["sub_ids"][i], "source": d["sources"][i], "amount": d["amounts"][i], "action": action})
+                if confirm and action == "CANCEL":
+                    await conn.execute(
+                        "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                        d["ids"][i]
+                    )
+                    canceled_count += 1
+            results.append({"email": d["em"], "records": entries})
+
+    if confirm:
+        return {"status": "ok", "duplicates_found": len(dups), "canceled": canceled_count, "details": results}
+    return {"status": "preview", "duplicates_found": len(dups), "plan": results}
+
+
+# --- Session 16: Meg Apple/Google Import ---
+
+@app.post("/api/admin/import-meg-apple-google")
+async def import_meg_apple_google(request: Request, file: UploadFile = File(...)):
+    """Import from Meg Apple & Google Members sheet (headerless: first,last,email,date,source).
+    ?preview=true for dry run. All imports tagged with batch_id for revert."""
+    import hashlib
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    preview_mode = request.query_params.get("preview", "false").lower() == "true"
+    contents = await file.read()
+
+    from openpyxl import load_workbook
+    from io import BytesIO
+    wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
+
+    target_sheet = None
+    for name in wb.sheetnames:
+        if "apple" in name.lower() and "google" in name.lower():
+            target_sheet = name
+            break
+    if not target_sheet:
+        wb.close()
+        raise HTTPException(status_code=400, detail=f"Apple & Google sheet not found. Sheets: {wb.sheetnames}")
+
+    ws = wb[target_sheet]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    parsed = []
+    for r in rows:
+        if not any(r):
+            continue
+        email = str(r[2] or "").strip().lower() if len(r) > 2 else ""
+        if not email or "@" not in email:
+            continue
+        first_name = str(r[0] or "").strip() if len(r) > 0 else ""
+        last_name = str(r[1] or "").strip() if len(r) > 1 else ""
+        date_val = r[3] if len(r) > 3 else None
+        source_val = str(r[4] or "").strip().lower() if len(r) > 4 else "apple"
+        if source_val not in ("apple", "google"):
+            source_val = "apple"
+        period_start = None
+        if hasattr(date_val, "strftime"):
+            period_start = date_val.replace(tzinfo=timezone.utc) if date_val.tzinfo is None else date_val
+        parsed.append({"first_name": first_name, "last_name": last_name, "email": email, "date": period_start, "source": source_val})
+
+    batch_id = f"meg_ag_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        active_emails = set(r["em"] for r in await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing')"
+        ))
+        cancelled_emails = set(r["em"] for r in await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status = 'canceled'"
+        ))
+        all_emails = set(r["em"] for r in await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != ''"
+        ))
+
+        new_imports = []
+        skip_active = []
+        reactivate_candidates = []
+        seen = set()
+
+        for p in parsed:
+            if p["email"] in seen:
+                continue
+            seen.add(p["email"])
+            if p["email"] in active_emails:
+                skip_active.append(p)
+            elif p["email"] in cancelled_emails:
+                reactivate_candidates.append(p)
+            else:
+                new_imports.append(p)
+
+        if preview_mode:
+            return {
+                "status": "preview",
+                "total_parsed": len(parsed),
+                "unique_emails": len(seen),
+                "would_import_new": len(new_imports),
+                "would_skip_already_active": len(skip_active),
+                "reactivate_candidates": len(reactivate_candidates),
+                "note_reactivate": "These are in DB as cancelled but Meg says active. Only Apple/Google source subs will be reactivated (not Stripe).",
+                "sample_new": [{"email": p["email"], "source": p["source"], "date": str(p["date"] or "")} for p in new_imports[:15]],
+                "sample_reactivate": [{"email": p["email"], "source": p["source"]} for p in reactivate_candidates[:15]],
+            }
+
+        count_before = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+        imported = 0
+        reactivated = 0
+        errors = 0
+
+        for p in new_imports:
+            email_hash = hashlib.md5(p["email"].encode()).hexdigest()[:16]
+            syn_id = f"meg_{p['source']}_{email_hash}"
+            try:
+                await conn.execute("""
+                    INSERT INTO subscriptions (
+                        stripe_customer_id, stripe_subscription_id, email, status,
+                        plan_interval, plan_amount, currency, source,
+                        current_period_start, created_at, updated_at, import_batch
+                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, $4, COALESCE($5, NOW()), NOW(), $6)
+                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """,
+                    syn_id, p["email"], p["source"],
+                    p["date"], p["date"], batch_id
+                )
+                imported += 1
+            except Exception as e:
+                print(f"[Meg import] Error: {e}")
+                errors += 1
+
+        # Reactivate: only Apple/Google source subs (Stripe webhook is authoritative)
+        for p in reactivate_candidates:
+            try:
+                result = await conn.execute("""
+                    UPDATE subscriptions SET status = 'active', canceled_at = NULL,
+                        updated_at = NOW(), import_batch = $1
+                    WHERE id = (
+                        SELECT id FROM subscriptions
+                        WHERE lower(email) = $2 AND status = 'canceled' AND source IN ('apple', 'google')
+                        ORDER BY created_at DESC LIMIT 1
+                    )
+                """, batch_id, p["email"])
+                if result and result.endswith("1"):
+                    reactivated += 1
+            except Exception as e:
+                print(f"[Meg import] Reactivate error: {e}")
+                errors += 1
+
+        count_after = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+
+    return {
+        "status": "ok",
+        "batch_id": batch_id,
+        "imported_new": imported,
+        "reactivated": reactivated,
+        "skipped_already_active": len(skip_active),
+        "errors": errors,
+        "count_before": count_before,
+        "count_after": count_after,
+        "revert_info": f"To undo: POST /api/admin/revert-batch with batch_id={batch_id}. Note: revert deletes new imports and re-cancels reactivated subs."
+    }
 
 
 # --- Session 16: Comprehensive Data Audit ---
