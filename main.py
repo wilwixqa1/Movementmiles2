@@ -3395,6 +3395,297 @@ async def health():
 
 
 
+# --- Session 16: Comprehensive Data Audit ---
+
+@app.get("/api/admin/data-audit")
+async def data_audit(request: Request):
+    """Run 15+ data quality checks across all tables. Returns issues that affect financial reports."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    audit = {"checks": {}, "summary": {}, "critical_issues": [], "warnings": []}
+
+    async with db_pool.acquire() as conn:
+
+        # ============================================================
+        # CHECK 1: Overall counts
+        # ============================================================
+        total = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+        active = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status = 'active'")
+        trialing = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status = 'trialing'")
+        canceled = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status = 'canceled'")
+        other_status = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status NOT IN ('active', 'trialing', 'canceled')")
+        audit["checks"]["totals"] = {"total": total, "active": active, "trialing": trialing, "canceled": canceled, "other_status": other_status}
+
+        # ============================================================
+        # CHECK 2: Subs with NO email (cannot attribute, cannot match leads)
+        # ============================================================
+        no_email = await conn.fetch(
+            "SELECT source, status, COUNT(*) as cnt FROM subscriptions WHERE email IS NULL OR email = '' GROUP BY source, status ORDER BY cnt DESC"
+        )
+        no_email_total = sum(r["cnt"] for r in no_email)
+        no_email_active = sum(r["cnt"] for r in no_email if r["status"] in ("active", "trialing"))
+        audit["checks"]["no_email"] = {
+            "total_without_email": no_email_total,
+            "active_without_email": no_email_active,
+            "by_source_status": [{"source": r["source"], "status": r["status"], "count": r["cnt"]} for r in no_email]
+        }
+        if no_email_active > 0:
+            audit["critical_issues"].append(f"{no_email_active} active/trialing subs have NO email. Cannot attribute to leads, cannot match cancellations, invisible in funnel.")
+
+        # ============================================================
+        # CHECK 3: Duplicate active subs (same email, multiple active records = double MRR)
+        # ============================================================
+        dup_active = await conn.fetch("""
+            SELECT lower(email) as em, COUNT(*) as cnt,
+                   array_agg(source) as sources,
+                   SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE plan_amount/12 END) as total_mrr_cents
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing') AND email != '' AND email IS NOT NULL
+            GROUP BY lower(email) HAVING COUNT(*) > 1
+            ORDER BY cnt DESC LIMIT 50
+        """)
+        dup_mrr_inflate = sum(r["total_mrr_cents"] - (1999 if r["total_mrr_cents"] else 0) for r in dup_active)
+        audit["checks"]["duplicate_active_emails"] = {
+            "count": len(dup_active),
+            "estimated_mrr_inflation_cents": dup_mrr_inflate,
+            "top_duplicates": [{"email": r["em"], "active_records": r["cnt"], "sources": list(r["sources"]), "combined_mrr_cents": r["total_mrr_cents"]} for r in dup_active[:20]]
+        }
+        if len(dup_active) > 0:
+            audit["critical_issues"].append(f"{len(dup_active)} emails have MULTIPLE active subscriptions. This inflates MRR by ~${dup_mrr_inflate/100:,.2f}. Each person should only have 1 active sub.")
+
+        # ============================================================
+        # CHECK 4: Plan amount anomalies (wrong amounts = wrong MRR)
+        # ============================================================
+        plan_dist = await conn.fetch("""
+            SELECT plan_amount, plan_interval, source, status, COUNT(*) as cnt
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            GROUP BY plan_amount, plan_interval, source, status
+            ORDER BY cnt DESC
+        """)
+        zero_amount_active = sum(r["cnt"] for r in plan_dist if (r["plan_amount"] or 0) == 0)
+        weird_amounts = [r for r in plan_dist if r["plan_amount"] not in (0, 1999, 17999) and r["plan_amount"] is not None]
+        audit["checks"]["plan_amounts"] = {
+            "active_with_zero_amount": zero_amount_active,
+            "distribution": [{"amount": r["plan_amount"], "interval": r["plan_interval"], "source": r["source"], "status": r["status"], "count": r["cnt"]} for r in plan_dist],
+            "unexpected_amounts": [{"amount": r["plan_amount"], "interval": r["plan_interval"], "source": r["source"], "count": r["cnt"]} for r in weird_amounts]
+        }
+        if zero_amount_active > 0:
+            audit["warnings"].append(f"{zero_amount_active} active subs have $0 plan_amount. They count as active but contribute nothing to MRR.")
+        if weird_amounts:
+            audit["warnings"].append(f"{len(weird_amounts)} plan_amount values are not standard ($19.99/mo or $179.99/yr). Could indicate data corruption.")
+
+        # ============================================================
+        # CHECK 5: Stale trialing subs (trial_end in the past but still trialing)
+        # ============================================================
+        stale_trials = await conn.fetchval("""
+            SELECT COUNT(*) FROM subscriptions
+            WHERE status = 'trialing' AND trial_end IS NOT NULL AND trial_end < NOW()
+        """)
+        audit["checks"]["stale_trialing"] = {"count": stale_trials or 0}
+        if stale_trials and stale_trials > 0:
+            audit["critical_issues"].append(f"{stale_trials} subs are still marked 'trialing' but their trial has ended. These inflate trial count and may be hiding cancellations or conversions.")
+
+        # ============================================================
+        # CHECK 6: Future dates (created_at or trial_start in the future)
+        # ============================================================
+        future_created = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE created_at > NOW() + INTERVAL '1 day'")
+        future_trial = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE trial_start > NOW() + INTERVAL '1 day'")
+        future_period = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE current_period_start > NOW() + INTERVAL '1 year'")
+        audit["checks"]["future_dates"] = {
+            "future_created_at": future_created or 0,
+            "future_trial_start": future_trial or 0,
+            "far_future_period_start": future_period or 0
+        }
+        if (future_created or 0) > 0:
+            audit["critical_issues"].append(f"{future_created} subs have created_at in the future. Distorts daily metrics and cohort analysis.")
+
+        # ============================================================
+        # CHECK 7: Source integrity (source vs subscription_id pattern)
+        # ============================================================
+        stripe_no_sub = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'stripe' AND stripe_subscription_id NOT LIKE 'sub_%' AND stripe_subscription_id NOT LIKE 'import_%'")
+        import_tagged = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id LIKE 'import_%'")
+        apple_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'apple'")
+        google_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'google'")
+        stripe_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'stripe'")
+        audit["checks"]["source_integrity"] = {
+            "stripe_total": stripe_count or 0,
+            "apple_total": apple_count or 0,
+            "google_total": google_count or 0,
+            "import_tagged_records": import_tagged or 0,
+            "stripe_without_sub_prefix": stripe_no_sub or 0
+        }
+
+        # ============================================================
+        # CHECK 8: MRR accuracy (calculated vs what dashboard would show)
+        # ============================================================
+        mrr_monthly = await conn.fetchval("SELECT COALESCE(SUM(plan_amount), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'month'")
+        mrr_annual = await conn.fetchval("SELECT COALESCE(SUM(plan_amount / 12), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'year'")
+        mrr_total = (mrr_monthly or 0) + (mrr_annual or 0)
+        mrr_by_src = await conn.fetch("""
+            SELECT source,
+                COUNT(*) as active_count,
+                COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as monthly,
+                COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as annual_equiv
+            FROM subscriptions WHERE status = 'active'
+            GROUP BY source
+        """)
+        audit["checks"]["mrr_breakdown"] = {
+            "total_mrr_cents": mrr_total,
+            "total_mrr_display": f"${mrr_total/100:,.2f}",
+            "from_monthly": mrr_monthly or 0,
+            "from_annual": mrr_annual or 0,
+            "by_source": [{"source": r["source"], "active_count": r["active_count"], "mrr_cents": (r["monthly"] or 0) + (r["annual_equiv"] or 0)} for r in mrr_by_src]
+        }
+
+        # ============================================================
+        # CHECK 9: Missing conversion stamps
+        # ============================================================
+        should_have_converted = await conn.fetchval("""
+            SELECT COUNT(*) FROM subscriptions
+            WHERE converted_at IS NULL
+            AND trial_end IS NOT NULL AND current_period_start IS NOT NULL
+            AND current_period_start > trial_end
+            AND status = 'active'
+        """)
+        has_converted = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE converted_at IS NOT NULL")
+        trial_with_data = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE trial_start IS NOT NULL")
+        trial_no_data = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE trial_start IS NULL")
+        audit["checks"]["conversion_tracking"] = {
+            "has_converted_at": has_converted or 0,
+            "missing_converted_at_but_clearly_converted": should_have_converted or 0,
+            "subs_with_trial_data": trial_with_data or 0,
+            "subs_without_trial_data": trial_no_data or 0
+        }
+        if should_have_converted and should_have_converted > 10:
+            audit["warnings"].append(f"{should_have_converted} active subs clearly converted from trial but lack converted_at stamp. Run backfill-conversions to fix.")
+
+        # ============================================================
+        # CHECK 10: Active subs that Meg lists as cancelled
+        # (Cross-reference: how many of our "active" subs might actually be cancelled?)
+        # ============================================================
+        active_stripe_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'stripe' AND status = 'active'")
+        active_apple_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'apple' AND status IN ('active', 'trialing')")
+        active_google_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE source = 'google' AND status IN ('active', 'trialing')")
+        audit["checks"]["active_by_source"] = {
+            "stripe_active": active_stripe_count or 0,
+            "apple_active": active_apple_count or 0,
+            "google_active": active_google_count or 0,
+            "note": "Compare these against Meg spreadsheet: 866 Stripe active, 796 Apple/Google active. Large discrepancies = stale data."
+        }
+
+        # ============================================================
+        # CHECK 11: Subscription age analysis (are old subs still marked active?)
+        # ============================================================
+        old_active = await conn.fetch("""
+            SELECT source, COUNT(*) as cnt,
+                MIN(created_at) as oldest,
+                MAX(created_at) as newest
+            FROM subscriptions
+            WHERE status = 'active'
+            GROUP BY source
+        """)
+        very_old = await conn.fetchval("""
+            SELECT COUNT(*) FROM subscriptions
+            WHERE status = 'active' AND created_at < NOW() - INTERVAL '2 years'
+        """)
+        audit["checks"]["active_age"] = {
+            "by_source": [{"source": r["source"], "active_count": r["cnt"], "oldest": str(r["oldest"]), "newest": str(r["newest"])} for r in old_active],
+            "active_older_than_2_years": very_old or 0
+        }
+        if very_old and very_old > 50:
+            audit["warnings"].append(f"{very_old} subs marked active are over 2 years old. Some may be zombies that cancelled outside our tracking.")
+
+        # ============================================================
+        # CHECK 12: period_end in the past for active subs (expired but not flipped)
+        # ============================================================
+        expired_active = await conn.fetchval("""
+            SELECT COUNT(*) FROM subscriptions
+            WHERE status = 'active'
+            AND current_period_end IS NOT NULL
+            AND current_period_end < NOW() - INTERVAL '7 days'
+        """)
+        audit["checks"]["expired_but_active"] = {"count": expired_active or 0}
+        if expired_active and expired_active > 20:
+            audit["critical_issues"].append(f"{expired_active} subs are marked 'active' but their current_period_end is over 7 days ago. These are likely cancelled/expired and inflate MRR.")
+
+        # ============================================================
+        # CHECK 13: Leads vs Subs email match rate
+        # ============================================================
+        total_leads = await conn.fetchval("SELECT COUNT(*) FROM leads WHERE email != ''")
+        leads_with_sub = await conn.fetchval("""
+            SELECT COUNT(DISTINCT lower(l.email)) FROM leads l
+            INNER JOIN subscriptions s ON lower(l.email) = lower(s.email)
+            WHERE l.email != '' AND s.email != ''
+        """)
+        subs_with_lead = await conn.fetchval("""
+            SELECT COUNT(DISTINCT lower(s.email)) FROM subscriptions s
+            INNER JOIN leads l ON lower(s.email) = lower(l.email)
+            WHERE s.email != '' AND l.email != '' AND s.status IN ('active', 'trialing')
+        """)
+        active_with_email = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing') AND email != '' AND email IS NOT NULL")
+        audit["checks"]["lead_attribution"] = {
+            "total_leads": total_leads or 0,
+            "leads_who_subscribed": leads_with_sub or 0,
+            "active_subs_with_matching_lead": subs_with_lead or 0,
+            "active_subs_with_email": active_with_email or 0,
+            "attribution_rate": round(((subs_with_lead or 0) / max(active_with_email or 1, 1)) * 100, 1)
+        }
+
+        # ============================================================
+        # CHECK 14: Cancelled subs with NO canceled_at date
+        # ============================================================
+        cancel_no_date = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status = 'canceled' AND canceled_at IS NULL")
+        audit["checks"]["cancel_date_quality"] = {
+            "canceled_without_date": cancel_no_date or 0,
+            "note": "Missing canceled_at means churn timing is unknown. Affects churn rate calculations."
+        }
+
+        # ============================================================
+        # CHECK 15: Net MRR risk score
+        # ============================================================
+        risk_factors = []
+        risk_score = 0
+        if (expired_active or 0) > 20:
+            risk_factors.append(f"~{expired_active} expired-but-active subs inflating MRR")
+            risk_score += 3
+        if len(dup_active) > 10:
+            risk_factors.append(f"~{len(dup_active)} duplicate active emails inflating MRR")
+            risk_score += 3
+        if no_email_active > 100:
+            risk_factors.append(f"~{no_email_active} active subs with no email (unverifiable)")
+            risk_score += 2
+        if (stale_trials or 0) > 10:
+            risk_factors.append(f"~{stale_trials} stale trialing subs (trial ended)")
+            risk_score += 1
+        if (very_old or 0) > 50:
+            risk_factors.append(f"~{very_old} active subs over 2 years old (possible zombies)")
+            risk_score += 2
+        if zero_amount_active > 20:
+            risk_factors.append(f"~{zero_amount_active} active subs with $0 plan amount")
+            risk_score += 1
+
+        if risk_score >= 6:
+            confidence = "LOW"
+        elif risk_score >= 3:
+            confidence = "MEDIUM"
+        else:
+            confidence = "HIGH"
+
+        audit["summary"] = {
+            "mrr_confidence": confidence,
+            "risk_score": risk_score,
+            "risk_factors": risk_factors,
+            "total_critical_issues": len(audit["critical_issues"]),
+            "total_warnings": len(audit["warnings"])
+        }
+
+    return audit
+
+
 # --- Session 16: Database Health Check ---
 
 @app.get("/api/admin/db-check")
