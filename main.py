@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import httpx
 import os
@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import gzip
+import asyncio
 
 app = FastAPI(title="Movement & Miles")
 
@@ -40,6 +41,10 @@ APPLE_KEY_ID = os.environ.get("APPLE_KEY_ID", "")
 APPLE_ISSUER_ID = os.environ.get("APPLE_ISSUER_ID", "")
 APPLE_KEY_CONTENT = os.environ.get("APPLE_KEY_CONTENT", "")
 APPLE_VENDOR_NUMBER = os.environ.get("APPLE_VENDOR_NUMBER", "")
+
+# ymove API (Session 17)
+YMOVE_API_KEY = os.environ.get("YMOVE_API_KEY", "")
+YMOVE_API_BASE = "https://v6-beta-api.ymove.app"
 
 # --- Database ---
 db_pool = None
@@ -338,22 +343,28 @@ FORMAT your response as a short paragraph overview, then bullet points for key i
 
 # --- Shared Helpers ---
 
-async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 800) -> str:
+async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 800, cache_system: bool = False) -> str:
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="API key not configured")
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if cache_system:
+        system_val = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
+    else:
+        system_val = system_prompt
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": max_tokens,
-                    "system": system_prompt,
+                    "system": system_val,
                     "messages": messages,
                 },
             )
@@ -366,23 +377,29 @@ async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 8
             raise HTTPException(status_code=500, detail=str(e))
 
 
-async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int = 800) -> str:
+async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int = 800, cache_system: bool = False) -> str:
     """Like call_anthropic but doesn't raise HTTPException — returns error string instead."""
     if not ANTHROPIC_API_KEY:
         return "[Error: ANTHROPIC_API_KEY not configured]"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if cache_system:
+        system_val = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
+    else:
+        system_val = system_prompt
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": max_tokens,
-                    "system": system_prompt,
+                    "system": system_val,
                     "messages": messages,
                 },
             )
@@ -476,7 +493,7 @@ async def chat(req: ChatRequest):
         if msg.get("role") in ("user", "assistant") and msg.get("content"):
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": req.message})
-    reply = await call_anthropic(NELLY_SYSTEM_PROMPT, messages)
+    reply = await call_anthropic(NELLY_SYSTEM_PROMPT, messages, cache_system=True)
     # Track chat session
     if db_pool:
         try:
@@ -1803,6 +1820,225 @@ async def admin_ymove_log(request: Request):
         {"id": r["id"], "event_type": r["event_type"], "payload": r["payload"], "created_at": str(r["created_at"])}
         for r in rows
     ]}
+
+
+# --- Session 17: ymove API Verification ---
+
+@app.post("/api/admin/ymove-verify")
+async def ymove_verify(request: Request):
+    """Verify emails against ymove API to check active subscription status.
+    Body: {"email": "single@ex.com"} or {"emails": [...]} or {"discover": true}
+    Custom batching: {"emails": [...], "batch_size": 10, "delay_seconds": 2}
+    Override endpoint: {"emails": [...], "endpoint": "/api/v1/members"}"""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    ymove_key = YMOVE_API_KEY
+    if not ymove_key:
+        return JSONResponse(status_code=500, content={
+            "error": "YMOVE_API_KEY not set in environment variables. Add it to Railway."
+        })
+
+    body = await request.json()
+
+    # Discovery mode: try common endpoint patterns
+    if body.get("discover"):
+        test_email = body.get("email", "takacsmeghan@gmail.com")
+        return await _ymove_discover(ymove_key, test_email)
+
+    emails = body.get("emails", [])
+    if not emails and body.get("email"):
+        emails = [body["email"]]
+    if not emails:
+        return JSONResponse(status_code=400, content={"error": "Provide email or emails list"})
+
+    endpoint = body.get("endpoint", "/api/v1/members")
+    auth_header = body.get("auth_header", "x-api-key")
+    email_param = body.get("email_param", "email")
+    batch_size = min(body.get("batch_size", 10), 50)
+    delay_seconds = max(body.get("delay_seconds", 1.5), 0.5)
+
+    results = []
+    rate_limit_hits = 0
+    errors = 0
+    total_delay = 0.0
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for i, email in enumerate(emails):
+            if i > 0 and i % batch_size == 0:
+                await asyncio.sleep(delay_seconds)
+                total_delay += delay_seconds
+            try:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}{endpoint}",
+                    headers={auth_header: ymove_key},
+                    params={email_param: email}
+                )
+                if resp.status_code == 429:
+                    rate_limit_hits += 1
+                    retry_after = float(resp.headers.get("retry-after", "5"))
+                    print(f"[ymove] Rate limited on {email}, backing off {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    total_delay += retry_after
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}{endpoint}",
+                        headers={auth_header: ymove_key},
+                        params={email_param: email}
+                    )
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {"raw_text": resp.text[:500]}
+                    status = _ymove_parse_status(data)
+                    results.append({"email": email, "status": status, "raw": data})
+                elif resp.status_code == 404:
+                    results.append({"email": email, "status": "not_found", "raw": None})
+                else:
+                    results.append({"email": email, "status": "error", "http_status": resp.status_code, "raw": resp.text[:300]})
+                    errors += 1
+            except Exception as e:
+                results.append({"email": email, "status": "error", "error": str(e)})
+                errors += 1
+
+    active_count = sum(1 for r in results if r["status"] == "active")
+    cancelled_count = sum(1 for r in results if r["status"] in ("cancelled", "canceled", "expired", "inactive"))
+    not_found_count = sum(1 for r in results if r["status"] == "not_found")
+    unknown_count = sum(1 for r in results if r["status"] == "unknown")
+
+    return {
+        "total": len(emails), "verified": len(results),
+        "active": active_count, "cancelled": cancelled_count,
+        "not_found": not_found_count, "unknown": unknown_count,
+        "errors": errors, "rate_limit_hits": rate_limit_hits,
+        "total_delay_seconds": round(total_delay, 1),
+        "endpoint_used": endpoint, "results": results
+    }
+
+
+async def _ymove_discover(api_key: str, test_email: str) -> dict:
+    """Try common ymove API endpoint patterns to discover the correct format."""
+    patterns = [
+        {"path": "/api/v1/members", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/api/members", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/api/v1/members/lookup", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/api/v1/users", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/api/members/search", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/api/v1/members", "params": {"email": test_email}, "header": "Authorization"},
+        {"path": "/api/v1/subscriptions", "params": {"email": test_email}, "header": "x-api-key"},
+        {"path": "/members", "params": {"email": test_email}, "header": "x-api-key"},
+    ]
+    results = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for p in patterns:
+            try:
+                headers = {}
+                if p["header"] == "Authorization":
+                    headers["Authorization"] = f"Bearer {api_key}"
+                else:
+                    headers[p["header"]] = api_key
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}{p['path']}",
+                    headers=headers, params=p["params"]
+                )
+                body_preview = resp.text[:500] if resp.text else "(empty)"
+                results.append({
+                    "pattern": f"GET {p['path']}?email=...",
+                    "auth": p["header"], "status": resp.status_code,
+                    "body_preview": body_preview,
+                    "promising": resp.status_code in (200, 401, 403),
+                })
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                results.append({"pattern": f"GET {p['path']}?email=...", "status": "error", "error": str(e), "promising": False})
+    return {
+        "status": "discovery_complete", "test_email": test_email,
+        "api_base": YMOVE_API_BASE, "patterns_tried": len(results),
+        "promising_patterns": len([r for r in results if r.get("promising")]),
+        "results": results,
+        "next_step": "Look for 200 responses. Then call with working endpoint path in body."
+    }
+
+
+def _ymove_parse_status(data) -> str:
+    """Parse ymove API response to determine subscription status."""
+    if isinstance(data, list):
+        if len(data) == 0:
+            return "not_found"
+        data = data[0]
+    if not isinstance(data, dict):
+        return "unknown"
+    for field in ["status", "subscriptionStatus", "subscription_status", "state", "memberStatus"]:
+        val = data.get(field, "")
+        if isinstance(val, str):
+            val_lower = val.lower()
+            if val_lower in ("active", "subscribed", "trialing"):
+                return "active"
+            if val_lower in ("cancelled", "canceled", "expired", "revoked", "inactive", "churned"):
+                return "cancelled"
+    for field in ["active", "isActive", "is_active"]:
+        val = data.get(field)
+        if val is True:
+            return "active"
+        if val is False:
+            return "cancelled"
+    sub = data.get("subscription") or data.get("subscriptions")
+    if isinstance(sub, dict):
+        return _ymove_parse_status(sub)
+    if isinstance(sub, list) and len(sub) > 0:
+        return _ymove_parse_status(sub[0])
+    return "unknown"
+
+
+@app.post("/api/admin/ymove-reactivate")
+async def ymove_reactivate(request: Request):
+    """Reactivate confirmed-active subs from ymove verification.
+    Body: {"emails": [...], "preview": true/false}
+    Only reactivates Apple/Google source subs (Stripe webhook is authoritative)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    emails = body.get("emails", [])
+    if not emails:
+        return JSONResponse(status_code=400, content={"error": "Provide emails list"})
+
+    batch_id = body.get("batch_id", f"ymove_react_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
+    preview = body.get("preview", True)
+
+    async with db_pool.acquire() as conn:
+        reactivated = 0
+        skipped = 0
+        details = []
+        for email in emails:
+            email_lower = email.strip().lower()
+            row = await conn.fetchrow("""
+                SELECT id, stripe_subscription_id, source, status, canceled_at
+                FROM subscriptions
+                WHERE lower(email) = $1 AND status = 'canceled' AND source IN ('apple', 'google')
+                ORDER BY created_at DESC LIMIT 1
+            """, email_lower)
+            if not row:
+                skipped += 1
+                details.append({"email": email_lower, "action": "skipped", "reason": "no cancelled apple/google sub"})
+                continue
+            if preview:
+                details.append({"email": email_lower, "action": "would_reactivate", "sub_id": row["stripe_subscription_id"], "source": row["source"], "canceled_at": str(row["canceled_at"] or "")})
+                reactivated += 1
+            else:
+                await conn.execute("UPDATE subscriptions SET status = 'active', canceled_at = NULL, updated_at = NOW(), import_batch = $1 WHERE id = $2", batch_id, row["id"])
+                reactivated += 1
+                details.append({"email": email_lower, "action": "reactivated", "sub_id": row["stripe_subscription_id"], "source": row["source"]})
+
+    return {
+        "status": "preview" if preview else "ok",
+        "batch_id": batch_id if not preview else None,
+        "reactivated": reactivated, "skipped": skipped,
+        "total_emails": len(emails), "details": details,
+        "next_step": "Set preview: false to execute" if preview else f"Revert with POST /api/admin/revert-batch batch_id={batch_id}"
+    }
 
 
 @app.post("/api/admin/send-test-digest")
@@ -3386,7 +3622,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "16.3.0",
+        "version": "17.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
