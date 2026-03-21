@@ -3386,7 +3386,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "16.2.0",
+        "version": "16.3.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
@@ -3466,6 +3466,7 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
         raise HTTPException(status_code=500, detail="No database connected")
 
     preview_mode = request.query_params.get("preview", "false").lower() == "true"
+    skip_reactivate = request.query_params.get("skip_reactivate", "false").lower() == "true"
     contents = await file.read()
 
     from openpyxl import load_workbook
@@ -3571,6 +3572,8 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
                 errors += 1
 
         # Reactivate: only Apple/Google source subs (Stripe webhook is authoritative)
+        if skip_reactivate:
+            reactivate_candidates = []  # skip all reactivations
         for p in reactivate_candidates:
             try:
                 result = await conn.execute("""
@@ -3600,6 +3603,92 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
         "count_before": count_before,
         "count_after": count_after,
         "revert_info": f"To undo: POST /api/admin/revert-batch with batch_id={batch_id}. Note: revert deletes new imports and re-cancels reactivated subs."
+    }
+
+
+# --- Session 16: Export Reactivation Candidates ---
+
+@app.post("/api/admin/reactivation-candidates")
+async def reactivation_candidates(request: Request, file: UploadFile = File(...)):
+    """Upload Meg Apple/Google XLSX, returns full list of reactivation candidates (cancelled in DB, active in Meg sheet)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    contents = await file.read()
+    from openpyxl import load_workbook
+    from io import BytesIO
+    wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
+
+    target_sheet = None
+    for name in wb.sheetnames:
+        if "apple" in name.lower() and "google" in name.lower():
+            target_sheet = name
+            break
+    if not target_sheet:
+        wb.close()
+        raise HTTPException(status_code=400, detail="Apple & Google sheet not found")
+
+    ws = wb[target_sheet]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    meg_people = {}
+    for r in rows:
+        if not any(r):
+            continue
+        email = str(r[2] or "").strip().lower() if len(r) > 2 else ""
+        if not email or "@" not in email:
+            continue
+        first_name = str(r[0] or "").strip() if len(r) > 0 else ""
+        last_name = str(r[1] or "").strip() if len(r) > 1 else ""
+        source_val = str(r[4] or "").strip().upper() if len(r) > 4 else "APPLE"
+        date_val = r[3].strftime("%Y-%m-%d") if len(r) > 3 and hasattr(r[3], "strftime") else ""
+        meg_people[email] = {"first_name": first_name, "last_name": last_name, "source": source_val or "APPLE", "date": date_val}
+
+    async with db_pool.acquire() as conn:
+        active_emails = set(r["em"] for r in await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing')"
+        ))
+        cancelled_rows = await conn.fetch("""
+            SELECT lower(email) as em, source, status, canceled_at, created_at
+            FROM subscriptions
+            WHERE email != '' AND status = 'canceled'
+            AND lower(email) IN (SELECT unnest($1::text[]))
+            ORDER BY email, created_at DESC
+        """, list(meg_people.keys()))
+
+    # Build cancelled lookup (most recent per email)
+    cancelled_map = {}
+    for r in cancelled_rows:
+        if r["em"] not in cancelled_map:
+            cancelled_map[r["em"]] = {"source": r["source"], "canceled_at": str(r["canceled_at"] or ""), "created_at": str(r["created_at"] or "")}
+
+    candidates = []
+    for email, info in meg_people.items():
+        if email in active_emails:
+            continue
+        if email in cancelled_map:
+            db_info = cancelled_map[email]
+            candidates.append({
+                "email": email,
+                "first_name": info["first_name"],
+                "last_name": info["last_name"],
+                "meg_source": info["source"],
+                "meg_date": info["date"],
+                "db_source": db_info["source"],
+                "db_canceled_at": db_info["canceled_at"],
+                "db_created_at": db_info["created_at"],
+            })
+
+    candidates.sort(key=lambda x: x["email"])
+
+    return {
+        "total_meg_entries": len(meg_people),
+        "already_active_in_db": len([e for e in meg_people if e in active_emails]),
+        "reactivation_candidates": len(candidates),
+        "candidates": candidates
     }
 
 
