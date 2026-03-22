@@ -1852,9 +1852,28 @@ async def send_digest_email(html: str, subject: str) -> dict:
 
 
 async def run_daily_digest():
-    """Orchestrator: gather stats -> AI insights -> build email -> send."""
+    """Orchestrator: auto-stamp conversions -> gather stats -> AI insights -> build email -> send."""
     print(f"[Digest] Starting daily digest at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
     try:
+        # S18: Auto-stamp Apple/Google conversions (trial expired + active + no cancel)
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    result = await conn.execute(
+                        """UPDATE subscriptions SET converted_at = trial_end
+                           WHERE converted_at IS NULL
+                           AND source IN ('apple', 'google')
+                           AND status = 'active'
+                           AND trial_end IS NOT NULL
+                           AND trial_end < NOW()
+                           AND canceled_at IS NULL"""
+                    )
+                    stamped = int(result.split(" ")[-1]) if result else 0
+                    if stamped > 0:
+                        print(f"[Digest] Auto-stamped {stamped} Apple/Google conversions")
+            except Exception as e:
+                print(f"[Digest] Auto-stamp error: {e}")
+
         stats = await gather_daily_stats()
         if "error" in stats:
             print(f"[Digest] Error gathering stats: {stats['error']}")
@@ -4019,7 +4038,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "18.2.0",
+        "version": "18.3.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
