@@ -1282,15 +1282,16 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Apple dedup error: {e}")
 
-        # S18: Detect trial-to-paid conversion (current_period moved past trial_end)
+        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel)
         try:
             conv_check = await conn.fetchrow(
-                """SELECT id, trial_end, current_period_start FROM subscriptions
+                """SELECT id, trial_end FROM subscriptions
                    WHERE stripe_subscription_id = $1
                    AND converted_at IS NULL
+                   AND status = 'active'
                    AND trial_end IS NOT NULL
-                   AND current_period_start IS NOT NULL
-                   AND current_period_start > trial_end""",
+                   AND trial_end < NOW()
+                   AND canceled_at IS NULL""",
                 transaction_id
             )
             if conv_check:
@@ -1407,15 +1408,16 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Google dedup error: {e}")
 
-        # S18: Detect trial-to-paid conversion (current_period moved past trial_end)
+        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel)
         try:
             conv_check = await conn.fetchrow(
-                """SELECT id, trial_end, current_period_start FROM subscriptions
+                """SELECT id, trial_end FROM subscriptions
                    WHERE stripe_subscription_id = $1
                    AND converted_at IS NULL
+                   AND status = 'active'
                    AND trial_end IS NOT NULL
-                   AND current_period_start IS NOT NULL
-                   AND current_period_start > trial_end""",
+                   AND trial_end < NOW()
+                   AND canceled_at IS NULL""",
                 external_id
             )
             if conv_check:
@@ -1917,9 +1919,9 @@ async def fix_future_dates(request: Request):
 
 @app.post("/api/admin/smart-backfill-conversions")
 async def smart_backfill_conversions(request: Request):
-    """S18: Stamp converted_at on Apple/Google subs where we have REAL evidence of conversion.
-    Evidence: current_period_start moved past trial_end (sub renewed past trial period).
-    Only stamps where converted_at is currently NULL."""
+    """S18: Stamp converted_at on Apple/Google subs that survived past their trial.
+    Heuristic: trial_end has passed + still active + never cancelled = converted.
+    Stamps converted_at = trial_end. Only where converted_at is currently NULL."""
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
     if not db_pool:
@@ -1934,31 +1936,36 @@ async def smart_backfill_conversions(request: Request):
 
     async with db_pool.acquire() as conn:
         candidates = await conn.fetch(
-            """SELECT id, stripe_subscription_id, email, source, trial_end, current_period_start
+            """SELECT id, stripe_subscription_id, email, source, trial_end, created_at
                FROM subscriptions
                WHERE converted_at IS NULL
                AND source IN ('apple', 'google')
+               AND status = 'active'
                AND trial_end IS NOT NULL
-               AND current_period_start IS NOT NULL
-               AND current_period_start > trial_end
+               AND trial_end < NOW()
+               AND canceled_at IS NULL
                ORDER BY source, trial_end"""
         )
 
         if preview:
             by_source = {}
+            in_30d = 0
             for r in candidates:
                 src = r["source"]
                 by_source[src] = by_source.get(src, 0) + 1
+                if r["trial_end"] and (datetime.now(timezone.utc) - r["trial_end"]).days <= 30:
+                    in_30d += 1
             return {
                 "status": "preview",
                 "would_stamp": len(candidates),
                 "by_source": by_source,
+                "would_show_in_30d_count": in_30d,
                 "sample": [
                     {"email": r["email"] or "n/a", "source": r["source"],
-                     "trial_end": str(r["trial_end"]), "period_start": str(r["current_period_start"])}
+                     "trial_end": str(r["trial_end"]), "created_at": str(r["created_at"])}
                     for r in candidates[:20]
                 ],
-                "note": "These subs have current_period_start > trial_end, meaning they renewed past trial. Send preview: false to stamp converted_at = trial_end."
+                "note": "These subs are active, past trial, never cancelled. converted_at will be set to trial_end. Check would_show_in_30d_count for dashboard impact."
             }
 
         stamped = 0
@@ -1969,7 +1976,7 @@ async def smart_backfill_conversions(request: Request):
             )
             stamped += 1
 
-    return {"status": "ok", "stamped": stamped, "note": "converted_at set to trial_end for subs with evidence of renewal past trial."}
+    return {"status": "ok", "stamped": stamped, "note": "converted_at set to trial_end for active subs that survived past trial."}
 
 
 @app.post("/api/admin/cleanup-converted-at")
@@ -4012,7 +4019,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "18.1.0",
+        "version": "18.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
