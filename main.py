@@ -1282,6 +1282,26 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Apple dedup error: {e}")
 
+        # S18: Detect trial-to-paid conversion (current_period moved past trial_end)
+        try:
+            conv_check = await conn.fetchrow(
+                """SELECT id, trial_end, current_period_start FROM subscriptions
+                   WHERE stripe_subscription_id = $1
+                   AND converted_at IS NULL
+                   AND trial_end IS NOT NULL
+                   AND current_period_start IS NOT NULL
+                   AND current_period_start > trial_end""",
+                transaction_id
+            )
+            if conv_check:
+                await conn.execute(
+                    "UPDATE subscriptions SET converted_at = $1 WHERE id = $2",
+                    conv_check["trial_end"], conv_check["id"]
+                )
+                print(f"[ymove] Apple conversion detected for {transaction_id} (trial_end: {conv_check['trial_end']})")
+        except Exception as e:
+            print(f"[ymove] Apple conversion check error: {e}")
+
         # Assign readable_id if not yet set
         try:
             existing = await conn.fetchrow(
@@ -1386,6 +1406,26 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                     print(f"[ymove] Dedup: deactivated synthetic {syn['stripe_subscription_id']} for {email} (real: {external_id})")
             except Exception as e:
                 print(f"[ymove] Google dedup error: {e}")
+
+        # S18: Detect trial-to-paid conversion (current_period moved past trial_end)
+        try:
+            conv_check = await conn.fetchrow(
+                """SELECT id, trial_end, current_period_start FROM subscriptions
+                   WHERE stripe_subscription_id = $1
+                   AND converted_at IS NULL
+                   AND trial_end IS NOT NULL
+                   AND current_period_start IS NOT NULL
+                   AND current_period_start > trial_end""",
+                external_id
+            )
+            if conv_check:
+                await conn.execute(
+                    "UPDATE subscriptions SET converted_at = $1 WHERE id = $2",
+                    conv_check["trial_end"], conv_check["id"]
+                )
+                print(f"[ymove] Google conversion detected for {external_id} (trial_end: {conv_check['trial_end']})")
+        except Exception as e:
+            print(f"[ymove] Google conversion check error: {e}")
 
         # Assign readable_id
         try:
@@ -1873,6 +1913,63 @@ async def fix_future_dates(request: Request):
                 details.append({"email": s["email"] or "n/a", "source": s["source"], "old_date": str(s["created_at"])})
 
     return {"status": "ok", "fixed": fixed, "total_found": len(future_subs), "details": details}
+
+
+@app.post("/api/admin/smart-backfill-conversions")
+async def smart_backfill_conversions(request: Request):
+    """S18: Stamp converted_at on Apple/Google subs where we have REAL evidence of conversion.
+    Evidence: current_period_start moved past trial_end (sub renewed past trial period).
+    Only stamps where converted_at is currently NULL."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    preview = body.get("preview", True)
+
+    async with db_pool.acquire() as conn:
+        candidates = await conn.fetch(
+            """SELECT id, stripe_subscription_id, email, source, trial_end, current_period_start
+               FROM subscriptions
+               WHERE converted_at IS NULL
+               AND source IN ('apple', 'google')
+               AND trial_end IS NOT NULL
+               AND current_period_start IS NOT NULL
+               AND current_period_start > trial_end
+               ORDER BY source, trial_end"""
+        )
+
+        if preview:
+            by_source = {}
+            for r in candidates:
+                src = r["source"]
+                by_source[src] = by_source.get(src, 0) + 1
+            return {
+                "status": "preview",
+                "would_stamp": len(candidates),
+                "by_source": by_source,
+                "sample": [
+                    {"email": r["email"] or "n/a", "source": r["source"],
+                     "trial_end": str(r["trial_end"]), "period_start": str(r["current_period_start"])}
+                    for r in candidates[:20]
+                ],
+                "note": "These subs have current_period_start > trial_end, meaning they renewed past trial. Send preview: false to stamp converted_at = trial_end."
+            }
+
+        stamped = 0
+        for r in candidates:
+            await conn.execute(
+                "UPDATE subscriptions SET converted_at = $1 WHERE id = $2",
+                r["trial_end"], r["id"]
+            )
+            stamped += 1
+
+    return {"status": "ok", "stamped": stamped, "note": "converted_at set to trial_end for subs with evidence of renewal past trial."}
 
 
 @app.post("/api/admin/cleanup-converted-at")
@@ -3915,7 +4012,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "18.0.0",
+        "version": "18.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
