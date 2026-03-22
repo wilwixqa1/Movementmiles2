@@ -126,6 +126,9 @@ async def startup():
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_renewed_at TIMESTAMPTZ")
                 # S16: import batch tracking for safe revert
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS import_batch TEXT")
+                # S17: store names directly on subscriptions
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS first_name TEXT")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_name TEXT")
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
                         id SERIAL PRIMARY KEY,
@@ -1123,7 +1126,7 @@ async def ymove_webhook(request: Request):
 
     async with db_pool.acquire() as conn:
         if event_type == "subscriptionCreated":
-            await _ymove_handle_created(conn, event_data, email, ymove_user_id, provider)
+            await _ymove_handle_created(conn, event_data, email, ymove_user_id, provider, first_name, last_name)
         elif event_type == "subscriptionCancelled":
             await _ymove_handle_cancelled(conn, event_data, email, ymove_user_id)
         else:
@@ -1132,7 +1135,7 @@ async def ymove_webhook(request: Request):
     return {"status": "ok", "processed": event_type, "email": email}
 
 
-async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_id: str, provider: str):
+async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_id: str, provider: str, first_name: str = "", last_name: str = ""):
     """Process subscriptionCreated from ymove."""
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
@@ -1169,6 +1172,15 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                         email, stripe_sub_id
                     )
                     print(f"[ymove] Attached email {email} to Stripe sub {stripe_sub_id}")
+                # S17: Store names
+                if existing and (first_name or last_name):
+                    try:
+                        await conn.execute(
+                            "UPDATE subscriptions SET first_name = COALESCE(NULLIF($1, ''), first_name), last_name = COALESCE(NULLIF($2, ''), last_name) WHERE stripe_subscription_id = $3",
+                            first_name, last_name, stripe_sub_id
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[ymove] Stripe email attach error: {e}")
 
@@ -1239,6 +1251,16 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             print(f"[ymove] Apple sub upserted: {transaction_id} | {email}")
         except Exception as e:
             print(f"[ymove] Apple sub upsert error: {e}")
+
+        # S17: Store names from ymove
+        if first_name or last_name:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET first_name = COALESCE(NULLIF($1, ''), first_name), last_name = COALESCE(NULLIF($2, ''), last_name) WHERE stripe_subscription_id = $3",
+                    first_name, last_name, transaction_id
+                )
+            except Exception as e:
+                print(f"[ymove] Apple name store error: {e}")
 
         # Assign readable_id if not yet set
         try:
@@ -1314,6 +1336,16 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             print(f"[ymove] Google sub upserted: {external_id} | {email}")
         except Exception as e:
             print(f"[ymove] Google sub upsert error: {e}")
+
+        # S17: Store names from ymove
+        if first_name or last_name:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET first_name = COALESCE(NULLIF($1, ''), first_name), last_name = COALESCE(NULLIF($2, ''), last_name) WHERE stripe_subscription_id = $3",
+                    first_name, last_name, external_id
+                )
+            except Exception as e:
+                print(f"[ymove] Google name store error: {e}")
 
         # Assign readable_id
         try:
@@ -1801,6 +1833,29 @@ async def fix_future_dates(request: Request):
                 details.append({"email": s["email"] or "n/a", "source": s["source"], "old_date": str(s["created_at"])})
 
     return {"status": "ok", "fixed": fixed, "total_found": len(future_subs), "details": details}
+
+
+@app.post("/api/admin/backfill-names")
+async def backfill_names(request: Request):
+    """Backfill first_name/last_name on subscriptions from leads table."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE subscriptions s SET
+                first_name = COALESCE(NULLIF(s.first_name, ''), l.first_name),
+                last_name = COALESCE(NULLIF(s.last_name, ''), l.extra)
+            FROM leads l
+            WHERE lower(s.email) = lower(l.email)
+            AND s.email != '' AND l.email != ''
+            AND (s.first_name IS NULL OR s.first_name = '' OR s.last_name IS NULL OR s.last_name = '')
+        """)
+        count = int(result.split(" ")[-1]) if result else 0
+
+    return {"status": "ok", "updated": count}
 
 
 @app.get("/api/admin/ymove-log")
@@ -2942,7 +2997,8 @@ async def admin_subscriptions_meg_xlsx(request: Request):
 
     async with db_pool.acquire() as conn:
         all_subs = await conn.fetch("""
-            SELECT s.*, l.first_name as lead_name, l.extra as lead_last_name
+            SELECT s.*, s.first_name as sub_first, s.last_name as sub_last,
+                   l.first_name as lead_name, l.extra as lead_last_name
             FROM subscriptions s
             LEFT JOIN LATERAL (
                 SELECT first_name, extra FROM leads
@@ -2989,7 +3045,9 @@ async def admin_subscriptions_meg_xlsx(request: Request):
     data_font = Font(name="Arial", size=10)
 
     def get_name(r):
-        return (r.get("lead_name", "") or ""), (r.get("lead_last_name", "") or "")
+        first = r.get("sub_first", "") or r.get("lead_name", "") or ""
+        last = r.get("sub_last", "") or r.get("lead_last_name", "") or ""
+        return first, last
 
     def auto_width(ws, num_cols, num_rows):
         for ci in range(1, num_cols + 1):
@@ -3775,7 +3833,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "17.1.0",
+        "version": "17.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
@@ -3948,12 +4006,14 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
                     INSERT INTO subscriptions (
                         stripe_customer_id, stripe_subscription_id, email, status,
                         plan_interval, plan_amount, currency, source,
-                        current_period_start, created_at, updated_at, import_batch
-                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, $4, COALESCE($5, NOW()), NOW(), $6)
+                        current_period_start, created_at, updated_at, import_batch,
+                        first_name, last_name
+                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, $4, COALESCE($5, NOW()), NOW(), $6, $7, $8)
                     ON CONFLICT (stripe_subscription_id) DO NOTHING
                 """,
                     syn_id, p["email"], p["source"],
-                    p["date"], p["date"], batch_id
+                    p["date"], p["date"], batch_id,
+                    p.get("first_name", ""), p.get("last_name", "")
                 )
                 imported += 1
             except Exception as e:
