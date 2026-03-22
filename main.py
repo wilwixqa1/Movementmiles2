@@ -1262,6 +1262,26 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Apple name store error: {e}")
 
+        # S18: Dedup - deactivate synthetic Meg-import record if real transaction arrived
+        if email:
+            try:
+                synthetic = await conn.fetch(
+                    """SELECT id, stripe_subscription_id FROM subscriptions
+                       WHERE lower(email) = lower($1)
+                       AND stripe_subscription_id LIKE 'meg_apple_%'
+                       AND stripe_subscription_id != $2
+                       AND status IN ('active', 'trialing')""",
+                    email, transaction_id
+                )
+                for syn in synthetic:
+                    await conn.execute(
+                        "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                        syn["id"]
+                    )
+                    print(f"[ymove] Dedup: deactivated synthetic {syn['stripe_subscription_id']} for {email} (real: {transaction_id})")
+            except Exception as e:
+                print(f"[ymove] Apple dedup error: {e}")
+
         # Assign readable_id if not yet set
         try:
             existing = await conn.fetchrow(
@@ -1346,6 +1366,26 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                 )
             except Exception as e:
                 print(f"[ymove] Google name store error: {e}")
+
+        # S18: Dedup - deactivate synthetic Meg-import record if real transaction arrived
+        if email:
+            try:
+                synthetic = await conn.fetch(
+                    """SELECT id, stripe_subscription_id FROM subscriptions
+                       WHERE lower(email) = lower($1)
+                       AND stripe_subscription_id LIKE 'meg_google_%'
+                       AND stripe_subscription_id != $2
+                       AND status IN ('active', 'trialing')""",
+                    email, external_id
+                )
+                for syn in synthetic:
+                    await conn.execute(
+                        "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                        syn["id"]
+                    )
+                    print(f"[ymove] Dedup: deactivated synthetic {syn['stripe_subscription_id']} for {email} (real: {external_id})")
+            except Exception as e:
+                print(f"[ymove] Google dedup error: {e}")
 
         # Assign readable_id
         try:
@@ -1833,6 +1873,46 @@ async def fix_future_dates(request: Request):
                 details.append({"email": s["email"] or "n/a", "source": s["source"], "old_date": str(s["created_at"])})
 
     return {"status": "ok", "fixed": fixed, "total_found": len(future_subs), "details": details}
+
+
+@app.post("/api/admin/cleanup-converted-at")
+async def cleanup_converted_at(request: Request):
+    """S18: NULL out fabricated converted_at on Apple/Google subs from S16 backfill.
+    These dates were synthetic (trial_end = created_at + 30d) and pollute conversion metrics."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    preview = body.get("preview", True)
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE source IN ('apple', 'google') AND converted_at IS NOT NULL"
+        )
+        if preview:
+            by_source = await conn.fetch(
+                """SELECT source, COUNT(*) as cnt FROM subscriptions
+                   WHERE source IN ('apple', 'google') AND converted_at IS NOT NULL
+                   GROUP BY source"""
+            )
+            return {
+                "status": "preview",
+                "would_null": count,
+                "by_source": [{"source": r["source"], "count": r["cnt"]} for r in by_source],
+                "note": "Send preview: false to execute. This NULLs converted_at on Apple/Google subs where dates were fabricated by S16 backfill."
+            }
+        result = await conn.execute(
+            "UPDATE subscriptions SET converted_at = NULL WHERE source IN ('apple', 'google') AND converted_at IS NOT NULL"
+        )
+        cleaned = int(result.split(" ")[-1]) if result else 0
+
+    return {"status": "ok", "cleaned": cleaned, "note": "converted_at NULLed on Apple/Google subs. Conversion metrics now reflect Stripe-only data."}
 
 
 @app.post("/api/admin/backfill-names")
@@ -3113,13 +3193,15 @@ async def admin_subscriptions_meg_xlsx(request: Request):
     ws4.freeze_panes = "A2"
 
     # Tab 5: Cancelled Subscription (NO headers)
+    # S18: Filter out rows with no email (cosmetic fix)
+    cancelled_with_email = [r for r in cancelled if r.get("email")]
     ws5 = wb.create_sheet("cancelled subscription")
-    for ri, r in enumerate(cancelled, 1):
+    for ri, r in enumerate(cancelled_with_email, 1):
         first, last = get_name(r)
         ws5.cell(row=ri, column=1, value=first).font = data_font
         ws5.cell(row=ri, column=2, value=last).font = data_font
         ws5.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
-    auto_width(ws5, 3, len(cancelled))
+    auto_width(ws5, 3, len(cancelled_with_email))
 
     output = BytesIO()
     wb.save(output)
@@ -3833,7 +3915,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "17.2.0",
+        "version": "18.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
