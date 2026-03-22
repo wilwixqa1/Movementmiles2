@@ -2920,6 +2920,159 @@ async def admin_subscriptions_xlsx(request: Request):
     )
 
 
+# --- Session 17: Meg Format XLSX Export ---
+
+@app.get("/api/admin/subscriptions-meg-xlsx")
+async def admin_subscriptions_meg_xlsx(request: Request):
+    """Export subscribers in Meg's exact spreadsheet format.
+    Tab 1: Apple & Google Members (no headers) - first, last, email, date, source
+    Tab 2: Stripe Members (no headers) - first, last, email, date
+    Tab 3: Free Month Trial (headers) - First Name, Last Name, Email, Sign Up Date, Payment Type
+    Tab 4: Downloaded & Offered Trial (headers) - First Name, Last Name, Email, Sign Up Date
+    Tab 5: Cancelled Subscription (no headers) - first, last, email"""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        all_subs = await conn.fetch("""
+            SELECT s.*, l.first_name as lead_name, l.extra as lead_last_name
+            FROM subscriptions s
+            LEFT JOIN LATERAL (
+                SELECT first_name, extra FROM leads
+                WHERE lower(leads.email) = lower(s.email) AND s.email != ''
+                ORDER BY created_at DESC LIMIT 1
+            ) l ON true
+            ORDER BY s.created_at
+        """)
+        offered_leads = await conn.fetch("""
+            SELECT l.first_name, l.extra as last_name, l.email, l.created_at
+            FROM leads l
+            WHERE l.email != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM subscriptions s
+                WHERE lower(s.email) = lower(l.email)
+                AND s.status IN ('active', 'trialing')
+            )
+            AND lower(l.email) NOT IN (
+                SELECT DISTINCT lower(email) FROM subscriptions
+                WHERE email != '' AND status = 'canceled'
+            )
+            ORDER BY l.created_at DESC
+        """)
+
+    apple_google_active = []
+    stripe_active = []
+    trialing = []
+    cancelled = []
+    for r in all_subs:
+        status = r.get("status", "")
+        source = r.get("source", "stripe") or "stripe"
+        if status == "trialing":
+            trialing.append(r)
+        elif status == "canceled":
+            cancelled.append(r)
+        elif status == "active":
+            if source in ("apple", "google"):
+                apple_google_active.append(r)
+            else:
+                stripe_active.append(r)
+
+    wb = Workbook()
+    hdr_font = Font(name="Arial", bold=True, size=11)
+    data_font = Font(name="Arial", size=10)
+
+    def get_name(r):
+        return (r.get("lead_name", "") or ""), (r.get("lead_last_name", "") or "")
+
+    def auto_width(ws, num_cols, num_rows):
+        for ci in range(1, num_cols + 1):
+            max_len = 10
+            for ri in range(1, min(num_rows + 2, 100)):
+                val = ws.cell(row=ri, column=ci).value
+                if val:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 2, 30)
+
+    # Tab 1: Apple & Google Members (NO headers, matching Meg format)
+    ws1 = wb.active
+    ws1.title = "Apple & Google Members"
+    for ri, r in enumerate(apple_google_active, 1):
+        first, last = get_name(r)
+        created = r.get("created_at")
+        source = (r.get("source", "") or "").upper()
+        ws1.cell(row=ri, column=1, value=first).font = data_font
+        ws1.cell(row=ri, column=2, value=last).font = data_font
+        ws1.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
+        ws1.cell(row=ri, column=4, value=created.strftime("%Y-%m-%d") if created else "").font = data_font
+        ws1.cell(row=ri, column=5, value=source).font = data_font
+    auto_width(ws1, 5, len(apple_google_active))
+
+    # Tab 2: Stripe Members (NO headers)
+    ws2 = wb.create_sheet("Stripe Members")
+    for ri, r in enumerate(stripe_active, 1):
+        first, last = get_name(r)
+        created = r.get("created_at")
+        ws2.cell(row=ri, column=1, value=first).font = data_font
+        ws2.cell(row=ri, column=2, value=last).font = data_font
+        ws2.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
+        ws2.cell(row=ri, column=4, value=created.strftime("%Y-%m-%d") if created else "").font = data_font
+    auto_width(ws2, 4, len(stripe_active))
+
+    # Tab 3: Free Month Trial (WITH headers)
+    ws3 = wb.create_sheet("Free month trial")
+    for ci, h in enumerate(["First Name", "Last Name", "Email", "Sign Up Date", "Payment Type"], 1):
+        ws3.cell(row=1, column=ci, value=h).font = hdr_font
+    for ri, r in enumerate(trialing, 2):
+        first, last = get_name(r)
+        created = r.get("created_at")
+        source = (r.get("source", "stripe") or "stripe").capitalize()
+        ws3.cell(row=ri, column=1, value=first).font = data_font
+        ws3.cell(row=ri, column=2, value=last).font = data_font
+        ws3.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
+        ws3.cell(row=ri, column=4, value=created.strftime("%Y-%m-%d") if created else "").font = data_font
+        ws3.cell(row=ri, column=5, value=source).font = data_font
+    auto_width(ws3, 5, len(trialing) + 1)
+    ws3.freeze_panes = "A2"
+
+    # Tab 4: Downloaded & Offered Trial (WITH headers)
+    ws4 = wb.create_sheet("downloaded, offered free trial")
+    for ci, h in enumerate(["First Name", "Last Name", "Email", "Sign Up Date"], 1):
+        ws4.cell(row=1, column=ci, value=h).font = hdr_font
+    for ri, r in enumerate(offered_leads, 2):
+        ws4.cell(row=ri, column=1, value=r.get("first_name", "") or "").font = data_font
+        ws4.cell(row=ri, column=2, value=r.get("last_name", "") or "").font = data_font
+        ws4.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
+        created = r.get("created_at")
+        ws4.cell(row=ri, column=4, value=created.strftime("%Y-%m-%d") if created else "").font = data_font
+    auto_width(ws4, 4, len(offered_leads) + 1)
+    ws4.freeze_panes = "A2"
+
+    # Tab 5: Cancelled Subscription (NO headers)
+    ws5 = wb.create_sheet("cancelled subscription")
+    for ri, r in enumerate(cancelled, 1):
+        first, last = get_name(r)
+        ws5.cell(row=ri, column=1, value=first).font = data_font
+        ws5.cell(row=ri, column=2, value=last).font = data_font
+        ws5.cell(row=ri, column=3, value=r.get("email", "") or "").font = data_font
+    auto_width(ws5, 3, len(cancelled))
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=mm-meg-format.xlsx"}
+    )
+
+
 # --- Session 11: User Journey CSV (lead -> subscriber timeline) ---
 
 @app.get("/api/admin/user-journey-csv")
@@ -3622,7 +3775,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "17.0.0",
+        "version": "17.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
