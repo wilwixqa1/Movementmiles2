@@ -275,6 +275,7 @@
       <button class="export-btn" onclick="exportSubsCSV()">Export Subscriptions CSV</button>
       <button class="export-btn" onclick="exportSubsXLSX()" style="background:var(--green)">Export Subscribers XLSX</button>
       <button class="export-btn" onclick="exportJourneyCSV()">Export User Journey CSV</button>
+      <button class="export-btn" onclick="exportMegXLSX()" style="background:var(--orange)">Meg Format XLSX</button>
     </div>
 
     <!-- Session 11: Manual Email Attach -->
@@ -595,10 +596,58 @@
     <!-- ============================================ -->
     <!-- SECTION 5: ADMIN TOOLS (collapsed)           -->
     <!-- ============================================ -->
+    <!-- Data Health & Verification (Session 17) -->
+    <div class="section-toggle" onclick="toggleSection('health')">
+      <div class="section-label">Data Health &amp; Verification</div>
+      <span class="chevron" id="chevron-health">&#9654;</span>
+      <span class="toggle-hint">(6 tools)</span>
+    </div>
+    <div class="collapsible" id="body-health">
+      <div class="tools-grid">
+        <div class="tool-card">
+          <h3>Data Audit</h3>
+          <p>Run 15 data quality checks. Shows MRR confidence score, duplicate detection, stale trials, and more.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-audit" onclick="doDataAudit()">Run Full Audit</button>
+          <div class="tool-result" id="res-audit"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Database Health</h3>
+          <p>Verify all tables, columns, and indexes exist. Quick structural check after deploys.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-dbcheck" onclick="doDbCheck()">Check Database</button>
+          <div class="tool-result" id="res-dbcheck"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Dedup Active Subs</h3>
+          <p>Find emails with multiple active subs (inflates MRR). Preview first, then confirm to fix.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-dedup" onclick="doDedupPreview()">Preview Duplicates</button>
+          <button class="tool-btn tool-btn-red" id="btn-dedup-fix" onclick="doDedupFix()" style="display:none;margin-top:8px">Fix Duplicates</button>
+          <div class="tool-result" id="res-dedup"></div>
+        </div>
+        <div class="tool-card">
+          <h3>ymove API Verify</h3>
+          <p>Discover ymove API endpoints or verify emails against ymove. Blocked until Tosh provides siteId.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-ymove" onclick="doYmoveDiscover()">Discover API</button>
+          <div class="tool-result" id="res-ymove"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Import Batches</h3>
+          <p>View all import batches with record counts. Use batch IDs to revert imports if needed.</p>
+          <button class="tool-btn tool-btn-navy" id="btn-batches" onclick="doListBatches()">List Batches</button>
+          <div class="tool-result" id="res-batches"></div>
+        </div>
+        <div class="tool-card">
+          <h3>Reactivation Status</h3>
+          <p>193 candidates waiting for ymove verification. Once Tosh provides siteId, verify and reactivate confirmed-active subs.</p>
+          <div style="padding:8px 0;font-size:.82rem;color:var(--orange);font-weight:600">BLOCKED: Waiting on Tosh for ymove siteId</div>
+          <div style="font-size:.8rem;color:var(--navy-mid)">Apple active in DB: ~582 | Meg says: ~796 | Gap: ~193</div>
+        </div>
+      </div>
+    </div>
+
     <div class="section-toggle" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
-      <span class="toggle-hint">(9 tools)</span>
+      <span class="toggle-hint">(4 tools)</span>
     </div>
     <div class="collapsible" id="body-tools">
       <div class="tools-grid">
@@ -625,44 +674,14 @@
           <button class="tool-btn tool-btn-green" id="btn-import" onclick="doImport()">Import Leads</button>
           <div class="tool-result" id="res-import"></div>
         </div>
-        <div class="tool-card">
-          <h3>Import Subscribers CSV</h3>
-          <p>Upload Apple/Google subscriber CSV. Creates records with synthetic IDs. Safe to re-run (skips existing).</p>
-          <div class="csv-upload"><input type="file" id="sub-csv-file" accept=".csv" /></div>
-          <button class="tool-btn tool-btn-navy" id="btn-import-subs" onclick="doImportSubs()">Import Subscribers</button>
-          <div class="tool-result" id="res-import-subs"></div>
-        </div>
-        <div class="tool-card">
-          <h3>Reconcile Cancellations</h3>
-          <p>Upload CSV of cancelled emails. Matches against active subscribers and flips them to canceled.</p>
-          <div class="csv-upload"><input type="file" id="cancel-csv-file" accept=".csv" /></div>
-          <button class="tool-btn tool-btn-red" id="btn-reconcile" onclick="doReconcile()">Reconcile Cancellations</button>
-          <div class="tool-result" id="res-reconcile"></div>
-        </div>
-        <div class="tool-card">
-          <h3>Backfill Trial Dates</h3>
-          <p>Sets trial_start/end on imported Apple/Google subs missing trial data. Uses created_at + 30 days.</p>
-          <button class="tool-btn tool-btn-navy" id="btn-backfill-trials" onclick="doBackfillTrials()">Backfill Trial Dates</button>
-          <div class="tool-result" id="res-backfill-trials"></div>
-        </div>
+
         <div class="tool-card">
           <h3>Send Test Digest</h3>
           <p>Manually trigger a daily digest email right now. Sends to configured recipients with [TEST] prefix.</p>
           <button class="tool-btn tool-btn-green" id="btn-test-digest" onclick="doTestDigest()">Send Test Digest</button>
           <div class="tool-result" id="res-test-digest"></div>
         </div>
-        <div class="tool-card">
-          <h3>Backfill Conversions</h3>
-          <p>Stamp converted_at on historical subs that converted from trial to paid. Safe to re-run multiple times.</p>
-          <button class="tool-btn tool-btn-navy" id="btn-backfill-conv" onclick="doBackfillConversions()">Backfill Conversions</button>
-          <div class="tool-result" id="res-backfill-conv"></div>
-        </div>
-        <div class="tool-card">
-          <h3>Backfill Readable IDs</h3>
-          <p>Assign persistent readable IDs (APPLE-0001, GOOGLE-0001, STRIPE-0001) to all existing subscribers. Safe to re-run.</p>
-          <button class="tool-btn tool-btn-navy" id="btn-backfill-ids" onclick="doBackfillIds()">Backfill Readable IDs</button>
-          <div class="tool-result" id="res-backfill-ids"></div>
-        </div>
+
       </div>
     </div>
 
@@ -1520,6 +1539,219 @@ function exportCSV() {
 }
 
 document.getElementById('admin-pw').focus();
+
+// --- Session 17: Data Health & Verification ---
+
+function doDataAudit() {
+  var btn = document.getElementById("btn-audit");
+  var res = document.getElementById("res-audit");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Running 15 data quality checks...";
+  fetch("/api/admin/data-audit", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) throw new Error("Failed");
+    return r.json();
+  }).then(function(d) {
+    var s = d.summary || {};
+    var color = s.mrr_confidence === "HIGH" ? "ok" : s.mrr_confidence === "MEDIUM" ? "warn" : "err";
+    var msg = "MRR Confidence: " + (s.mrr_confidence || "?") + " (risk score " + (s.risk_score || 0) + ")\n";
+    msg += "Critical issues: " + (s.total_critical_issues || 0) + " | Warnings: " + (s.total_warnings || 0) + "\n";
+    if (s.risk_factors && s.risk_factors.length > 0) {
+      msg += "Risk factors:\n" + s.risk_factors.map(function(f) { return "  - " + f; }).join("\n");
+    }
+    var checks = d.checks || {};
+    if (checks.totals) {
+      msg += "\n\nTotals: " + checks.totals.total + " subs (" + checks.totals.active + " active, " + checks.totals.trialing + " trialing, " + checks.totals.canceled + " canceled)";
+    }
+    if (checks.mrr_breakdown) {
+      msg += "\nGross MRR: " + checks.mrr_breakdown.total_mrr_display;
+    }
+    if (checks.duplicate_active_emails) {
+      msg += "\nDuplicate active emails: " + checks.duplicate_active_emails.count;
+    }
+    if (checks.stale_trialing) {
+      msg += "\nStale trialing: " + checks.stale_trialing.count;
+    }
+    if (checks.lead_attribution) {
+      msg += "\nLead attribution rate: " + checks.lead_attribution.attribution_rate + "%";
+    }
+    res.className = "tool-result " + color;
+    res.style.whiteSpace = "pre-wrap";
+    res.textContent = msg;
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doDbCheck() {
+  var btn = document.getElementById("btn-dbcheck");
+  var res = document.getElementById("res-dbcheck");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Checking database structure...";
+  fetch("/api/admin/db-check", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) throw new Error("Failed");
+    return r.json();
+  }).then(function(d) {
+    var ok = d.all_ok;
+    var msg = ok ? "All tables, columns, and indexes verified." : "ISSUES FOUND:";
+    if (!ok) {
+      var tables = d.tables || {};
+      for (var t in tables) { if (!tables[t]) msg += "\n  Missing table: " + t; }
+      var indexes = d.indexes || {};
+      for (var i in indexes) { if (!indexes[i]) msg += "\n  Missing index: " + i; }
+    }
+    if (d.row_counts) {
+      msg += "\n\nRow counts:";
+      for (var t in d.row_counts) msg += "\n  " + t + ": " + d.row_counts[t].toLocaleString();
+    }
+    res.className = "tool-result " + (ok ? "ok" : "err");
+    res.style.whiteSpace = "pre-wrap";
+    res.textContent = msg;
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doDedupPreview() {
+  var btn = document.getElementById("btn-dedup");
+  var res = document.getElementById("res-dedup");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Scanning for duplicate active emails...";
+  fetch("/api/admin/dedup-active", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Admin-Password": adminPw},
+    body: JSON.stringify({})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.duplicates_found === 0) {
+      res.className = "tool-result ok";
+      res.textContent = "No duplicate active emails found. MRR is clean.";
+    } else {
+      res.className = "tool-result warn";
+      res.style.whiteSpace = "pre-wrap";
+      var msg = d.duplicates_found + " duplicate active emails found.\n";
+      (d.plan || []).slice(0, 10).forEach(function(p) {
+        msg += "\n" + p.email + ": " + p.records.map(function(r) { return r.source + "(" + r.action + ")"; }).join(", ");
+      });
+      res.textContent = msg;
+      document.getElementById("btn-dedup-fix").style.display = "block";
+    }
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doDedupFix() {
+  if (!confirm("Cancel duplicate subs? Keeps Stripe over imports, most recent over older.")) return;
+  var res = document.getElementById("res-dedup");
+  res.className = "tool-result loading";
+  res.textContent = "Fixing duplicates...";
+  fetch("/api/admin/dedup-active", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Admin-Password": adminPw},
+    body: JSON.stringify({confirm: true})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    res.className = "tool-result ok";
+    res.textContent = "Fixed! " + d.canceled + " duplicate subs canceled.";
+    document.getElementById("btn-dedup-fix").style.display = "none";
+    loadStats();
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doYmoveDiscover() {
+  var btn = document.getElementById("btn-ymove");
+  var res = document.getElementById("res-ymove");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Testing 8 API endpoint patterns...";
+  fetch("/api/admin/ymove-verify", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Admin-Password": adminPw},
+    body: JSON.stringify({discover: true})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    var promising = d.promising_patterns || 0;
+    var msg = "Tried " + d.patterns_tried + " patterns. Promising: " + promising + "\n";
+    (d.results || []).forEach(function(r) {
+      var icon = r.status === 200 ? "OK" : r.status === 500 ? "ERR" : r.status;
+      msg += "\n[" + icon + "] " + r.pattern;
+      if (r.body_preview && r.body_preview.length < 120) msg += " -> " + r.body_preview.replace(/<[^>]+>/g, "");
+    });
+    if (promising === 0) msg += "\n\nBLOCKED: Need siteId from Tosh. All endpoints return siteId null.";
+    res.className = "tool-result " + (promising > 0 ? "ok" : "warn");
+    res.style.whiteSpace = "pre-wrap";
+    res.textContent = msg;
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doListBatches() {
+  var btn = document.getElementById("btn-batches");
+  var res = document.getElementById("res-batches");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Loading batches...";
+  fetch("/api/admin/list-batches", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    var batches = d.batches || [];
+    if (batches.length === 0) {
+      res.className = "tool-result ok";
+      res.textContent = "No import batches found.";
+    } else {
+      var msg = batches.length + " batch(es):\n";
+      batches.forEach(function(b) {
+        msg += "\n" + b.batch_id + " (" + b.records + " records, " + b.earliest.slice(0,10) + ")";
+      });
+      res.className = "tool-result ok";
+      res.style.whiteSpace = "pre-wrap";
+      res.textContent = msg;
+    }
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function exportMegXLSX() {
+  fetch("/api/admin/subscriptions-meg-xlsx", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(res) {
+    if (!res.ok) throw new Error("Meg XLSX endpoint not yet deployed. Push backend first.");
+    return res.blob();
+  }).then(function(blob) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "mm-meg-format.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+  }).catch(function(err) {
+    alert(err.message || "Failed to export Meg format XLSX.");
+  });
+}
 
 function doBackfillConversions() {
   if (!confirm("Backfill converted_at on historical subscribers?")) return;
