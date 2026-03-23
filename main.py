@@ -45,6 +45,7 @@ APPLE_VENDOR_NUMBER = os.environ.get("APPLE_VENDOR_NUMBER", "")
 # ymove API (Session 17)
 YMOVE_API_KEY = os.environ.get("YMOVE_API_KEY", "")
 YMOVE_API_BASE = "https://v6-beta-api.ymove.app"
+YMOVE_SITE_ID = "75"  # Movement & Miles site ID (from Tosh, S19)
 
 # --- Database ---
 db_pool = None
@@ -2084,35 +2085,42 @@ async def admin_ymove_log(request: Request):
 
 @app.post("/api/admin/ymove-verify")
 async def ymove_verify(request: Request):
-    """Verify emails against ymove API to check active subscription status.
-    Body: {"email": "single@ex.com"} or {"emails": [...]} or {"discover": true}
-    Custom batching: {"emails": [...], "batch_size": 10, "delay_seconds": 2}
-    Override endpoint: {"emails": [...], "endpoint": "/api/v1/members"}"""
+    """Verify emails against ymove Member Lookup API (S19 rewrite).
+    Modes:
+      {"smoke_test": true} - test API connectivity with Meg's email
+      {"email": "single@ex.com"} - look up one email
+      {"emails": [...]} - batch lookup with rate limiting
+      {"pull_all_subscribed": true} - pull ALL active members, cross-ref our cancelled subs
+    """
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
 
     ymove_key = YMOVE_API_KEY
     if not ymove_key:
         return JSONResponse(status_code=500, content={
-            "error": "YMOVE_API_KEY not set in environment variables. Add it to Railway."
+            "error": "YMOVE_API_KEY not set in environment variables."
         })
 
     body = await request.json()
 
-    # Discovery mode: try common endpoint patterns
-    if body.get("discover"):
+    # Smoke test mode
+    if body.get("smoke_test"):
         test_email = body.get("email", "takacsmeghan@gmail.com")
-        return await _ymove_discover(ymove_key, test_email)
+        return await _ymove_smoke_test(ymove_key, test_email)
 
+    # Pull all subscribed members and cross-reference
+    if body.get("pull_all_subscribed"):
+        return await _ymove_pull_all_subscribed(ymove_key)
+
+    # Single or batch email lookup
     emails = body.get("emails", [])
     if not emails and body.get("email"):
         emails = [body["email"]]
     if not emails:
-        return JSONResponse(status_code=400, content={"error": "Provide email or emails list"})
+        return JSONResponse(status_code=400, content={
+            "error": "Provide email, emails, smoke_test, or pull_all_subscribed"
+        })
 
-    endpoint = body.get("endpoint", "/api/v1/members")
-    auth_header = body.get("auth_header", "x-api-key")
-    email_param = body.get("email_param", "email")
     batch_size = min(body.get("batch_size", 10), 50)
     delay_seconds = max(body.get("delay_seconds", 1.5), 0.5)
 
@@ -2128,9 +2136,9 @@ async def ymove_verify(request: Request):
                 total_delay += delay_seconds
             try:
                 resp = await client.get(
-                    f"{YMOVE_API_BASE}{endpoint}",
-                    headers={auth_header: ymove_key},
-                    params={email_param: email}
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": ymove_key},
+                    params={"email": email.strip().lower()}
                 )
                 if resp.status_code == 429:
                     rate_limit_hits += 1
@@ -2139,113 +2147,193 @@ async def ymove_verify(request: Request):
                     await asyncio.sleep(retry_after)
                     total_delay += retry_after
                     resp = await client.get(
-                        f"{YMOVE_API_BASE}{endpoint}",
-                        headers={auth_header: ymove_key},
-                        params={email_param: email}
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": ymove_key},
+                        params={"email": email.strip().lower()}
                     )
                 if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {"raw_text": resp.text[:500]}
+                    data = resp.json()
                     status = _ymove_parse_status(data)
                     results.append({"email": email, "status": status, "raw": data})
                 elif resp.status_code == 404:
                     results.append({"email": email, "status": "not_found", "raw": None})
                 else:
-                    results.append({"email": email, "status": "error", "http_status": resp.status_code, "raw": resp.text[:300]})
+                    results.append({
+                        "email": email, "status": "error",
+                        "http_status": resp.status_code, "raw": resp.text[:300]
+                    })
                     errors += 1
             except Exception as e:
                 results.append({"email": email, "status": "error", "error": str(e)})
                 errors += 1
 
     active_count = sum(1 for r in results if r["status"] == "active")
-    cancelled_count = sum(1 for r in results if r["status"] in ("cancelled", "canceled", "expired", "inactive"))
+    expired_count = sum(1 for r in results if r["status"] == "expired")
     not_found_count = sum(1 for r in results if r["status"] == "not_found")
-    unknown_count = sum(1 for r in results if r["status"] == "unknown")
 
     return {
         "total": len(emails), "verified": len(results),
-        "active": active_count, "cancelled": cancelled_count,
-        "not_found": not_found_count, "unknown": unknown_count,
-        "errors": errors, "rate_limit_hits": rate_limit_hits,
+        "active": active_count, "expired": expired_count,
+        "not_found": not_found_count, "errors": errors,
+        "rate_limit_hits": rate_limit_hits,
         "total_delay_seconds": round(total_delay, 1),
-        "endpoint_used": endpoint, "results": results
+        "results": results
     }
 
 
-async def _ymove_discover(api_key: str, test_email: str) -> dict:
-    """Try common ymove API endpoint patterns to discover the correct format."""
-    patterns = [
-        {"path": "/api/v1/members", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/api/members", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/api/v1/members/lookup", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/api/v1/users", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/api/members/search", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/api/v1/members", "params": {"email": test_email}, "header": "Authorization"},
-        {"path": "/api/v1/subscriptions", "params": {"email": test_email}, "header": "x-api-key"},
-        {"path": "/members", "params": {"email": test_email}, "header": "x-api-key"},
-    ]
-    results = []
+async def _ymove_smoke_test(api_key: str, test_email: str) -> dict:
+    """Quick connectivity test against ymove member-lookup with siteId 75."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for p in patterns:
+        try:
+            url = f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup"
+            resp = await client.get(
+                url,
+                headers={"X-Authorization": api_key},
+                params={"email": test_email}
+            )
             try:
-                headers = {}
-                if p["header"] == "Authorization":
-                    headers["Authorization"] = f"Bearer {api_key}"
-                else:
-                    headers[p["header"]] = api_key
+                body = resp.json()
+            except Exception:
+                body = resp.text[:500]
+            return {
+                "status": "smoke_test_complete",
+                "test_email": test_email,
+                "http_status": resp.status_code,
+                "api_url": url,
+                "response": body,
+                "success": resp.status_code == 200,
+                "next_step": "If success, try {\"pull_all_subscribed\": true} to cross-ref candidates"
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+
+async def _ymove_pull_all_subscribed(api_key: str) -> dict:
+    """Pull all subscribed members from ymove paginated API, cross-ref with our cancelled Apple/Google subs."""
+    if not db_pool:
+        return {"error": "No database connected"}
+
+    # Step 1: Pull all subscribed members page by page
+    all_members = []
+    page = 1
+    total_pages = None
+    rate_limit_hits = 0
+    last_data = {}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        while True:
+            try:
                 resp = await client.get(
-                    f"{YMOVE_API_BASE}{p['path']}",
-                    headers=headers, params=p["params"]
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                    headers={"X-Authorization": api_key},
+                    params={"status": "subscribed", "page": str(page)}
                 )
-                body_preview = resp.text[:500] if resp.text else "(empty)"
-                results.append({
-                    "pattern": f"GET {p['path']}?email=...",
-                    "auth": p["header"], "status": resp.status_code,
-                    "body_preview": body_preview,
-                    "promising": resp.status_code in (200, 401, 403),
-                })
-                await asyncio.sleep(0.5)
+                if resp.status_code == 429:
+                    rate_limit_hits += 1
+                    retry_after = float(resp.headers.get("retry-after", "5"))
+                    print(f"[ymove] Rate limited on page {page}, backing off {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                if resp.status_code != 200:
+                    return {
+                        "error": f"ymove API returned {resp.status_code} on page {page}",
+                        "body": resp.text[:500],
+                        "members_so_far": len(all_members)
+                    }
+                last_data = resp.json()
+                users = last_data.get("users", [])
+                all_members.extend(users)
+                total_pages = last_data.get("totalPages", 1)
+                print(f"[ymove] Page {page}/{total_pages}: {len(users)} members (total: {len(all_members)})")
+                if page >= total_pages:
+                    break
+                page += 1
+                await asyncio.sleep(1.0)
             except Exception as e:
-                results.append({"pattern": f"GET {p['path']}?email=...", "status": "error", "error": str(e), "promising": False})
+                return {"error": f"Failed on page {page}: {str(e)}", "members_so_far": len(all_members)}
+
+    # Step 2: Build lookup of ymove active emails
+    ymove_active = {}
+    for m in all_members:
+        email = (m.get("email") or "").strip().lower()
+        if email:
+            ymove_active[email] = {
+                "provider": m.get("subscriptionProvider"),
+                "plan_id": m.get("activeSubscriptionPlanID"),
+                "first_name": m.get("firstName"),
+                "last_name": m.get("lastName"),
+                "signup_date": m.get("signupDate"),
+            }
+
+    # Step 3: Cross-ref with our cancelled Apple/Google subs
+    async with db_pool.acquire() as conn:
+        cancelled_rows = await conn.fetch("""
+            SELECT DISTINCT ON (lower(email))
+                id, lower(email) as em, source, status, canceled_at, created_at,
+                stripe_subscription_id, first_name, last_name
+            FROM subscriptions
+            WHERE status = 'canceled' AND source IN ('apple', 'google') AND email != ''
+            ORDER BY lower(email), created_at DESC
+        """)
+        active_emails = set(r["em"] for r in await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing')"
+        ))
+
+    # Step 4: Categorize
+    reactivation_candidates = []
+    already_active = 0
+    confirmed_cancelled = 0
+
+    for row in cancelled_rows:
+        email = row["em"]
+        if email in active_emails:
+            already_active += 1
+            continue
+        if email in ymove_active:
+            ym = ymove_active[email]
+            reactivation_candidates.append({
+                "email": email,
+                "db_source": row["source"],
+                "db_sub_id": row["stripe_subscription_id"],
+                "db_canceled_at": str(row["canceled_at"] or ""),
+                "ymove_provider": ym["provider"],
+                "ymove_plan_id": ym["plan_id"],
+                "ymove_first_name": ym["first_name"],
+                "ymove_last_name": ym["last_name"],
+            })
+        else:
+            confirmed_cancelled += 1
+
+    reactivation_candidates.sort(key=lambda x: x["email"])
+    react_emails = [c["email"] for c in reactivation_candidates]
+
     return {
-        "status": "discovery_complete", "test_email": test_email,
-        "api_base": YMOVE_API_BASE, "patterns_tried": len(results),
-        "promising_patterns": len([r for r in results if r.get("promising")]),
-        "results": results,
-        "next_step": "Look for 200 responses. Then call with working endpoint path in body."
+        "ymove_total_subscribed": last_data.get("total", len(all_members)),
+        "ymove_pages_fetched": page,
+        "ymove_unique_emails": len(ymove_active),
+        "our_cancelled_apple_google": len(cancelled_rows),
+        "already_active_in_db": already_active,
+        "reactivation_candidates": len(reactivation_candidates),
+        "confirmed_cancelled_in_ymove_too": confirmed_cancelled,
+        "rate_limit_hits": rate_limit_hits,
+        "candidates": reactivation_candidates,
+        "candidate_emails": react_emails,
+        "next_step": f"Review {len(reactivation_candidates)} candidates, then POST /api/admin/ymove-reactivate with emails list (preview first)"
     }
 
 
-def _ymove_parse_status(data) -> str:
-    """Parse ymove API response to determine subscription status."""
-    if isinstance(data, list):
-        if len(data) == 0:
-            return "not_found"
-        data = data[0]
+def _ymove_parse_status(data: dict) -> str:
+    """Parse ymove member-lookup response. Format: {found: bool, user: {activeSubscription: bool, ...}}"""
     if not isinstance(data, dict):
         return "unknown"
-    for field in ["status", "subscriptionStatus", "subscription_status", "state", "memberStatus"]:
-        val = data.get(field, "")
-        if isinstance(val, str):
-            val_lower = val.lower()
-            if val_lower in ("active", "subscribed", "trialing"):
-                return "active"
-            if val_lower in ("cancelled", "canceled", "expired", "revoked", "inactive", "churned"):
-                return "cancelled"
-    for field in ["active", "isActive", "is_active"]:
-        val = data.get(field)
-        if val is True:
-            return "active"
-        if val is False:
-            return "cancelled"
-    sub = data.get("subscription") or data.get("subscriptions")
-    if isinstance(sub, dict):
-        return _ymove_parse_status(sub)
-    if isinstance(sub, list) and len(sub) > 0:
-        return _ymove_parse_status(sub[0])
-    return "unknown"
+    if not data.get("found"):
+        return "not_found"
+    user = data.get("user", {})
+    if user.get("activeSubscription") is True:
+        return "active"
+    if user.get("previouslySubscribed") is True:
+        return "expired"
+    return "not_found"
 
 
 @app.post("/api/admin/ymove-reactivate")
@@ -4038,7 +4126,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "18.3.0",
+        "version": "19.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
