@@ -2387,6 +2387,61 @@ async def ymove_reactivate(request: Request):
     }
 
 
+@app.post("/api/admin/ymove-deactivate")
+async def ymove_deactivate(request: Request):
+    """Deactivate subs confirmed expired by ymove API verification (S19).
+    Body: {"emails": [...], "preview": true/false}
+    Only deactivates Apple/Google source subs marked active."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    emails = body.get("emails", [])
+    if not emails:
+        return JSONResponse(status_code=400, content={"error": "Provide emails list"})
+
+    batch_id = body.get("batch_id", f"ymove_deact_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
+    preview = body.get("preview", True)
+
+    async with db_pool.acquire() as conn:
+        deactivated = 0
+        skipped = 0
+        details = []
+        for email in emails:
+            email_lower = email.strip().lower()
+            row = await conn.fetchrow("""
+                SELECT id, stripe_subscription_id, source, status, plan_amount
+                FROM subscriptions
+                WHERE lower(email) = $1 AND status IN ('active', 'trialing') AND source IN ('apple', 'google')
+                ORDER BY created_at DESC LIMIT 1
+            """, email_lower)
+            if not row:
+                skipped += 1
+                details.append({"email": email_lower, "action": "skipped", "reason": "no active apple/google sub"})
+                continue
+            if preview:
+                details.append({"email": email_lower, "action": "would_deactivate", "sub_id": row["stripe_subscription_id"], "source": row["source"], "plan_amount": row["plan_amount"]})
+                deactivated += 1
+            else:
+                await conn.execute("""
+                    UPDATE subscriptions
+                    SET status = 'canceled', canceled_at = NOW(), updated_at = NOW(), import_batch = $1
+                    WHERE id = $2
+                """, batch_id, row["id"])
+                deactivated += 1
+                details.append({"email": email_lower, "action": "deactivated", "sub_id": row["stripe_subscription_id"], "source": row["source"]})
+
+    return {
+        "status": "preview" if preview else "ok",
+        "batch_id": batch_id if not preview else None,
+        "deactivated": deactivated, "skipped": skipped,
+        "total_emails": len(emails), "details": details,
+        "next_step": "Set preview: false to execute" if preview else f"Revert with POST /api/admin/revert-batch batch_id={batch_id}"
+    }
+
+
 @app.post("/api/admin/send-test-digest")
 async def send_test_digest(request: Request):
     """Manually trigger a daily digest email (for testing)."""
@@ -4126,7 +4181,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "19.0.0",
+        "version": "19.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
