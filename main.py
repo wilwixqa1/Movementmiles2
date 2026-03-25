@@ -2939,6 +2939,167 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
     }
 
 
+@app.post("/api/admin/ymove-import-new")
+async def ymove_import_new(request: Request):
+    """Import new Apple/Google subscribers discovered by shadow sync.
+    Takes emails, verifies each against ymove to get provider, creates records.
+    Body: {"emails": [...], "preview": true/false, "skip_test_accounts": true}
+    """
+    import hashlib
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    body = await request.json()
+    emails = body.get("emails", [])
+    if not emails:
+        return JSONResponse(status_code=400, content={"error": "Provide emails list"})
+
+    preview = body.get("preview", True)
+    skip_test = body.get("skip_test_accounts", True)
+
+    # Filter test accounts
+    test_domains = ["ymove.app"]
+    test_patterns = ["test", "dsfg", "asdf", "qwer"]
+    filtered_emails = []
+    skipped_test = []
+    for email in emails:
+        em = email.strip().lower()
+        if not em or "@" not in em:
+            continue
+        domain = em.split("@")[-1]
+        local = em.split("@")[0]
+        is_test = False
+        if skip_test:
+            if domain in test_domains:
+                is_test = True
+            for pat in test_patterns:
+                if pat in local:
+                    is_test = True
+                    break
+        if is_test:
+            skipped_test.append(em)
+        else:
+            filtered_emails.append(em)
+
+    # Check which emails already have active Apple/Google subs (skip those)
+    async with db_pool.acquire() as conn:
+        active_ag_rows = await conn.fetch(
+            "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing') AND source IN ('apple', 'google')"
+        )
+    active_ag_emails = set(r["em"] for r in active_ag_rows)
+
+    new_emails = [e for e in filtered_emails if e not in active_ag_emails]
+    already_known = [e for e in filtered_emails if e in active_ag_emails]
+
+    # Verify against ymove to get provider and confirm active
+    verified = []
+    not_active = []
+    verify_errors = []
+    batch_size = 10
+    delay_seconds = 1.5
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for i, email in enumerate(new_emails):
+            if i > 0 and i % batch_size == 0:
+                await asyncio.sleep(delay_seconds)
+            try:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": YMOVE_API_KEY},
+                    params={"email": email}
+                )
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("retry-after", "5"))
+                    await asyncio.sleep(retry_after)
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"email": email}
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status = _ymove_parse_status(data)
+                    if status == "active":
+                        # Try to determine provider from response
+                        user_data = data.get("user", {})
+                        provider = (user_data.get("subscriptionProvider") or
+                                    user_data.get("provider") or "apple").lower()
+                        if provider not in ("apple", "google"):
+                            provider = "apple"
+                        verified.append({"email": email, "provider": provider, "raw": user_data})
+                    else:
+                        not_active.append({"email": email, "status": status})
+                else:
+                    verify_errors.append({"email": email, "http_status": resp.status_code})
+            except Exception as e:
+                verify_errors.append({"email": email, "error": str(e)})
+
+    if preview:
+        by_provider = {}
+        for v in verified:
+            p = v["provider"]
+            by_provider[p] = by_provider.get(p, 0) + 1
+        return {
+            "status": "preview",
+            "total_input": len(emails),
+            "skipped_test_accounts": len(skipped_test),
+            "already_active_apple_google": len(already_known),
+            "new_to_verify": len(new_emails),
+            "verified_active": len(verified),
+            "not_active": len(not_active),
+            "verify_errors": len(verify_errors),
+            "by_provider": by_provider,
+            "would_import": len(verified),
+            "est_mrr_impact_cents": len(verified) * 1999,
+            "verified_sample": [{"email": v["email"], "provider": v["provider"]} for v in verified[:30]],
+            "skipped_test_sample": skipped_test[:10],
+            "not_active_sample": not_active[:10],
+            "already_known_sample": already_known[:10],
+            "note": "Send preview: false to create Apple/Google records for verified-active emails."
+        }
+
+    # Create records
+    batch_id = f"ymove_import_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    imported = 0
+    errors = 0
+
+    async with db_pool.acquire() as conn:
+        for v in verified:
+            email = v["email"]
+            provider = v["provider"]
+            email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+            syn_id = f"ymove_new_{provider}_{email_hash}"
+            try:
+                await conn.execute("""
+                    INSERT INTO subscriptions (
+                        stripe_customer_id, stripe_subscription_id, email, status,
+                        plan_interval, plan_amount, currency, source,
+                        created_at, updated_at, import_batch
+                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """, syn_id, email, provider, batch_id)
+                imported += 1
+            except Exception as e:
+                print(f"[ymove import] Error for {email}: {e}")
+                errors += 1
+
+    return {
+        "status": "ok",
+        "batch_id": batch_id,
+        "imported": imported,
+        "errors": errors,
+        "skipped_test_accounts": len(skipped_test),
+        "already_active_apple_google": len(already_known),
+        "not_active_in_ymove": len(not_active),
+        "est_mrr_added_cents": imported * 1999,
+        "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}"
+    }
+
+
 @app.post("/api/admin/send-test-digest")
 async def send_test_digest(request: Request):
     """Manually trigger a daily digest email (for testing)."""
@@ -4678,7 +4839,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "20.1.0",
+        "version": "20.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
