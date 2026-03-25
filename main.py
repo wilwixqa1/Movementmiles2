@@ -2540,7 +2540,8 @@ async def ymove_shadow_sync(request: Request):
             result["summary"] = {
                 "to_deactivate": len(res_data.get("to_deactivate", [])),
                 "to_reactivate": len(res_data.get("to_reactivate", [])),
-                "cross_platform": len(res_data.get("cross_platform", [])),
+                "cross_platform_switchers": len(res_data.get("cross_platform_switchers", [])),
+                "active_stripe_in_ymove": res_data.get("active_stripe_in_ymove", 0),
                 "truly_new": len(res_data.get("truly_new", [])),
                 "unchanged": res_data.get("unchanged", 0),
                 "not_found": res_data.get("not_found_in_ymove", 0),
@@ -2564,7 +2565,8 @@ async def ymove_shadow_sync(request: Request):
             "ymove_active_count": run["ymove_active_count"],
             "to_deactivate": res_data.get("to_deactivate", []),
             "to_reactivate": res_data.get("to_reactivate", []),
-            "cross_platform": res_data.get("cross_platform", []),
+            "cross_platform_switchers": res_data.get("cross_platform_switchers", []),
+            "active_stripe_in_ymove": res_data.get("active_stripe_in_ymove", 0),
             "truly_new": res_data.get("truly_new", []),
             "unchanged": res_data.get("unchanged", 0),
             "not_found_in_ymove": res_data.get("not_found_in_ymove", 0),
@@ -2755,10 +2757,16 @@ async def _run_shadow_sync(run_id: int):
                 "UPDATE ymove_sync_runs SET phase = 'computing_diff', ymove_active_count = $1 WHERE id = $2",
                 len(ymove_all_emails), run_id
             )
+            # Query active Stripe emails to separate from cross-platform switchers
+            active_stripe_rows = await conn.fetch(
+                "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing') AND source = 'stripe'"
+            )
+        active_stripe_emails = set(r["em"] for r in active_stripe_rows)
 
         to_deactivate = []
         to_reactivate = []
-        cross_platform = []
+        cross_platform_switchers = []  # Cancelled Stripe, now active on Apple/Google
+        active_stripe_in_ymove = 0     # Active Stripe users ymove also tracks (no action)
         truly_new = []
         unchanged = 0
         not_found = 0
@@ -2796,8 +2804,12 @@ async def _run_shadow_sync(run_id: int):
                         "source": row["source"],
                         "db_id": row["id"],
                     })
+                elif email in active_stripe_emails:
+                    # Active Stripe sub, ymove just tracks them too. No action needed.
+                    active_stripe_in_ymove += 1
                 elif email in all_known_emails:
-                    cross_platform.append({"email": email})
+                    # Known email but no active sub of any kind. Real cross-platform switcher.
+                    cross_platform_switchers.append({"email": email})
                 else:
                     truly_new.append({"email": email})
 
@@ -2805,7 +2817,8 @@ async def _run_shadow_sync(run_id: int):
         results = {
             "to_deactivate": to_deactivate,
             "to_reactivate": to_reactivate,
-            "cross_platform": cross_platform,
+            "cross_platform_switchers": cross_platform_switchers,
+            "active_stripe_in_ymove": active_stripe_in_ymove,
             "truly_new": truly_new,
             "unchanged": unchanged,
             "not_found_in_ymove": not_found,
@@ -2830,8 +2843,8 @@ async def _run_shadow_sync(run_id: int):
 
         print(f"[Shadow Sync] Run {run_id} COMPLETED. "
               f"Deactivate: {len(to_deactivate)}, Reactivate: {len(to_reactivate)}, "
-              f"Cross-platform: {len(cross_platform)}, New: {len(truly_new)}, "
-              f"Unchanged: {unchanged}, Not found: {not_found}")
+              f"Switchers: {len(cross_platform_switchers)}, Stripe-in-ymove: {active_stripe_in_ymove}, "
+              f"New: {len(truly_new)}, Unchanged: {unchanged}, Not found: {not_found}")
 
     except Exception as e:
         print(f"[Shadow Sync] Run {run_id} FAILED: {e}")
@@ -2853,7 +2866,8 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
 
     to_deactivate = results.get("to_deactivate", [])
     to_reactivate = results.get("to_reactivate", [])
-    cross_platform = results.get("cross_platform", [])
+    cross_platform_switchers = results.get("cross_platform_switchers", [])
+    active_stripe_in_ymove = results.get("active_stripe_in_ymove", 0)
     truly_new = results.get("truly_new", [])
 
     if preview:
@@ -2864,16 +2878,17 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
             "batch_id": batch_id,
             "would_deactivate": len(to_deactivate),
             "would_reactivate": len(to_reactivate),
-            "cross_platform_found": len(cross_platform),
+            "cross_platform_switchers": len(cross_platform_switchers),
+            "active_stripe_in_ymove": active_stripe_in_ymove,
             "truly_new_found": len(truly_new),
             "mrr_impact_deactivate_cents": -deact_mrr,
             "mrr_impact_reactivate_cents": react_mrr,
             "net_mrr_impact_cents": react_mrr - deact_mrr,
             "deactivate_sample": to_deactivate[:25],
             "reactivate_sample": to_reactivate[:25],
-            "cross_platform_sample": cross_platform[:25],
+            "switcher_sample": cross_platform_switchers[:25],
             "truly_new_sample": truly_new[:25],
-            "note": "Send preview: false to execute deactivations and reactivations. Cross-platform and new subscribers are NOT auto-applied (require manual import)."
+            "note": "Send preview: false to execute deactivations and reactivations. Switchers and new subscribers are NOT auto-applied (require manual review/import)."
         }
 
     deactivated = 0
@@ -2914,12 +2929,13 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
         "batch_id": batch_id,
         "deactivated": deactivated,
         "reactivated": reactivated,
-        "cross_platform_found": len(cross_platform),
+        "cross_platform_switchers": len(cross_platform_switchers),
+        "active_stripe_in_ymove": active_stripe_in_ymove,
         "truly_new_found": len(truly_new),
         "errors": errors,
         "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}",
         "note": f"Applied {deactivated} deactivations, {reactivated} reactivations. "
-                f"{len(cross_platform)} cross-platform and {len(truly_new)} new subscribers NOT auto-applied."
+                f"{len(cross_platform_switchers)} switchers and {len(truly_new)} new subscribers NOT auto-applied (need manual review)."
     }
 
 
@@ -4662,7 +4678,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "20.0.0",
+        "version": "20.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
