@@ -187,6 +187,21 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ymove_sync_runs (
+                        id SERIAL PRIMARY KEY,
+                        status TEXT DEFAULT 'running',
+                        started_at TIMESTAMPTZ DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ,
+                        phase TEXT DEFAULT 'init',
+                        progress_current INTEGER DEFAULT 0,
+                        progress_total INTEGER DEFAULT 0,
+                        our_active_count INTEGER DEFAULT 0,
+                        ymove_active_count INTEGER DEFAULT 0,
+                        results JSONB,
+                        error TEXT
+                    )
+                """)
             print("[Startup] Block 3: Analytics tables ready")
 
             # Block 4: Indexes (non-blocking, failure will not kill startup)
@@ -2442,6 +2457,472 @@ async def ymove_deactivate(request: Request):
     }
 
 
+# --- Session 20: ymove Shadow Sync ---
+
+_active_sync_task = None  # Track running sync task
+
+
+@app.post("/api/admin/ymove-shadow-sync")
+async def ymove_shadow_sync(request: Request):
+    """Shadow sync: pull ymove data, compute diff, optionally apply.
+    Actions:
+      run    - Start background sync task
+      status - Check progress of running/latest sync
+      diff   - Get categorized diff from latest completed sync
+      apply  - Apply diff changes with batch_id (preview/confirm)
+    """
+    global _active_sync_task
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    body = await request.json()
+    action = body.get("action", "status")
+
+    if action == "run":
+        # Check for already running sync
+        async with db_pool.acquire() as conn:
+            running = await conn.fetchrow(
+                "SELECT id, started_at FROM ymove_sync_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
+            )
+            if running:
+                age_minutes = (datetime.now(timezone.utc) - running["started_at"]).total_seconds() / 60
+                # Auto-expire stuck runs after 30 minutes
+                if age_minutes > 30:
+                    await conn.execute(
+                        "UPDATE ymove_sync_runs SET status = 'failed', error = 'Timed out after 30 minutes', completed_at = NOW() WHERE id = $1",
+                        running["id"]
+                    )
+                else:
+                    return {"status": "already_running", "run_id": running["id"],
+                            "running_for_minutes": round(age_minutes, 1),
+                            "hint": "Use action: status to check progress"}
+
+            # Create new run record
+            run_id = await conn.fetchval(
+                "INSERT INTO ymove_sync_runs (status, phase) VALUES ('running', 'init') RETURNING id"
+            )
+
+        # Launch background task
+        _active_sync_task = asyncio.create_task(_run_shadow_sync(run_id))
+        return {"status": "started", "run_id": run_id, "hint": "Poll with action: status (every 10-15s)"}
+
+    elif action == "status":
+        async with db_pool.acquire() as conn:
+            run = await conn.fetchrow(
+                "SELECT * FROM ymove_sync_runs ORDER BY started_at DESC LIMIT 1"
+            )
+        if not run:
+            return {"status": "no_runs", "hint": "Start with action: run"}
+
+        pct = ""
+        if run["progress_total"] and run["progress_total"] > 0:
+            pct = f" ({round(run['progress_current'] / run['progress_total'] * 100)}%)"
+
+        result = {
+            "run_id": run["id"],
+            "status": run["status"],
+            "phase": run["phase"],
+            "progress": f"{run['progress_current']}/{run['progress_total']}{pct}" if run["progress_total"] else "initializing",
+            "started_at": str(run["started_at"]),
+            "completed_at": str(run["completed_at"]) if run["completed_at"] else None,
+            "our_active_count": run["our_active_count"],
+            "ymove_active_count": run["ymove_active_count"],
+        }
+        if run["error"]:
+            result["error"] = run["error"]
+        # Include summary if completed
+        if run["status"] == "completed" and run["results"]:
+            res_data = run["results"] if isinstance(run["results"], dict) else json.loads(run["results"])
+            result["summary"] = {
+                "to_deactivate": len(res_data.get("to_deactivate", [])),
+                "to_reactivate": len(res_data.get("to_reactivate", [])),
+                "cross_platform": len(res_data.get("cross_platform", [])),
+                "truly_new": len(res_data.get("truly_new", [])),
+                "unchanged": res_data.get("unchanged", 0),
+                "not_found": res_data.get("not_found_in_ymove", 0),
+                "pull_all_status": res_data.get("pull_all_status", "unknown"),
+            }
+        return result
+
+    elif action == "diff":
+        async with db_pool.acquire() as conn:
+            run = await conn.fetchrow(
+                "SELECT * FROM ymove_sync_runs WHERE status = 'completed' ORDER BY started_at DESC LIMIT 1"
+            )
+        if not run:
+            return {"status": "no_completed_runs", "hint": "Start with action: run, wait for completion"}
+
+        res_data = run["results"] if isinstance(run["results"], dict) else json.loads(run["results"])
+        return {
+            "run_id": run["id"],
+            "completed_at": str(run["completed_at"]),
+            "our_active_count": run["our_active_count"],
+            "ymove_active_count": run["ymove_active_count"],
+            "to_deactivate": res_data.get("to_deactivate", []),
+            "to_reactivate": res_data.get("to_reactivate", []),
+            "cross_platform": res_data.get("cross_platform", []),
+            "truly_new": res_data.get("truly_new", []),
+            "unchanged": res_data.get("unchanged", 0),
+            "not_found_in_ymove": res_data.get("not_found_in_ymove", 0),
+            "errors": res_data.get("errors", 0),
+            "pull_all_status": res_data.get("pull_all_status", "unknown"),
+            "pull_all_emails_found": res_data.get("pull_all_emails_found", 0),
+            "verified_count": res_data.get("verified_count", 0),
+        }
+
+    elif action == "apply":
+        preview = body.get("preview", True)
+        async with db_pool.acquire() as conn:
+            run = await conn.fetchrow(
+                "SELECT * FROM ymove_sync_runs WHERE status = 'completed' ORDER BY started_at DESC LIMIT 1"
+            )
+        if not run:
+            return {"status": "no_completed_runs", "hint": "Run a sync first"}
+
+        res_data = run["results"] if isinstance(run["results"], dict) else json.loads(run["results"])
+        return await _apply_shadow_sync(res_data, preview, run["id"])
+
+    else:
+        return JSONResponse(status_code=400, content={
+            "error": f"Unknown action: {action}. Use run, status, diff, or apply."
+        })
+
+
+async def _run_shadow_sync(run_id: int):
+    """Background task: verify active Apple/Google emails + best-effort pull_all from ymove."""
+    try:
+        print(f"[Shadow Sync] Run {run_id} starting...")
+
+        # --- Gather our DB state ---
+        async with db_pool.acquire() as conn:
+            # All our active Apple/Google subs with email
+            our_active = await conn.fetch(
+                """SELECT id, lower(email) as email, source, stripe_subscription_id, plan_amount, plan_interval
+                   FROM subscriptions
+                   WHERE status IN ('active', 'trialing') AND source IN ('apple', 'google')
+                   AND email != '' AND email IS NOT NULL
+                   ORDER BY email"""
+            )
+            # All cancelled Apple/Google subs (most recent per email, for reactivation)
+            our_cancelled_ag = await conn.fetch(
+                """SELECT DISTINCT ON (lower(email))
+                   id, lower(email) as email, source, stripe_subscription_id
+                   FROM subscriptions
+                   WHERE status = 'canceled' AND source IN ('apple', 'google')
+                   AND email != '' AND email IS NOT NULL
+                   ORDER BY lower(email), created_at DESC"""
+            )
+            # All known emails across all sources/statuses
+            all_known_rows = await conn.fetch(
+                "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND email IS NOT NULL"
+            )
+
+        our_active_emails = [r["email"] for r in our_active]
+        our_active_set = set(our_active_emails)
+        our_active_lookup = {r["email"]: r for r in our_active}
+        our_cancelled_ag_map = {r["email"]: r for r in our_cancelled_ag if r["email"] not in our_active_set}
+        all_known_emails = set(r["em"] for r in all_known_rows)
+
+        total_to_verify = len(our_active_emails)
+        print(f"[Shadow Sync] {total_to_verify} active Apple/Google emails to verify, {len(our_cancelled_ag_map)} cancelled AG candidates")
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ymove_sync_runs SET phase = 'verify_existing', progress_total = $1, our_active_count = $2 WHERE id = $3",
+                total_to_verify, total_to_verify, run_id
+            )
+
+        # --- Phase 1: Verify all active Apple/Google emails against ymove ---
+        verify_results = {}
+        batch_size = 10
+        delay_seconds = 1.5
+        processed = 0
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for i, email in enumerate(our_active_emails):
+                if i > 0 and i % batch_size == 0:
+                    await asyncio.sleep(delay_seconds)
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"email": email}
+                    )
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "5"))
+                        print(f"[Shadow Sync] Rate limited at {email}, backing off {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        resp = await client.get(
+                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                            headers={"X-Authorization": YMOVE_API_KEY},
+                            params={"email": email}
+                        )
+                    if resp.status_code == 200:
+                        verify_results[email] = _ymove_parse_status(resp.json())
+                    elif resp.status_code == 404:
+                        verify_results[email] = "not_found"
+                    else:
+                        verify_results[email] = "error"
+                except Exception as e:
+                    verify_results[email] = "error"
+                    print(f"[Shadow Sync] Verify error for {email}: {e}")
+
+                processed += 1
+                if processed % 50 == 0:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE ymove_sync_runs SET progress_current = $1 WHERE id = $2",
+                            processed, run_id
+                        )
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ymove_sync_runs SET progress_current = $1, phase = 'pull_all' WHERE id = $2",
+                processed, run_id
+            )
+
+        print(f"[Shadow Sync] Phase 1 done: verified {processed} emails")
+
+        # --- Phase 2: Best-effort pull all subscribed members ---
+        ymove_all_emails = set()
+        pull_all_status = "starting"
+        pull_all_pages = 0
+        total_pages_est = 0
+
+        try:
+            page = 1
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                while True:
+                    try:
+                        resp = await client.get(
+                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                            headers={"X-Authorization": YMOVE_API_KEY},
+                            params={"status": "subscribed", "page": str(page)}
+                        )
+                    except httpx.TimeoutException:
+                        print(f"[Shadow Sync] Timeout on pull_all page {page}")
+                        pull_all_status = f"timeout_page_{page}"
+                        break
+
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "5"))
+                        print(f"[Shadow Sync] Rate limited on pull_all page {page}, backing off {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    if resp.status_code != 200:
+                        pull_all_status = f"error_page_{page}_http_{resp.status_code}"
+                        print(f"[Shadow Sync] pull_all error: HTTP {resp.status_code} on page {page}")
+                        break
+
+                    data = resp.json()
+                    users = data.get("users", [])
+                    for u in users:
+                        em = (u.get("email") or "").strip().lower()
+                        if em:
+                            ymove_all_emails.add(em)
+
+                    total_pages_est = data.get("totalPages", 1)
+                    pull_all_pages = page
+
+                    if page >= total_pages_est:
+                        pull_all_status = "success"
+                        break
+
+                    page += 1
+                    await asyncio.sleep(1.0)
+
+                    # Update progress every 50 pages
+                    if page % 50 == 0:
+                        async with db_pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE ymove_sync_runs SET phase = $1 WHERE id = $2",
+                                f"pull_all_page_{page}_of_{total_pages_est}", run_id
+                            )
+        except Exception as e:
+            pull_all_status = f"error: {str(e)[:200]}"
+            print(f"[Shadow Sync] pull_all exception: {e}")
+
+        print(f"[Shadow Sync] Phase 2 done: pull_all_status={pull_all_status}, found {len(ymove_all_emails)} emails across {pull_all_pages} pages")
+
+        # --- Phase 3: Compute diff ---
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ymove_sync_runs SET phase = 'computing_diff', ymove_active_count = $1 WHERE id = $2",
+                len(ymove_all_emails), run_id
+            )
+
+        to_deactivate = []
+        to_reactivate = []
+        cross_platform = []
+        truly_new = []
+        unchanged = 0
+        not_found = 0
+        verify_errors = 0
+
+        # Categorize our active subs based on ymove verification
+        for email, ymove_status in verify_results.items():
+            if ymove_status == "active":
+                unchanged += 1
+            elif ymove_status == "expired":
+                r = our_active_lookup.get(email)
+                if r:
+                    to_deactivate.append({
+                        "email": email,
+                        "sub_id": r["stripe_subscription_id"],
+                        "source": r["source"],
+                        "plan_amount": r["plan_amount"],
+                        "db_id": r["id"],
+                    })
+            elif ymove_status == "not_found":
+                not_found += 1
+            else:
+                verify_errors += 1
+
+        # Categorize ymove subscribers we don't have as active
+        if pull_all_status == "success":
+            for email in ymove_all_emails:
+                if email in our_active_set:
+                    continue
+                if email in our_cancelled_ag_map:
+                    row = our_cancelled_ag_map[email]
+                    to_reactivate.append({
+                        "email": email,
+                        "sub_id": row["stripe_subscription_id"],
+                        "source": row["source"],
+                        "db_id": row["id"],
+                    })
+                elif email in all_known_emails:
+                    cross_platform.append({"email": email})
+                else:
+                    truly_new.append({"email": email})
+
+        # Build final results
+        results = {
+            "to_deactivate": to_deactivate,
+            "to_reactivate": to_reactivate,
+            "cross_platform": cross_platform,
+            "truly_new": truly_new,
+            "unchanged": unchanged,
+            "not_found_in_ymove": not_found,
+            "errors": verify_errors,
+            "pull_all_status": pull_all_status,
+            "pull_all_pages": pull_all_pages,
+            "pull_all_total_pages": total_pages_est,
+            "pull_all_emails_found": len(ymove_all_emails),
+            "verified_count": len(verify_results),
+        }
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE ymove_sync_runs SET
+                   status = 'completed', phase = 'done', completed_at = NOW(),
+                   progress_current = $1, results = $2,
+                   ymove_active_count = $3
+                   WHERE id = $4""",
+                processed, json.dumps(results, default=str),
+                len(ymove_all_emails), run_id
+            )
+
+        print(f"[Shadow Sync] Run {run_id} COMPLETED. "
+              f"Deactivate: {len(to_deactivate)}, Reactivate: {len(to_reactivate)}, "
+              f"Cross-platform: {len(cross_platform)}, New: {len(truly_new)}, "
+              f"Unchanged: {unchanged}, Not found: {not_found}")
+
+    except Exception as e:
+        print(f"[Shadow Sync] Run {run_id} FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE ymove_sync_runs SET status = 'failed', error = $1, completed_at = NOW() WHERE id = $2",
+                    str(e)[:500], run_id
+                )
+        except Exception:
+            pass
+
+
+async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
+    """Apply shadow sync diff: deactivate expired, reactivate confirmed active."""
+    batch_id = f"shadow_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    to_deactivate = results.get("to_deactivate", [])
+    to_reactivate = results.get("to_reactivate", [])
+    cross_platform = results.get("cross_platform", [])
+    truly_new = results.get("truly_new", [])
+
+    if preview:
+        deact_mrr = sum(r.get("plan_amount", 1999) for r in to_deactivate)
+        react_mrr = len(to_reactivate) * 1999
+        return {
+            "status": "preview",
+            "batch_id": batch_id,
+            "would_deactivate": len(to_deactivate),
+            "would_reactivate": len(to_reactivate),
+            "cross_platform_found": len(cross_platform),
+            "truly_new_found": len(truly_new),
+            "mrr_impact_deactivate_cents": -deact_mrr,
+            "mrr_impact_reactivate_cents": react_mrr,
+            "net_mrr_impact_cents": react_mrr - deact_mrr,
+            "deactivate_sample": to_deactivate[:25],
+            "reactivate_sample": to_reactivate[:25],
+            "cross_platform_sample": cross_platform[:25],
+            "truly_new_sample": truly_new[:25],
+            "note": "Send preview: false to execute deactivations and reactivations. Cross-platform and new subscribers are NOT auto-applied (require manual import)."
+        }
+
+    deactivated = 0
+    reactivated = 0
+    errors = 0
+
+    async with db_pool.acquire() as conn:
+        for item in to_deactivate:
+            try:
+                result = await conn.execute(
+                    """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                       updated_at = NOW(), import_batch = $1
+                       WHERE id = $2 AND status IN ('active', 'trialing')""",
+                    batch_id, item["db_id"]
+                )
+                if result and result.endswith("1"):
+                    deactivated += 1
+            except Exception as e:
+                print(f"[Shadow Sync Apply] Deactivate error {item.get('email')}: {e}")
+                errors += 1
+
+        for item in to_reactivate:
+            try:
+                result = await conn.execute(
+                    """UPDATE subscriptions SET status = 'active', canceled_at = NULL,
+                       updated_at = NOW(), import_batch = $1
+                       WHERE id = $2 AND status = 'canceled'""",
+                    batch_id, item["db_id"]
+                )
+                if result and result.endswith("1"):
+                    reactivated += 1
+            except Exception as e:
+                print(f"[Shadow Sync Apply] Reactivate error {item.get('email')}: {e}")
+                errors += 1
+
+    return {
+        "status": "applied",
+        "batch_id": batch_id,
+        "deactivated": deactivated,
+        "reactivated": reactivated,
+        "cross_platform_found": len(cross_platform),
+        "truly_new_found": len(truly_new),
+        "errors": errors,
+        "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}",
+        "note": f"Applied {deactivated} deactivations, {reactivated} reactivations. "
+                f"{len(cross_platform)} cross-platform and {len(truly_new)} new subscribers NOT auto-applied."
+    }
+
+
 @app.post("/api/admin/send-test-digest")
 async def send_test_digest(request: Request):
     """Manually trigger a daily digest email (for testing)."""
@@ -4181,7 +4662,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "19.1.0",
+        "version": "20.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
