@@ -233,8 +233,17 @@ async def startup():
                 id="daily_digest",
                 replace_existing=True,
             )
+            # S20: Daily shadow sync at 8:00 AM ET (1 hour before digest)
+            if YMOVE_API_KEY:
+                scheduler.add_job(
+                    run_daily_shadow_sync,
+                    CronTrigger(hour=8, minute=0, timezone=et),
+                    id="daily_shadow_sync",
+                    replace_existing=True,
+                )
             scheduler.start()
-            print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS})")
+            ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
+            print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg})")
         except Exception as e:
             print(f"Scheduler startup error: {e}")
     else:
@@ -3100,6 +3109,75 @@ async def ymove_import_new(request: Request):
     }
 
 
+async def run_daily_shadow_sync():
+    """Automated daily shadow sync: verify all Apple/Google against ymove, auto-apply safe changes."""
+    print(f"[Daily Sync] Starting automated shadow sync at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
+    try:
+        if not db_pool or not YMOVE_API_KEY:
+            print("[Daily Sync] Skipped: missing db_pool or YMOVE_API_KEY")
+            return
+
+        # Check for already running sync
+        async with db_pool.acquire() as conn:
+            running = await conn.fetchrow(
+                "SELECT id, started_at FROM ymove_sync_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
+            )
+            if running:
+                age_minutes = (datetime.now(timezone.utc) - running["started_at"]).total_seconds() / 60
+                if age_minutes > 30:
+                    await conn.execute(
+                        "UPDATE ymove_sync_runs SET status = 'failed', error = 'Timed out after 30 minutes', completed_at = NOW() WHERE id = $1",
+                        running["id"]
+                    )
+                else:
+                    print(f"[Daily Sync] Skipped: sync already running (id={running['id']}, {round(age_minutes,1)}m)")
+                    return
+
+            # Create run record
+            run_id = await conn.fetchval(
+                "INSERT INTO ymove_sync_runs (status, phase) VALUES ('running', 'init') RETURNING id"
+            )
+
+        # Run the sync (same function as manual trigger)
+        await _run_shadow_sync(run_id)
+
+        # Wait briefly for completion to be written
+        await asyncio.sleep(2)
+
+        # Auto-apply safe changes (deactivations + reactivations only)
+        async with db_pool.acquire() as conn:
+            run = await conn.fetchrow(
+                "SELECT * FROM ymove_sync_runs WHERE id = $1", run_id
+            )
+
+        if run and run["status"] == "completed" and run["results"]:
+            res_data = run["results"] if isinstance(run["results"], dict) else json.loads(run["results"])
+            to_deactivate = res_data.get("to_deactivate", [])
+            to_reactivate = res_data.get("to_reactivate", [])
+            switchers = len(res_data.get("cross_platform_switchers", []))
+            truly_new = len(res_data.get("truly_new", []))
+
+            if to_deactivate or to_reactivate:
+                apply_result = await _apply_shadow_sync(res_data, False, run_id)
+                print(f"[Daily Sync] Auto-applied: {apply_result.get('deactivated', 0)} deactivated, "
+                      f"{apply_result.get('reactivated', 0)} reactivated, "
+                      f"batch_id={apply_result.get('batch_id', 'n/a')}")
+            else:
+                print("[Daily Sync] No changes to apply. Database is in sync.")
+
+            if switchers > 0 or truly_new > 0:
+                print(f"[Daily Sync] Note: {switchers} cross-platform switchers and {truly_new} truly new subs found but NOT auto-imported. Review manually.")
+        else:
+            status = run["status"] if run else "unknown"
+            error = run.get("error", "") if run else ""
+            print(f"[Daily Sync] Sync did not complete successfully. Status: {status}, Error: {error}")
+
+    except Exception as e:
+        print(f"[Daily Sync] Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 @app.post("/api/admin/send-test-digest")
 async def send_test_digest(request: Request):
     """Manually trigger a daily digest email (for testing)."""
@@ -4836,14 +4914,17 @@ async def health():
     db_status = "connected" if db_pool else "not connected"
     stripe_status = "configured" if STRIPE_SECRET_KEY else "not configured"
     digest_status = "active" if (RESEND_API_KEY and DIGEST_RECIPIENTS and scheduler) else "disabled"
+    shadow_sync_status = "active" if (YMOVE_API_KEY and scheduler) else "disabled"
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "20.2.0",
+        "version": "20.3.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
         "digest_recipients": DIGEST_RECIPIENTS if DIGEST_RECIPIENTS else "none",
+        "daily_shadow_sync": shadow_sync_status,
+        "shadow_sync_schedule": "8:00 AM ET daily" if shadow_sync_status == "active" else "disabled",
     }
 
 
