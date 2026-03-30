@@ -130,6 +130,10 @@ async def startup():
                 # S17: store names directly on subscriptions
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS first_name TEXT")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_name TEXT")
+                # S21: UTM attribution from ymove meta parameters
+                for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source']:
+                    await conn.execute(f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS utm_meta_raw JSONB")
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
                         id SERIAL PRIMARY KEY,
@@ -1160,6 +1164,108 @@ async def ymove_webhook(request: Request):
     return {"status": "ok", "processed": event_type, "email": email}
 
 
+async def _ymove_lookup_utm(email: str, ymove_user_id: str = "") -> dict:
+    """S21: Query ymove Member Lookup API for a user's meta parameters (UTM attribution).
+    Returns dict with extracted UTM fields + raw meta response.
+    Tosh confirmed: new checkout (ymove.app/join/movementandmiles) stores UTM params
+    in the user's meta field. Only applies to Stripe signups (Apple/Google go through
+    app stores which strip UTMs)."""
+    result = {"found": False, "utm": {}, "raw_meta": None}
+    if not YMOVE_API_KEY or not email:
+        return result
+
+    UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source',
+                'utm_id', 'gclid', 'fbclid', 'ttclid', 'msclkid', 'twclid', 'ref', 'referrer']
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                headers={"X-Authorization": YMOVE_API_KEY},
+                params={"email": email.strip().lower()}
+            )
+            if resp.status_code != 200:
+                print(f"[ymove-utm] Lookup failed for {email}: HTTP {resp.status_code}")
+                return result
+
+            data = resp.json()
+            if not data.get("found"):
+                print(f"[ymove-utm] User not found: {email}")
+                return result
+
+            user = data.get("user", {})
+            result["found"] = True
+
+            # Extract meta parameters -- try common field names
+            meta = user.get("meta") or user.get("metadata") or user.get("metaParameters") or user.get("params") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+
+            result["raw_meta"] = meta
+            print(f"[ymove-utm] Raw meta for {email}: {json.dumps(meta, default=str)[:500]}")
+
+            # Extract known UTM fields
+            if isinstance(meta, dict):
+                for key in UTM_KEYS:
+                    val = meta.get(key, "")
+                    if val:
+                        result["utm"][key] = str(val)
+
+            # Also check top-level user fields in case meta is nested differently
+            for key in UTM_KEYS:
+                if key not in result["utm"]:
+                    val = user.get(key, "")
+                    if val:
+                        result["utm"][key] = str(val)
+
+            if result["utm"]:
+                print(f"[ymove-utm] Found UTMs for {email}: {result['utm']}")
+            else:
+                print(f"[ymove-utm] No UTM data found for {email} (meta keys: {list(meta.keys()) if isinstance(meta, dict) else 'not a dict'})")
+
+    except Exception as e:
+        print(f"[ymove-utm] Lookup error for {email}: {e}")
+
+    return result
+
+
+async def _store_utm_on_subscription(conn, stripe_sub_id: str, utm_result: dict):
+    """S21: Store UTM attribution data on a subscription record."""
+    utm = utm_result.get("utm", {})
+    raw_meta = utm_result.get("raw_meta")
+
+    if not utm and not raw_meta:
+        return
+
+    try:
+        await conn.execute("""
+            UPDATE subscriptions SET
+                utm_source = COALESCE(NULLIF($1, ''), utm_source),
+                utm_medium = COALESCE(NULLIF($2, ''), utm_medium),
+                utm_campaign = COALESCE(NULLIF($3, ''), utm_campaign),
+                utm_term = COALESCE(NULLIF($4, ''), utm_term),
+                utm_content = COALESCE(NULLIF($5, ''), utm_content),
+                ym_source = COALESCE(NULLIF($6, ''), ym_source),
+                utm_meta_raw = $7,
+                updated_at = NOW()
+            WHERE stripe_subscription_id = $8
+        """,
+            utm.get("utm_source", ""),
+            utm.get("utm_medium", ""),
+            utm.get("utm_campaign", ""),
+            utm.get("utm_term", ""),
+            utm.get("utm_content", ""),
+            utm.get("ym_source", ""),
+            json.dumps(raw_meta, default=str) if raw_meta else None,
+            stripe_sub_id
+        )
+        print(f"[ymove-utm] Stored UTM data on sub {stripe_sub_id}")
+    except Exception as e:
+        print(f"[ymove-utm] Store error for {stripe_sub_id}: {e}")
+
+
 async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_id: str, provider: str, first_name: str = "", last_name: str = ""):
     """Process subscriptionCreated from ymove."""
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -1208,6 +1314,15 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                         pass
             except Exception as e:
                 print(f"[ymove] Stripe email attach error: {e}")
+
+        # S21: Look up UTM attribution from ymove meta parameters
+        if email:
+            try:
+                utm_result = await _ymove_lookup_utm(email, ymove_user_id)
+                if utm_result["found"]:
+                    await _store_utm_on_subscription(conn, stripe_sub_id, utm_result)
+            except Exception as e:
+                print(f"[ymove-utm] Attribution lookup error: {e}")
 
     elif provider == "apple":
         # Apple subs: ymove is our PRIMARY source (no direct Apple webhook connected)
@@ -4918,7 +5033,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "20.3.0",
+        "version": "21.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
