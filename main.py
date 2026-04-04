@@ -615,32 +615,22 @@ async def chat(req: ChatRequest):
 
 @app.post("/api/lead")
 async def save_lead(lead: LeadRequest):
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)""",
-                    lead.first_name, lead.email, lead.experience_level,
-                    lead.goals, lead.referral_source, lead.recommended_plan, lead.extra,
-                    lead.utm_source, lead.utm_medium, lead.utm_campaign,
-                    lead.utm_term, lead.utm_content, lead.ym_source
-                )
-            return {"status": "saved", "storage": "postgres"}
-        except Exception as e:
-            print(f"DB lead save error: {e}")
-    # Fallback to JSON
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="Database not connected")
     try:
-        leads = []
-        if os.path.exists("leads.json"):
-            with open("leads.json", "r") as f:
-                leads = json.load(f)
-        leads.append(lead.dict())
-        with open("leads.json", "w") as f:
-            json.dump(leads, f, indent=2)
-        return {"status": "saved", "storage": "json"}
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO leads (first_name, email, experience_level, goals, referral_source, recommended_plan, extra, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)""",
+                lead.first_name, lead.email, lead.experience_level,
+                lead.goals, lead.referral_source, lead.recommended_plan, lead.extra,
+                lead.utm_source, lead.utm_medium, lead.utm_campaign,
+                lead.utm_term, lead.utm_content, lead.ym_source
+            )
+        return {"status": "saved", "storage": "postgres"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"DB lead save error: {e}")
+        raise HTTPException(status_code=500, detail=f"Lead save failed: {str(e)}")
 
 
 # Page view tracking
@@ -820,360 +810,54 @@ async def stripe_webhook(request: Request):
     return {"status": "ok"}
 
 
-# --- Apple App Store Server Notifications v2 ---
+# --- Apple App Store Server Notifications v2 (STUBBED S22) ---
+# Full handler preserved in git history (commit d51fae9, pre-S22 cleanup).
+# ymove receives Apple webhooks and forwards to /webhooks/ymove.
+# Endpoint kept alive so Apple doesn't 404 if it ever sends here directly.
 
 @app.post("/webhooks/apple")
 async def apple_webhook(request: Request):
-    """
-    Apple sends JWS (JSON Web Signature) signed payloads.
-    We decode the payload to extract notification type and transaction info.
-    Full JWS signature verification can be added later with PyJWT + Apple root certs.
-    """
-
+    """Stub: Apple webhooks are received by ymove, not directly."""
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    signed_payload = body.get("signedPayload", "")
-    if not signed_payload:
-        raise HTTPException(status_code=400, detail="Missing signedPayload")
-
-    # Decode JWS payload (header.payload.signature â we want the middle part)
-    try:
-        parts = signed_payload.split(".")
-        if len(parts) != 3:
-            raise ValueError("Invalid JWS format")
-        # Base64url decode the payload
-        payload_b64 = parts[1]
-        # Add padding if needed
-        padding = 4 - len(payload_b64) % 4
-        if padding != 4:
-            payload_b64 += "=" * padding
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        notification = json.loads(payload_bytes)
-    except Exception as e:
-        print(f"Apple JWS decode error: {e}")
-        raise HTTPException(status_code=400, detail="Failed to decode payload")
-
-    notification_type = notification.get("notificationType", "")
-    subtype = notification.get("subtype", "")
-
-    # Decode the signed transaction info
-    transaction_info = {}
-    signed_transaction = notification.get("data", {}).get("signedTransactionInfo", "")
-    if signed_transaction:
+        body = {}
+    if db_pool:
         try:
-            t_parts = signed_transaction.split(".")
-            if len(t_parts) == 3:
-                t_b64 = t_parts[1]
-                t_padding = 4 - len(t_b64) % 4
-                if t_padding != 4:
-                    t_b64 += "=" * t_padding
-                transaction_info = json.loads(base64.urlsafe_b64decode(t_b64))
-        except Exception as e:
-            print(f"Apple transaction decode error: {e}")
-
-    # Decode renewal info
-    renewal_info = {}
-    signed_renewal = notification.get("data", {}).get("signedRenewalInfo", "")
-    if signed_renewal:
-        try:
-            r_parts = signed_renewal.split(".")
-            if len(r_parts) == 3:
-                r_b64 = r_parts[1]
-                r_padding = 4 - len(r_b64) % 4
-                if r_padding != 4:
-                    r_b64 += "=" * r_padding
-                renewal_info = json.loads(base64.urlsafe_b64decode(r_b64))
-        except Exception as e:
-            print(f"Apple renewal decode error: {e}")
-
-    original_transaction_id = transaction_info.get("originalTransactionId", "")
-    product_id = transaction_info.get("productId", "")
-
-    # Map Apple notification types to our status
-    status_map = {
-        "SUBSCRIBED": "active",
-        "DID_RENEW": "active",
-        "DID_CHANGE_RENEWAL_STATUS": "active",  # could be turning off auto-renew
-        "EXPIRED": "canceled",
-        "DID_FAIL_TO_RENEW": "past_due",
-        "GRACE_PERIOD_EXPIRED": "canceled",
-        "REFUND": "canceled",
-        "REVOKE": "canceled",
-        "CONSUMPTION_REQUEST": "active",
-    }
-    status = status_map.get(notification_type, "active")
-    if notification_type == "DID_CHANGE_RENEWAL_STATUS" and subtype == "AUTO_RENEW_DISABLED":
-        status = "canceled"
-
-    # Determine plan from product ID
-    plan_interval = "month"
-    plan_amount = 1999  # $19.99 default
-    if product_id:
-        pid_lower = product_id.lower()
-        if "annual" in pid_lower or "year" in pid_lower:
-            plan_interval = "year"
-            plan_amount = 17999  # $179.99
-
-    if not db_pool or not original_transaction_id:
-        return {"status": "ok"}
-
-    async with db_pool.acquire() as conn:
-        # Store event
-        event_id = f"apple_{notification_type}_{original_transaction_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        try:
-            await conn.execute(
-                """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_customer_id, stripe_subscription_id, source, data)
-                   VALUES ($1, $2, $3, $4, 'apple', $5)
-                   ON CONFLICT (stripe_event_id) DO NOTHING""",
-                event_id,
-                f"apple.{notification_type}",
-                "",
-                original_transaction_id,
-                json.dumps({"notification": notification_type, "subtype": subtype, "product_id": product_id, "transaction": transaction_info})
-            )
-        except Exception as e:
-            print(f"Apple event store error: {e}")
-
-        # Upsert subscription
-        try:
-            expires_ms = transaction_info.get("expiresDate", 0)
-            purchase_ms = transaction_info.get("purchaseDate", 0)
-
-
-            await conn.execute("""
-                INSERT INTO subscriptions (
-                    stripe_customer_id, stripe_subscription_id, email, status,
-                    plan_interval, plan_amount, currency, source,
-                    current_period_start, current_period_end,
-                    canceled_at, updated_at
-                ) VALUES ('', $1, '', $2, $3, $4, 'usd', 'apple', $5, $6, $7, NOW())
-                ON CONFLICT (stripe_subscription_id) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    plan_interval = EXCLUDED.plan_interval,
-                    plan_amount = EXCLUDED.plan_amount,
-                    current_period_start = EXCLUDED.current_period_start,
-                    current_period_end = EXCLUDED.current_period_end,
-                    canceled_at = EXCLUDED.canceled_at,
-                    updated_at = NOW()
-            """,
-                original_transaction_id, status,
-                plan_interval, plan_amount,
-                _ms_to_dt(purchase_ms), _ms_to_dt(expires_ms),
-                _ms_to_dt(expires_ms) if status == "canceled" else None
-            )
-        except Exception as e:
-            print(f"Apple subscription upsert error: {e}")
-
-        # Session 11: Assign readable_id if not yet set
-        try:
-            existing = await conn.fetchrow(
-                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
-                original_transaction_id
-            )
-            if existing and not existing["readable_id"]:
-                rid = await assign_readable_id(conn, "apple")
+            async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
-                    rid, original_transaction_id
+                    "INSERT INTO ymove_webhook_log (event_type, payload) VALUES ($1, $2)",
+                    "apple.direct_stub", json.dumps(body, default=str)
                 )
-        except Exception as e:
-            print(f"Apple readable ID error: {e}")
-
-        # Session 11: Track renewals on DID_RENEW
-        if notification_type == "DID_RENEW":
-            try:
-                await conn.execute(
-                    """UPDATE subscriptions SET
-                       renewal_count = COALESCE(renewal_count, 0) + 1,
-                       last_renewed_at = NOW()
-                       WHERE stripe_subscription_id = $1""",
-                    original_transaction_id
-                )
-            except Exception:
-                pass
-
-        # Apple trial-to-paid: DID_RENEW after SUBSCRIBED = converted
-        if notification_type == "DID_RENEW":
-            try:
-                await conn.execute(
-                    """UPDATE subscriptions SET converted_at = NOW()
-                       WHERE stripe_subscription_id = $1 AND converted_at IS NULL
-                       AND trial_start IS NOT NULL""",
-                    original_transaction_id
-                )
-            except Exception:
-                pass
-
-    return {"status": "ok"}
+        except Exception:
+            pass
+    print(f"[Apple webhook] Received (stubbed): {json.dumps(body, default=str)[:200]}")
+    return {"status": "ok", "note": "stubbed - ymove handles Apple webhooks"}
 
 
-# --- Google Play Real-Time Developer Notifications ---
+# --- Google Play Real-Time Developer Notifications (STUBBED S22) ---
+# Full handler preserved in git history (commit d51fae9, pre-S22 cleanup).
+# ymove receives Google webhooks and forwards to /webhooks/ymove.
+# Endpoint kept alive so Google doesn't 404 if it ever sends here directly.
 
 @app.post("/webhooks/google")
 async def google_webhook(request: Request):
-    """
-    Google sends RTDN via Cloud Pub/Sub push subscription.
-    The payload contains a base64-encoded subscription notification.
-    Full verification via Google Play Developer API can be added later.
-    """
-
+    """Stub: Google webhooks are received by ymove, not directly."""
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Google Pub/Sub wraps the message
-    message = body.get("message", {})
-    data_b64 = message.get("data", "")
-
-    if not data_b64:
-        # Might be a direct notification format
-        data_b64 = body.get("data", "")
-
-    if not data_b64:
-        return {"status": "ok", "note": "no data"}
-
-    # Decode the notification
-    try:
-        padding = 4 - len(data_b64) % 4
-        if padding != 4:
-            data_b64 += "=" * padding
-        notification = json.loads(base64.b64decode(data_b64))
-    except Exception as e:
-        print(f"Google RTDN decode error: {e}")
-        raise HTTPException(status_code=400, detail="Failed to decode notification")
-
-    package_name = notification.get("packageName", "")
-    sub_notification = notification.get("subscriptionNotification", {})
-
-    if not sub_notification:
-        # Might be a one-time purchase or test notification
-        print(f"Google non-subscription notification: {notification}")
-        return {"status": "ok"}
-
-    notification_type = sub_notification.get("notificationType", 0)
-    purchase_token = sub_notification.get("purchaseToken", "")
-    subscription_id = sub_notification.get("subscriptionId", "")
-
-    # Map Google notification types to our status
-    # https://developer.android.com/google/play/billing/rtdn-reference
-    google_type_map = {
-        1: ("google.RECOVERED", "active"),           # SUBSCRIPTION_RECOVERED
-        2: ("google.RENEWED", "active"),              # SUBSCRIPTION_RENEWED
-        3: ("google.CANCELED", "canceled"),            # SUBSCRIPTION_CANCELED
-        4: ("google.PURCHASED", "active"),             # SUBSCRIPTION_PURCHASED
-        5: ("google.ON_HOLD", "past_due"),             # SUBSCRIPTION_ON_HOLD
-        6: ("google.IN_GRACE_PERIOD", "past_due"),     # SUBSCRIPTION_IN_GRACE_PERIOD
-        7: ("google.RESTARTED", "active"),             # SUBSCRIPTION_RESTARTED
-        8: ("google.PRICE_CHANGE_CONFIRMED", "active"),# SUBSCRIPTION_PRICE_CHANGE_CONFIRMED
-        9: ("google.DEFERRED", "active"),              # SUBSCRIPTION_DEFERRED
-        10: ("google.PAUSED", "canceled"),             # SUBSCRIPTION_PAUSED
-        11: ("google.PAUSE_SCHEDULE_CHANGED", "active"),
-        12: ("google.REVOKED", "canceled"),            # SUBSCRIPTION_REVOKED
-        13: ("google.EXPIRED", "canceled"),            # SUBSCRIPTION_EXPIRED
-        20: ("google.PENDING_PURCHASE_CANCELED", "canceled"),
-    }
-
-    event_name, status = google_type_map.get(notification_type, (f"google.UNKNOWN_{notification_type}", "active"))
-
-    # Determine plan from subscription ID
-    plan_interval = "month"
-    plan_amount = 1999
-    if subscription_id:
-        sid_lower = subscription_id.lower()
-        if "annual" in sid_lower or "year" in sid_lower:
-            plan_interval = "year"
-            plan_amount = 17999
-
-    # Use purchase_token as the unique ID (truncate if very long)
-    external_id = f"gp_{purchase_token[:80]}" if purchase_token else ""
-
-    if not db_pool or not external_id:
-        return {"status": "ok"}
-
-    async with db_pool.acquire() as conn:
-        # Store event
-        event_id = f"google_{notification_type}_{purchase_token[:40]}_{int(datetime.now(timezone.utc).timestamp())}"
+        body = {}
+    if db_pool:
         try:
-            await conn.execute(
-                """INSERT INTO subscription_events (stripe_event_id, event_type, stripe_customer_id, stripe_subscription_id, source, data)
-                   VALUES ($1, $2, $3, $4, 'google', $5)
-                   ON CONFLICT (stripe_event_id) DO NOTHING""",
-                event_id,
-                event_name,
-                "",
-                external_id,
-                json.dumps({"notification_type": notification_type, "subscription_id": subscription_id, "package": package_name})
-            )
-        except Exception as e:
-            print(f"Google event store error: {e}")
-
-        # Upsert subscription
-        try:
-            await conn.execute("""
-                INSERT INTO subscriptions (
-                    stripe_customer_id, stripe_subscription_id, email, status,
-                    plan_interval, plan_amount, currency, source,
-                    updated_at
-                ) VALUES ('', $1, '', $2, $3, $4, 'usd', 'google', NOW())
-                ON CONFLICT (stripe_subscription_id) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    plan_interval = EXCLUDED.plan_interval,
-                    plan_amount = EXCLUDED.plan_amount,
-                    canceled_at = CASE WHEN EXCLUDED.status = 'canceled' THEN NOW() ELSE subscriptions.canceled_at END,
-                    updated_at = NOW()
-            """,
-                external_id, status,
-                plan_interval, plan_amount
-            )
-        except Exception as e:
-            print(f"Google subscription upsert error: {e}")
-
-        # Session 11: Assign readable_id if not yet set
-        try:
-            existing = await conn.fetchrow(
-                "SELECT readable_id FROM subscriptions WHERE stripe_subscription_id = $1",
-                external_id
-            )
-            if existing and not existing["readable_id"]:
-                rid = await assign_readable_id(conn, "google")
+            async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE subscriptions SET readable_id = $1 WHERE stripe_subscription_id = $2",
-                    rid, external_id
+                    "INSERT INTO ymove_webhook_log (event_type, payload) VALUES ($1, $2)",
+                    "google.direct_stub", json.dumps(body, default=str)
                 )
-        except Exception as e:
-            print(f"Google readable ID error: {e}")
-
-        # Session 11: Track renewals on RENEWED (2) or RECOVERED (1)
-        if notification_type in (1, 2):
-            try:
-                await conn.execute(
-                    """UPDATE subscriptions SET
-                       renewal_count = COALESCE(renewal_count, 0) + 1,
-                       last_renewed_at = NOW()
-                       WHERE stripe_subscription_id = $1""",
-                    external_id
-                )
-            except Exception:
-                pass
-
-        # Session 11: Google trial-to-paid conversion
-        # RENEWED (type 2) or RECOVERED (type 1) after initial purchase = likely converted
-        if notification_type in (1, 2):
-            try:
-                await conn.execute(
-                    """UPDATE subscriptions SET converted_at = NOW()
-                       WHERE stripe_subscription_id = $1 AND converted_at IS NULL
-                       AND trial_start IS NOT NULL""",
-                    external_id
-                )
-            except Exception:
-                pass
-
-    return {"status": "ok"}
+        except Exception:
+            pass
+    print(f"[Google webhook] Received (stubbed): {json.dumps(body, default=str)[:200]}")
+    return {"status": "ok", "note": "stubbed - ymove handles Google webhooks"}
 
 
 # --- ymove Webhook (Session 16 â Phase 2 Processor) ---
@@ -5049,7 +4733,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.1.0",
+        "version": "22.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
