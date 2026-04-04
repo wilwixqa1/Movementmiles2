@@ -13,6 +13,16 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import gzip
 import asyncio
+import base64
+import csv
+import io
+import hashlib
+import time
+from io import BytesIO
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import jwt as pyjwt
 
 app = FastAPI(title="Movement & Miles")
 
@@ -472,13 +482,77 @@ async def assign_readable_id(conn, source: str) -> str:
     return f"{prefix}-{num:04d}"
 
 
+# --- Shared Parse/Extract Helpers (S22: deduplicated from inline definitions) ---
+
+def _ts(v):
+    """Convert Unix timestamp to UTC datetime."""
+    if v:
+        return datetime.fromtimestamp(v, tz=timezone.utc)
+    return None
+
+
+def _ms_to_dt(ms):
+    """Convert millisecond timestamp to UTC datetime."""
+    if ms:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return None
+
+
+def _parse_iso(s):
+    """Parse ISO 8601 date string to datetime."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _find_col(row, options):
+    """Find a column value by trying multiple header name variants."""
+    for opt in options:
+        for key in row:
+            if key.strip().lower() == opt.lower():
+                return (row[key] or "").strip()
+    return ""
+
+
+def _get_email(row):
+    """Extract and normalize email from a row dict."""
+    for key in ["email", "e-mail", "email address"]:
+        if key in row and row[key] and "@" in row[key]:
+            return row[key].strip().lower()
+    return ""
+
+
+def _get_source(row, default="unknown"):
+    """Extract subscription source from a row dict."""
+    for key in ["source", "platform"]:
+        if key in row:
+            val = row[key].strip().lower()
+            if val in ("apple", "google", "stripe"):
+                return val
+    return default
+
+
+def _get_date(row):
+    """Parse a date from common column name variants."""
+    for key in ["date", "sign up date", "signup_date", "signup date", "created_at"]:
+        if key in row and row[key]:
+            val = row[key].strip()
+            for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d %H:%M:%S"]:
+                try:
+                    return datetime.strptime(val[:19], fmt).replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+    return None
+
+
 # --- Pydantic Models ---
 
 class ChatRequest(BaseModel):
     message: str
     history: list = []
-    source: str = "widget"
-    source: str = "widget"
     source: str = "widget"
 
 class ChatResponse(BaseModel):
@@ -661,10 +735,6 @@ async def stripe_webhook(request: Request):
                     pass
 
             # Convert timestamps
-            def ts(v):
-                if v:
-                    return datetime.fromtimestamp(v, tz=timezone.utc)
-                return None
 
             try:
                 await conn.execute("""
@@ -689,9 +759,9 @@ async def stripe_webhook(request: Request):
                 """,
                     customer_id, sub_id, email, status,
                     plan_interval, plan_amount, sub.get("currency", "usd"),
-                    ts(sub.get("trial_start")), ts(sub.get("trial_end")),
-                    ts(sub.get("current_period_start")), ts(sub.get("current_period_end")),
-                    ts(sub.get("canceled_at"))
+                    _ts(sub.get("trial_start")), _ts(sub.get("trial_end")),
+                    _ts(sub.get("current_period_start")), _ts(sub.get("current_period_end")),
+                    _ts(sub.get("canceled_at"))
                 )
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
@@ -759,7 +829,6 @@ async def apple_webhook(request: Request):
     We decode the payload to extract notification type and transaction info.
     Full JWS signature verification can be added later with PyJWT + Apple root certs.
     """
-    import base64
 
     try:
         body = await request.json()
@@ -873,10 +942,6 @@ async def apple_webhook(request: Request):
             expires_ms = transaction_info.get("expiresDate", 0)
             purchase_ms = transaction_info.get("purchaseDate", 0)
 
-            def ms_to_dt(ms):
-                if ms:
-                    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-                return None
 
             await conn.execute("""
                 INSERT INTO subscriptions (
@@ -896,8 +961,8 @@ async def apple_webhook(request: Request):
             """,
                 original_transaction_id, status,
                 plan_interval, plan_amount,
-                ms_to_dt(purchase_ms), ms_to_dt(expires_ms),
-                ms_to_dt(expires_ms) if status == "canceled" else None
+                _ms_to_dt(purchase_ms), _ms_to_dt(expires_ms),
+                _ms_to_dt(expires_ms) if status == "canceled" else None
             )
         except Exception as e:
             print(f"Apple subscription upsert error: {e}")
@@ -954,7 +1019,6 @@ async def google_webhook(request: Request):
     The payload contains a base64-encoded subscription notification.
     Full verification via Google Play Developer API can be added later.
     """
-    import base64
 
     try:
         body = await request.json()
@@ -1342,13 +1406,6 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             plan_amount = 17999
 
         # Parse ISO dates
-        def _parse_iso(s):
-            if not s:
-                return None
-            try:
-                return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                return None
 
         period_start = _parse_iso(start_str)
         period_end = _parse_iso(end_str)
@@ -1475,16 +1532,9 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             plan_interval = "year"
             plan_amount = 17999
 
-        def _parse_iso_g(s):
-            if not s:
-                return None
-            try:
-                return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                return None
 
-        period_start = _parse_iso_g(start_str)
-        period_end = _parse_iso_g(end_str)
+        period_start = _parse_iso(start_str)
+        period_end = _parse_iso(end_str)
 
         eid = f"ymove_created_{ym_uuid}_{now_ts}"
         try:
@@ -3077,7 +3127,6 @@ async def ymove_import_new(request: Request):
     Takes emails, verifies each against ymove to get provider, creates records.
     Body: {"emails": [...], "preview": true/false, "skip_test_accounts": true}
     """
-    import hashlib
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
     if not db_pool:
@@ -3385,12 +3434,8 @@ async def backfill_stripe(request: Request):
                 except Exception:
                     pass
 
-                def ts(v):
-                    if v:
-                        return datetime.fromtimestamp(v, tz=timezone.utc)
-                    return None
 
-                real_created = ts(sub.created) if hasattr(sub, 'created') else None
+                real_created = _ts(sub.created) if hasattr(sub, 'created') else None
 
                 async with db_pool.acquire() as conn:
                     await conn.execute("""
@@ -3416,9 +3461,9 @@ async def backfill_stripe(request: Request):
                     """,
                         customer_id, sub_id, email, status,
                         plan_interval, plan_amount, sub.currency or "usd",
-                        ts(sub.trial_start), ts(sub.trial_end),
-                        ts(sub.current_period_start), ts(sub.current_period_end),
-                        ts(sub.canceled_at), real_created
+                        _ts(sub.trial_start), _ts(sub.trial_end),
+                        _ts(sub.current_period_start), _ts(sub.current_period_end),
+                        _ts(sub.canceled_at), real_created
                     )
                 count += 1
             except Exception as e:
@@ -3460,10 +3505,6 @@ async def sync_trialing(request: Request):
                 results["still_trialing"] += 1
                 continue
 
-            def ts(v):
-                if v:
-                    return datetime.fromtimestamp(v, tz=timezone.utc)
-                return None
 
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -3475,9 +3516,9 @@ async def sync_trialing(request: Request):
                        updated_at = NOW()
                        WHERE id = $5""",
                     real_status,
-                    ts(real_sub.canceled_at),
-                    ts(real_sub.current_period_start),
-                    ts(real_sub.current_period_end),
+                    _ts(real_sub.canceled_at),
+                    _ts(real_sub.current_period_start),
+                    _ts(real_sub.current_period_end),
                     z["id"]
                 )
 
@@ -3578,19 +3619,11 @@ async def import_leads_csv(request: Request, file: UploadFile = File(...)):
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database connected")
 
-    import csv
-    import io
 
     contents = await file.read()
     text = contents.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
 
-    def find_col(row, options):
-        for opt in options:
-            for key in row:
-                if key.strip().lower() == opt.lower():
-                    return (row[key] or "").strip()
-        return ""
 
     async with db_pool.acquire() as conn:
         existing = await conn.fetch("SELECT DISTINCT lower(email) as em FROM leads WHERE email != ''")
@@ -3599,13 +3632,13 @@ async def import_leads_csv(request: Request, file: UploadFile = File(...)):
         imported = 0
         skipped = 0
         for row in reader:
-            email = find_col(row, ["email", "e-mail"])
+            email = _find_col(row, ["email", "e-mail"])
             if not email or email.lower() in existing_emails:
                 skipped += 1
                 continue
-            first_name = find_col(row, ["first_name", "first", "firstname", "first name"])
-            last_name = find_col(row, ["last_name", "last", "lastname", "last name"])
-            referral = find_col(row, ["source", "referral_source", "referral", "how_heard"])
+            first_name = _find_col(row, ["first_name", "first", "firstname", "first name"])
+            last_name = _find_col(row, ["last_name", "last", "lastname", "last name"])
+            referral = _find_col(row, ["source", "referral_source", "referral", "how_heard"])
 
             await conn.execute(
                 """INSERT INTO leads (first_name, email, extra, referral_source)
@@ -3621,9 +3654,6 @@ async def import_leads_csv(request: Request, file: UploadFile = File(...)):
 @app.post("/api/admin/import-subscribers-csv")
 async def import_subscribers_csv(request: Request, file: UploadFile = File(...)):
     """Import Apple/Google subscribers from CSV into subscriptions table."""
-    import csv as csv_mod
-    import io as io_mod
-    import hashlib
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -3632,14 +3662,8 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
 
     contents = await file.read()
     text = contents.decode("utf-8-sig")
-    reader = csv_mod.DictReader(io_mod.StringIO(text))
+    reader = csv.DictReader(io.StringIO(text))
 
-    def find_col(row, options):
-        for opt in options:
-            for key in row:
-                if key.strip().lower() == opt.lower():
-                    return (row[key] or "").strip()
-        return ""
 
     async with db_pool.acquire() as conn:
         existing = await conn.fetch("SELECT stripe_subscription_id FROM subscriptions")
@@ -3648,12 +3672,12 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
         imported = 0
         skipped = 0
         for row in reader:
-            email = find_col(row, ["email", "e-mail"])
+            email = _find_col(row, ["email", "e-mail"])
             if not email:
                 skipped += 1
                 continue
 
-            source_raw = find_col(row, ["source"]).lower()
+            source_raw = _find_col(row, ["source"]).lower()
             if source_raw == "google":
                 source = "google"
             else:
@@ -3666,7 +3690,7 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
                 skipped += 1
                 continue
 
-            date_str = find_col(row, ["date", "sign up date", "signup_date"])
+            date_str = _find_col(row, ["date", "sign up date", "signup_date"])
             period_start = None
             if date_str:
                 try:
@@ -3703,8 +3727,6 @@ async def import_subscribers_csv(request: Request, file: UploadFile = File(...))
 @app.post("/api/admin/reconcile-cancellations")
 async def reconcile_cancellations(request: Request, file: UploadFile = File(...)):
     """Upload CSV of cancelled emails. Matches against subscriptions and flips to canceled."""
-    import csv as csv_mod
-    import io as io_mod
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -3713,7 +3735,7 @@ async def reconcile_cancellations(request: Request, file: UploadFile = File(...)
 
     contents = await file.read()
     text = contents.decode("utf-8-sig")
-    reader = csv_mod.DictReader(io_mod.StringIO(text))
+    reader = csv.DictReader(io.StringIO(text))
 
     cancelled_emails = set()
     for row in reader:
@@ -3859,8 +3881,6 @@ async def backfill_readable_ids(request: Request):
 @app.get("/api/admin/subscriptions-csv")
 async def admin_subscriptions_csv(request: Request):
     """Export all subscribers (Stripe + Apple + Google) as CSV with lead attribution."""
-    import io as io_mod
-    import csv as csv_mod
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -3887,8 +3907,8 @@ async def admin_subscriptions_csv(request: Request):
 
     # readable_id now comes from DB (assigned persistently)
 
-    output = io_mod.StringIO()
-    writer = csv_mod.writer(output)
+    output = io.StringIO()
+    writer = csv.writer(output)
     writer.writerow([
         "readable_id", "email", "name", "source", "status",
         "plan", "signup_date",
@@ -3967,10 +3987,6 @@ async def admin_subscriptions_csv(request: Request):
 @app.get("/api/admin/subscriptions-xlsx")
 async def admin_subscriptions_xlsx(request: Request):
     """Export subscribers as multi-tab XLSX matching Meg spreadsheet layout."""
-    from io import BytesIO
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -4190,10 +4206,6 @@ async def admin_subscriptions_meg_xlsx(request: Request):
     Tab 3: Free Month Trial (headers) - First Name, Last Name, Email, Sign Up Date, Payment Type
     Tab 4: Downloaded & Offered Trial (headers) - First Name, Last Name, Email, Sign Up Date
     Tab 5: Cancelled Subscription (no headers) - first, last, email"""
-    from io import BytesIO
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -4343,8 +4355,6 @@ async def admin_subscriptions_meg_xlsx(request: Request):
 @app.get("/api/admin/user-journey-csv")
 async def admin_user_journey_csv(request: Request):
     """Export lead-to-subscriber journey: joins leads + subscriptions by email."""
-    import io as io_mod
-    import csv as csv_mod
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -4376,8 +4386,8 @@ async def admin_user_journey_csv(request: Request):
             ORDER BY l.created_at DESC
         """)
 
-    output = io_mod.StringIO()
-    writer = csv_mod.writer(output)
+    output = io.StringIO()
+    writer = csv.writer(output)
     writer.writerow([
         "email", "first_name",
         "lead_date", "utm_source", "utm_medium", "utm_campaign",
@@ -5016,8 +5026,6 @@ async def admin_leads_csv(request: Request):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM leads ORDER BY created_at DESC")
 
-    import io
-    import csv
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["id", "first_name", "email", "experience_level", "goals", "referral_source", "recommended_plan", "extra", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ym_source", "created_at"])
@@ -5041,7 +5049,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.0.0",
+        "version": "22.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
@@ -5115,7 +5123,6 @@ async def dedup_active(request: Request):
 async def import_meg_apple_google(request: Request, file: UploadFile = File(...)):
     """Import from Meg Apple & Google Members sheet (headerless: first,last,email,date,source).
     ?preview=true for dry run. All imports tagged with batch_id for revert."""
-    import hashlib
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -5126,8 +5133,6 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
     skip_reactivate = request.query_params.get("skip_reactivate", "false").lower() == "true"
     contents = await file.read()
 
-    from openpyxl import load_workbook
-    from io import BytesIO
     wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
 
     target_sheet = None
@@ -5276,8 +5281,6 @@ async def reactivation_candidates(request: Request, file: UploadFile = File(...)
         raise HTTPException(status_code=500, detail="No database connected")
 
     contents = await file.read()
-    from openpyxl import load_workbook
-    from io import BytesIO
     wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
 
     target_sheet = None
@@ -5704,9 +5707,6 @@ async def db_check(request: Request):
 @app.post("/api/admin/import-preview")
 async def import_preview(request: Request, file: UploadFile = File(...)):
     """Dry-run import: reads Excel/CSV, shows what would be imported vs skipped."""
-    import csv as csv_mod
-    import io as io_mod
-    import hashlib
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -5718,8 +5718,6 @@ async def import_preview(request: Request, file: UploadFile = File(...)):
 
     rows_to_check = []
     if filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
-        from openpyxl import load_workbook
-        from io import BytesIO
         wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -5738,25 +5736,13 @@ async def import_preview(request: Request, file: UploadFile = File(...)):
         wb.close()
     else:
         text = contents.decode("utf-8-sig")
-        reader = csv_mod.DictReader(io_mod.StringIO(text))
+        reader = csv.DictReader(io.StringIO(text))
         for row in reader:
             normalized = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
             normalized["_sheet"] = "csv"
             rows_to_check.append(normalized)
 
-    def get_email(row):
-        for key in ["email", "e-mail", "email address"]:
-            if key in row and row[key] and "@" in row[key]:
-                return row[key].strip().lower()
-        return ""
 
-    def get_source(row):
-        for key in ["source", "platform"]:
-            if key in row:
-                val = row[key].strip().lower()
-                if val in ("apple", "google", "stripe"):
-                    return val
-        return "unknown"
 
     async with db_pool.acquire() as conn:
         existing_emails = await conn.fetch(
@@ -5774,8 +5760,8 @@ async def import_preview(request: Request, file: UploadFile = File(...)):
     by_sheet = {}
 
     for row in rows_to_check:
-        email = get_email(row)
-        source = get_source(row)
+        email = _get_email(row)
+        source = _get_source(row)
         sheet = row.get("_sheet", "unknown")
         if sheet not in by_sheet:
             by_sheet[sheet] = {"total": 0, "import": 0, "skip_dup": 0, "skip_no_email": 0}
@@ -5813,9 +5799,6 @@ async def import_preview(request: Request, file: UploadFile = File(...)):
 @app.post("/api/admin/import-batch")
 async def import_batch(request: Request, file: UploadFile = File(...)):
     """Import subscribers with batch ID for safe revert. Use /api/admin/revert-batch to undo."""
-    import csv as csv_mod
-    import io as io_mod
-    import hashlib
 
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -5828,8 +5811,6 @@ async def import_batch(request: Request, file: UploadFile = File(...)):
 
     rows_to_import = []
     if filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
-        from openpyxl import load_workbook
-        from io import BytesIO
         wb = load_workbook(BytesIO(contents), read_only=True, data_only=True)
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -5847,35 +5828,13 @@ async def import_batch(request: Request, file: UploadFile = File(...)):
         wb.close()
     else:
         text = contents.decode("utf-8-sig")
-        reader = csv_mod.DictReader(io_mod.StringIO(text))
+        reader = csv.DictReader(io.StringIO(text))
         for row in reader:
             normalized = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
             rows_to_import.append(normalized)
 
-    def get_email(row):
-        for key in ["email", "e-mail", "email address"]:
-            if key in row and row[key] and "@" in row[key]:
-                return row[key].strip().lower()
-        return ""
 
-    def get_source(row):
-        for key in ["source", "platform"]:
-            if key in row:
-                val = row[key].strip().lower()
-                if val in ("apple", "google", "stripe"):
-                    return val
-        return "apple"
 
-    def get_date(row):
-        for key in ["date", "sign up date", "signup_date", "signup date", "created_at"]:
-            if key in row and row[key]:
-                val = row[key].strip()
-                for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d %H:%M:%S"]:
-                    try:
-                        return datetime.strptime(val[:19], fmt).replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
-        return None
 
     async with db_pool.acquire() as conn:
         existing_emails = await conn.fetch(
@@ -5891,17 +5850,17 @@ async def import_batch(request: Request, file: UploadFile = File(...)):
         errors = 0
 
         for row in rows_to_import:
-            email = get_email(row)
+            email = _get_email(row)
             if not email:
                 skipped += 1
                 continue
-            source = get_source(row)
+            source = _get_source(row, "apple")
             email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
             syn_id = f"import_{source}_{email_hash}"
             if email in existing_email_set or syn_id in existing_id_set:
                 skipped += 1
                 continue
-            period_start = get_date(row)
+            period_start = _get_date(row)
             plan_amount = 1999
             plan_interval = "month"
             try:
@@ -6005,14 +5964,12 @@ async def list_batches(request: Request):
 
 # --- Apple App Store Connect Integration (Session 13) ---
 
-import jwt as pyjwt
 
 def generate_apple_jwt() -> str:
     """Generate a short-lived JWT for App Store Connect API."""
     if not all([APPLE_KEY_ID, APPLE_ISSUER_ID, APPLE_KEY_CONTENT]):
         raise ValueError("Apple API credentials not configured (APPLE_KEY_ID, APPLE_ISSUER_ID, APPLE_KEY_CONTENT)")
-    import time as _time
-    now = int(_time.time())
+    now = int(time.time())
     payload = {
         "iss": APPLE_ISSUER_ID,
         "iat": now,
