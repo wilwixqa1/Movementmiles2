@@ -992,7 +992,7 @@ function loadStats() {
     var churnEl = document.getElementById('s-churn');
     churnEl.textContent = churnVal + '%';
     churnEl.className = 'value' + (churnVal > 10 ? ' red' : churnVal > 5 ? ' orange' : ' green');
-    document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d';
+    document.getElementById('s-churn-detail').textContent = (subs.churned_30d || 0) + ' canceled last 30d (' + (subs.churned_30d_paid || 0) + ' paid, ' + (subs.churned_30d_trial || 0) + ' trial)';
 
     document.getElementById('s-ltv').textContent = subs.est_ltv_display || '$0.00';
     var ltv_months = ((subs.avg_sub_age_days || 30) / 30).toFixed(1);

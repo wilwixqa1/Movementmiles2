@@ -4451,6 +4451,17 @@ async def admin_stats(request: Request):
             """SELECT COUNT(*) FROM subscriptions
                WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'"""
         )
+        # S22: Split churn into paid vs trial
+        churned_30d_paid = await conn.fetchval(
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'
+               AND converted_at IS NOT NULL"""
+        )
+        churned_30d_trial = await conn.fetchval(
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'
+               AND converted_at IS NULL"""
+        )
 
         # Recent subscription events
         recent_events = await conn.fetch(
@@ -4675,6 +4686,8 @@ async def admin_stats(request: Request):
             "conversion_cohorts": conversion_cohorts,
             "churn_rate_30d": churn_rate,
             "churned_30d": churned_30d or 0,
+            "churned_30d_paid": churned_30d_paid or 0,
+            "churned_30d_trial": churned_30d_trial or 0,
             "by_status": [{"status": r["status"], "count": r["count"]} for r in subs_by_status],
             "by_source": [{"source": r["source"], "total": r["count"], "active": r["active_count"]} for r in subs_by_source],
             "mrr_by_source": [
@@ -4743,7 +4756,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.3.0",
+        "version": "22.4.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
