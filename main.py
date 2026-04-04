@@ -222,7 +222,7 @@ async def startup():
             print(f"Database connection failed: {e}")
             db_pool = None
     else:
-        print("No DATABASE_URL — running without database")
+        print("No DATABASE_URL â running without database")
 
     # Start daily digest scheduler
     if RESEND_API_KEY and DIGEST_RECIPIENTS:
@@ -256,7 +256,7 @@ async def startup():
             missing.append("RESEND_API_KEY")
         if not DIGEST_RECIPIENTS:
             missing.append("DIGEST_RECIPIENTS")
-        print(f"Daily digest disabled — missing: {', '.join(missing)}")
+        print(f"Daily digest disabled â missing: {', '.join(missing)}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -353,9 +353,9 @@ FINAL RECOMMENDATIONS: Always present exactly 3 options with one-sentence explan
 
 DIGEST_SYSTEM_PROMPT = """You are an analytics advisor for Movement & Miles, a fitness subscription app. You receive daily metrics and generate a brief, actionable morning digest for the business owner.
 
-CRITICAL CONTEXT — TRIAL vs PAID:
-- "new_subscriptions_trial_starts" are TRIAL STARTS — these are $0 revenue. The checkout flow gives 1 month free, then $19.99/month.
-- "conversions_today" are the real revenue events — people whose free trial ended and converted to paid.
+CRITICAL CONTEXT â TRIAL vs PAID:
+- "new_subscriptions_trial_starts" are TRIAL STARTS â these are $0 revenue. The checkout flow gives 1 month free, then $19.99/month.
+- "conversions_today" are the real revenue events â people whose free trial ended and converted to paid.
 - Do NOT celebrate new subscriptions as revenue. Frame them as "pipeline" or "trial starts."
 - Conversions are what matter for revenue. Highlight them prominently when they occur.
 - A healthy business needs both: new trials (top of funnel) AND conversions (actual revenue).
@@ -410,7 +410,7 @@ async def call_anthropic(system_prompt: str, messages: list, max_tokens: int = 8
 
 
 async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int = 800, cache_system: bool = False) -> str:
-    """Like call_anthropic but doesn't raise HTTPException — returns error string instead."""
+    """Like call_anthropic but doesn't raise HTTPException â returns error string instead."""
     if not ANTHROPIC_API_KEY:
         return "[Error: ANTHROPIC_API_KEY not configured]"
     headers = {
@@ -601,7 +601,7 @@ async def stripe_webhook(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
     else:
-        # No webhook secret configured — parse raw (dev/testing only)
+        # No webhook secret configured â parse raw (dev/testing only)
         try:
             event = json.loads(payload)
         except Exception:
@@ -770,7 +770,7 @@ async def apple_webhook(request: Request):
     if not signed_payload:
         raise HTTPException(status_code=400, detail="Missing signedPayload")
 
-    # Decode JWS payload (header.payload.signature — we want the middle part)
+    # Decode JWS payload (header.payload.signature â we want the middle part)
     try:
         parts = signed_payload.split(".")
         if len(parts) != 3:
@@ -1112,7 +1112,7 @@ async def google_webhook(request: Request):
     return {"status": "ok"}
 
 
-# --- ymove Webhook (Session 16 — Phase 2 Processor) ---
+# --- ymove Webhook (Session 16 â Phase 2 Processor) ---
 
 @app.post("/webhooks/ymove")
 async def ymove_webhook(request: Request):
@@ -1130,7 +1130,7 @@ async def ymove_webhook(request: Request):
     event_type = event_data.get("type", "unknown")
     category = event_data.get("category", "")
 
-    # User info — available on ALL events (key advantage over direct Apple/Google webhooks)
+    # User info â available on ALL events (key advantage over direct Apple/Google webhooks)
     email = user_data.get("email", "")
     first_name = user_data.get("firstName", "")
     last_name = user_data.get("lastName", "")
@@ -1272,7 +1272,7 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
 
     if provider == "stripe":
         # Stripe subs already arrive via direct Stripe webhook.
-        # ymove adds email + name — attach email if missing.
+        # ymove adds email + name â attach email if missing.
         stripe_sub_id = event_data.get("stripeSubscriptionId", "")
         if not stripe_sub_id:
             return
@@ -1366,7 +1366,7 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
         except Exception as e:
             print(f"[ymove] Apple event store error: {e}")
 
-        # Upsert subscription — email + period dates are the key value from ymove
+        # Upsert subscription â email + period dates are the key value from ymove
         try:
             await conn.execute("""
                 INSERT INTO subscriptions (
@@ -1459,7 +1459,7 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             print(f"[ymove] Apple readable ID error: {e}")
 
     elif provider == "google":
-        # Google subs — same pattern as Apple, using ymove uuid as ID
+        # Google subs â same pattern as Apple, using ymove uuid as ID
         ym_uuid = event_data.get("uuid", "")
         if not ym_uuid:
             return
@@ -1590,7 +1590,7 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
 
 async def _ymove_handle_cancelled(conn, event_data: dict, email: str, ymove_user_id: str):
     """Process subscriptionCancelled from ymove.
-    Cancel events have no provider field — we find the sub by email."""
+    Cancel events have no provider field â we find the sub by email."""
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     # Store event for audit
@@ -1607,11 +1607,11 @@ async def _ymove_handle_cancelled(conn, event_data: dict, email: str, ymove_user
         print(f"[ymove] Cancel event store error: {e}")
 
     if not email:
-        print("[ymove] Cancel event has no email — cannot match subscription")
+        print("[ymove] Cancel event has no email â cannot match subscription")
         return
 
     # Find most recent active sub for this email and cancel it
-    # For Stripe subs, the direct Stripe webhook will also fire — double-cancel is safe (no-op)
+    # For Stripe subs, the direct Stripe webhook will also fire â double-cancel is safe (no-op)
     # For Apple subs, this is the ONLY cancel signal we get
     try:
         active_sub = await conn.fetchrow(
@@ -1654,16 +1654,16 @@ async def gather_daily_stats() -> dict:
                GROUP BY source ORDER BY count DESC"""
         )
 
-        # Conversions (trial → paid) in last 24h
+        # Conversions (trial â paid) in last 24h
         conversions_today = await conn.fetch(
             """SELECT source, email, plan_interval, plan_amount, converted_at
                FROM subscriptions WHERE converted_at > NOW() - INTERVAL '24 hours'
                ORDER BY converted_at DESC"""
         )
 
-        # Cancellations in last 24h
+        # Cancellations in last 24h (S22: include converted_at to distinguish paid vs trial)
         cancellations = await conn.fetch(
-            """SELECT source, email, canceled_at FROM subscriptions
+            """SELECT source, email, canceled_at, converted_at, trial_end FROM subscriptions
                WHERE canceled_at > NOW() - INTERVAL '24 hours'
                ORDER BY canceled_at DESC"""
         )
@@ -1751,7 +1751,9 @@ async def gather_daily_stats() -> dict:
         "new_subs_by_source": [{"source": r["source"], "count": r["count"]} for r in new_subs_by_source],
         "new_sub_details": [{"email": r["email"] or "n/a", "source": r["source"], "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}"} for r in new_subs],
         "cancellations": len(cancellations),
-        "cancel_details": [{"email": r["email"] or "n/a", "source": r["source"]} for r in cancellations],
+        "cancellations_paid": len([c for c in cancellations if c["converted_at"] is not None]),
+        "cancellations_trial": len([c for c in cancellations if c["converted_at"] is None]),
+        "cancel_details": [{"email": r["email"] or "n/a", "source": r["source"], "type": "paid" if r["converted_at"] is not None else "trial"} for r in cancellations],
         "gross_mrr": f"${current_mrr_cents/100:,.2f}",
         "gross_mrr_cents": current_mrr_cents,
         "net_mrr": f"${net_mrr_cents/100:,.2f}",
@@ -1779,6 +1781,8 @@ async def generate_digest_insights(stats: dict) -> str:
         "new_subscriptions_trial_starts": stats.get("new_subscriptions", 0),
         "new_subs_by_source": stats.get("new_subs_by_source", []),
         "cancellations": stats.get("cancellations", 0),
+        "cancellations_paid_subscribers": stats.get("cancellations_paid", 0),
+        "cancellations_trial_users": stats.get("cancellations_trial", 0),
         "gross_mrr": stats.get("gross_mrr", "$0"),
         "net_mrr": stats.get("net_mrr", "$0"),
         "total_fees": stats.get("total_fees", "$0"),
@@ -1810,7 +1814,10 @@ def build_digest_html(stats: dict, insights: str) -> str:
 
     cancel_rows = ""
     for c in stats.get("cancel_details", [])[:10]:
-        cancel_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["email"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["source"]}</td></tr>'
+        ctype = c.get("type", "unknown")
+        type_color = "#c0392b" if ctype == "paid" else "#b35a00"
+        type_label = "PAID" if ctype == "paid" else "TRIAL"
+        cancel_rows += f'<tr><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["email"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0">{c["source"]}</td><td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e0e0e0;color:{type_color};font-weight:600">{type_label}</td></tr>'
 
     lead_source_rows = ""
     for ls in stats.get("leads_by_source", []):
@@ -1818,7 +1825,7 @@ def build_digest_html(stats: dict, insights: str) -> str:
 
     # Session 11: Convert markdown bold **text** to <strong>text</strong>
     insights_clean = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', insights)
-    # Format insights — convert newlines and bullet points to HTML
+    # Format insights â convert newlines and bullet points to HTML
     insights_html = insights_clean.replace("\n\n", "</p><p style='margin:0 0 12px'>").replace("\n- ", "<br>&#8226; ").replace("\n", "<br>")
 
     html = f"""<!DOCTYPE html>
@@ -1889,6 +1896,7 @@ def build_digest_html(stats: dict, insights: str) -> str:
       <td style="padding:12px 16px;background:#fde8e8;border-radius:8px;text-align:center;width:20%">
         <div style="font-size:28px;font-weight:700;color:#c0392b">{stats.get('cancellations',0)}</div>
         <div style="font-size:11px;color:#c0392b;font-weight:600;margin-top:2px">Cancellations</div>
+        <div style="font-size:10px;color:#c0392b;margin-top:2px">{stats.get('cancellations_paid',0)} paid &bull; {stats.get('cancellations_trial',0)} trial</div>
       </td>
       <td width="12"></td>
       <td style="padding:12px 16px;background:#e8eaf6;border-radius:8px;text-align:center;width:20%">
@@ -1921,9 +1929,9 @@ def build_digest_html(stats: dict, insights: str) -> str:
         html += f"""
 <!-- Cancellations Detail -->
 <tr><td style="padding:0 32px 24px">
-  <h3 style="margin:0 0 8px;color:#c0392b;font-size:14px;font-weight:600">Cancellations</h3>
+  <h3 style="margin:0 0 8px;color:#c0392b;font-size:14px;font-weight:600">Cancellations ({stats.get('cancellations_paid',0)} paid, {stats.get('cancellations_trial',0)} trial)</h3>
   <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
-    <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Email</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th></tr>
+    <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Email</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Type</th></tr>
     {cancel_rows}
   </table>
 </td></tr>"""
@@ -2022,7 +2030,7 @@ async def run_daily_digest():
         insights = await generate_digest_insights(stats)
 
         now_et = datetime.now(ZoneInfo("America/New_York"))
-        subject = f"M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations',0)} cancellations"
+        subject = f"M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations_paid',0)} paid cancels, {stats.get('cancellations_trial',0)} trial cancels"
 
         html = build_digest_html(stats, insights)
         result = await send_digest_email(html, subject)
@@ -3311,7 +3319,7 @@ async def send_test_digest(request: Request):
     insights = await generate_digest_insights(stats)
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    subject = f"[TEST] M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations',0)} cancellations"
+    subject = f"[TEST] M&M Daily Digest - {now_et.strftime('%b %d')} | {stats.get('conversions_today',0)} conversions, {stats.get('new_subscriptions',0)} trials, {stats.get('cancellations_paid',0)} paid cancels, {stats.get('cancellations_trial',0)} trial cancels"
 
     html = build_digest_html(stats, insights)
     result = await send_digest_email(html, subject)
@@ -4776,7 +4784,7 @@ async def admin_stats(request: Request):
                GROUP BY month ORDER BY month"""
         )
 
-        # Avg subscriber lifetime (all who ever converted — includes churned for honest LTV)
+        # Avg subscriber lifetime (all who ever converted â includes churned for honest LTV)
         avg_sub_age = await conn.fetchval(
             """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (COALESCE(canceled_at, NOW()) - created_at)) / 86400), 0)
                FROM subscriptions
@@ -5033,7 +5041,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "21.0.0",
+        "version": "22.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
@@ -6217,7 +6225,7 @@ async def apple_discover(request: Request):
 @app.post("/api/admin/apple-pull-report")
 async def apple_pull_report(request: Request):
     """Pull Apple subscription reports for a date and store in platform_metrics.
-    Body: {"date": "2026-03-10"} — defaults to 2 days ago (Apple ~2 day lag)."""
+    Body: {"date": "2026-03-10"} â defaults to 2 days ago (Apple ~2 day lag)."""
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
 
