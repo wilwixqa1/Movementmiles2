@@ -151,6 +151,22 @@
   .adspend-msg.ok{display:block;color:var(--green)}
   .adspend-msg.err{display:block;color:var(--red)}
 
+  .sync-bar{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:16px 24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .sync-status{display:flex;align-items:center;gap:12px}
+  .sync-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0}
+  .sync-dot.green{background:#2d6a2d}
+  .sync-dot.orange{background:#b35a00}
+  .sync-dot.red{background:#c0392b}
+  .sync-dot.gray{background:#999}
+  .sync-info{display:flex;flex-direction:column;gap:2px}
+  .sync-label{font-size:.78rem;font-weight:600;color:var(--navy)}
+  .sync-detail{font-size:.72rem;color:var(--navy-mid)}
+  .sync-right{display:flex;align-items:center;gap:12px}
+  .sync-btn{background:var(--navy);color:var(--white);border:none;padding:8px 18px;border-radius:8px;font-family:inherit;font-size:.78rem;font-weight:600;cursor:pointer;white-space:nowrap}
+  .sync-btn:hover{background:#2a3a5c}
+  .sync-btn:disabled{opacity:.5;cursor:not-allowed}
+  .sync-changes{font-size:.72rem;color:var(--navy-mid);text-align:right}
+
   @media(max-width:768px){
     .stat-cards{grid-template-columns:repeat(2,1fr)}
     .stat-cards-2{grid-template-columns:1fr}
@@ -200,6 +216,21 @@
       <button class="quick-btn" id="qb-90" onclick="setQuickRange(90)">90d</button>
       <button class="quick-btn active" id="qb-all" onclick="clearDateFilter()">All Time</button>
       <span class="date-range-label" id="range-label">Showing: All Time</span>
+    </div>
+
+    <!-- Sync Status Indicator -->
+    <div class="sync-bar" id="sync-bar">
+      <div class="sync-status">
+        <div class="sync-dot gray" id="sync-dot"></div>
+        <div class="sync-info">
+          <div class="sync-label" id="sync-label">Data Sync: Loading...</div>
+          <div class="sync-detail" id="sync-detail"></div>
+        </div>
+      </div>
+      <div class="sync-right">
+        <div class="sync-changes" id="sync-changes"></div>
+        <button class="sync-btn" id="sync-btn" onclick="runManualSync()">Sync Now</button>
+      </div>
     </div>
 
     <!-- ============================================ -->
@@ -1077,9 +1108,149 @@ function loadStats() {
     // --- Ad Spend table ---
     renderAdSpendTable(d.ad_spend || []);
 
+    // --- Sync Indicator ---
+    renderSyncIndicator(d.last_sync);
+
   }).catch(function(err) {
     console.error('Stats error:', err);
   });
+}
+
+function renderSyncIndicator(sync) {
+  var dot = document.getElementById('sync-dot');
+  var label = document.getElementById('sync-label');
+  var detail = document.getElementById('sync-detail');
+  var changes = document.getElementById('sync-changes');
+
+  if (!sync) {
+    dot.className = 'sync-dot gray';
+    label.textContent = 'Data Sync: No sync runs found';
+    detail.textContent = '';
+    changes.textContent = '';
+    return;
+  }
+
+  if (sync.status === 'running') {
+    dot.className = 'sync-dot orange';
+    label.textContent = 'Data Sync: Running...';
+    detail.textContent = 'Started ' + formatSyncTime(sync.started_at);
+    changes.textContent = '';
+    document.getElementById('sync-btn').disabled = true;
+    return;
+  }
+
+  document.getElementById('sync-btn').disabled = false;
+
+  var completedAt = sync.completed_at ? new Date(sync.completed_at) : null;
+  var hoursAgo = completedAt ? (Date.now() - completedAt.getTime()) / (1000 * 60 * 60) : 999;
+
+  if (sync.status === 'failed') {
+    dot.className = 'sync-dot red';
+    label.textContent = 'Data Sync: Failed';
+    detail.textContent = (sync.error || 'Unknown error') + (completedAt ? ' \u2022 ' + formatSyncTime(sync.completed_at) : '');
+    changes.textContent = '';
+    return;
+  }
+
+  // Completed successfully
+  if (hoursAgo < 24) {
+    dot.className = 'sync-dot green';
+    label.textContent = 'Data Sync: Current';
+  } else if (hoursAgo < 48) {
+    dot.className = 'sync-dot orange';
+    label.textContent = 'Data Sync: Stale';
+  } else {
+    dot.className = 'sync-dot red';
+    label.textContent = 'Data Sync: Overdue';
+  }
+
+  detail.textContent = 'Last sync ' + formatSyncTime(sync.completed_at);
+
+  // Show changes summary from results
+  var r = sync.results;
+  if (r) {
+    var parts = [];
+    if (r.deactivated && r.deactivated > 0) parts.push(r.deactivated + ' deactivated');
+    if (r.reactivated && r.reactivated > 0) parts.push(r.reactivated + ' reactivated');
+    if (r.new_discovered && r.new_discovered > 0) parts.push(r.new_discovered + ' new');
+    changes.textContent = parts.length > 0 ? parts.join(', ') : 'No changes';
+  } else {
+    changes.textContent = sync.our_active_count ? sync.our_active_count + ' ours / ' + sync.ymove_active_count + ' ymove' : '';
+  }
+}
+
+function formatSyncTime(isoStr) {
+  if (!isoStr) return '';
+  var d = new Date(isoStr);
+  var now = new Date();
+  var diffMs = now - d;
+  var diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return diffMin + 'm ago';
+  var diffH = Math.floor(diffMin / 60);
+  if (diffH < 24) return diffH + 'h ago';
+  var diffD = Math.floor(diffH / 24);
+  return diffD + 'd ago';
+}
+
+function runManualSync() {
+  var btn = document.getElementById('sync-btn');
+  btn.disabled = true;
+  btn.textContent = 'Syncing...';
+  var dot = document.getElementById('sync-dot');
+  dot.className = 'sync-dot orange';
+  document.getElementById('sync-label').textContent = 'Data Sync: Running...';
+  document.getElementById('sync-detail').textContent = 'Started just now';
+  document.getElementById('sync-changes').textContent = '';
+
+  fetch('/api/admin/ymove-shadow-sync', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
+    body: JSON.stringify({action: 'run'})
+  }).then(function(res) {
+    return res.json();
+  }).then(function(d) {
+    if (d.status === 'started' || d.status === 'already_running') {
+      // Poll for completion
+      pollSyncStatus();
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Sync Now';
+      loadStats();
+    }
+  }).catch(function(err) {
+    btn.disabled = false;
+    btn.textContent = 'Sync Now';
+    dot.className = 'sync-dot red';
+    document.getElementById('sync-label').textContent = 'Data Sync: Error';
+    document.getElementById('sync-detail').textContent = err.message || 'Request failed';
+  });
+}
+
+function pollSyncStatus() {
+  setTimeout(function() {
+    fetch('/api/admin/ymove-shadow-sync', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
+      body: JSON.stringify({action: 'status'})
+    }).then(function(res) { return res.json(); })
+    .then(function(d) {
+      if (d.status === 'running') {
+        var phase = d.phase || '';
+        document.getElementById('sync-detail').textContent = 'Running: ' + phase + (d.progress_current ? ' (' + d.progress_current + '/' + d.progress_total + ')' : '');
+        pollSyncStatus();
+      } else {
+        // Done (completed or failed), refresh everything
+        document.getElementById('sync-btn').disabled = false;
+        document.getElementById('sync-btn').textContent = 'Sync Now';
+        loadStats();
+      }
+    }).catch(function() {
+      document.getElementById('sync-btn').disabled = false;
+      document.getElementById('sync-btn').textContent = 'Sync Now';
+      loadStats();
+    });
+  }, 5000);
 }
 
 function tagClass(eventType) {

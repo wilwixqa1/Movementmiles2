@@ -4688,6 +4688,23 @@ async def admin_stats(request: Request):
         "cpa_cents": all_cpa,
     })
 
+    # Last sync status for dashboard indicator
+    last_sync = None
+    async with db_pool.acquire() as conn:
+        sync_row = await conn.fetchrow(
+            "SELECT status, started_at, completed_at, our_active_count, ymove_active_count, results, error FROM ymove_sync_runs ORDER BY started_at DESC LIMIT 1"
+        )
+        if sync_row:
+            last_sync = {
+                "status": sync_row["status"],
+                "started_at": str(sync_row["started_at"]) if sync_row["started_at"] else None,
+                "completed_at": str(sync_row["completed_at"]) if sync_row["completed_at"] else None,
+                "our_active_count": sync_row["our_active_count"],
+                "ymove_active_count": sync_row["ymove_active_count"],
+                "results": sync_row["results"],
+                "error": sync_row["error"],
+            }
+
     return {
         "leads": {
             "total": total_leads,
@@ -4759,6 +4776,7 @@ async def admin_stats(request: Request):
             "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
             "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
         },
+        "last_sync": last_sync,
     }
 
 
@@ -4796,7 +4814,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.8.0",
+        "version": "23.0.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
