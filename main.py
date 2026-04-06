@@ -364,42 +364,20 @@ MISSED WORKOUTS: 1-2 = continue. 3-5 = resume easier. Week+ = repeat previous we
 FINAL RECOMMENDATIONS: Always present exactly 3 options with one-sentence explanations. Use button format."""
 
 
-DIGEST_SYSTEM_PROMPT = """You are an analytics advisor for Movement & Miles, a fitness subscription app. You receive daily metrics and generate a brief, actionable morning digest for the business owner.
+DIGEST_SYSTEM_PROMPT = """You are a concise analytics advisor for Movement & Miles, a fitness subscription app ($19.99/mo after 1-month free trial). Generate 3-5 bullet points for the business owner.
 
-CRITICAL CONTEXT - TRIAL vs PAID:
-- "new_subscriptions_trial_starts" are TRIAL STARTS - these are $0 revenue. The checkout flow gives 1 month free, then $19.99/month.
-- "conversions_today" are the real revenue events - people whose free trial ended and converted to paid.
-- Do NOT celebrate new subscriptions as revenue. Frame them as "pipeline" or "trial starts."
-- Conversions are what matter for revenue. Highlight them prominently when they occur.
-- A healthy business needs both: new trials (top of funnel) AND conversions (actual revenue).
-
-CRITICAL - CANCELLATION ANALYSIS:
-- "cancellations_paid_subscribers" = paying customers who cancelled. This is real revenue loss.
-- "cancellations_trial_users" = people who cancelled during their free trial month. No revenue was lost.
-- ALWAYS calculate and report NET GROWTH for each tier:
-  * Net paid subscriber growth = conversions_today - cancellations_paid_subscribers
-  * Net trial pipeline growth = new_subscriptions_trial_starts - cancellations_trial_users
-- Do NOT compare total cancellations against conversions. A day with 10 conversions and 9 cancellations (5 paid, 4 trial) is actually net +5 paid and net +3 trial - both growing.
-- Only flag concern when net paid growth is negative (more paid cancels than conversions).
-- Trial cancellations are normal attrition. Only flag if the ratio is unusually high (e.g. >70% of trial starts cancelling).
+KEY DISTINCTIONS:
+- trial_starts = new free trials, $0 revenue. Frame as "pipeline."
+- conversions = trials that became paying. This is real revenue growth.
+- net_paid_growth and net_trial_growth are pre-computed. Lead with these.
+- Only flag concern when net_paid_growth is negative. Trial cancellations are normal attrition.
 
 RULES:
-- Be concise: 3-5 bullet points max for insights
-- Lead with net paid growth, then net trial pipeline growth
-- Compare to context when possible (e.g. "above/below your typical daily rate")
-- Flag anything unusual or concerning
-- Suggest ONE specific action if data warrants it
-- Use plain language, not jargon
-- If a day had zero activity in some area, just note it briefly, don't over-analyze
-- Platform fee context: Apple and Google take 15%, Stripe takes ~2.9%
-
-MARKETING ATTRIBUTION:
-- "subs_by_utm_source_24h" shows which marketing channels drove new subscribers in the last 24 hours (only Stripe signups with UTM tracking, not Apple/Google).
-- "top_traffic_sources_7d" shows which channels drove the most page views in the last 7 days.
-- If UTM data is present, briefly note which channels are performing. If empty, don't mention it (UTM tracking is new and data is still building up).
-- Keep marketing commentary to one bullet max.
-
-FORMAT your response as a short paragraph overview, then bullet points for key insights. Keep total response under 200 words."""
+- One short overview paragraph, then 3-5 bullets. Under 200 words total.
+- Lead with net paid growth, then trial pipeline.
+- If marketing UTM data is present, note top channel in one bullet. If empty, skip.
+- Flag anything unusual. Suggest ONE action if warranted.
+- Plain language, no jargon. Don't over-analyze zero-activity areas."""
 
 
 # --- Shared Helpers ---
@@ -1549,33 +1527,38 @@ async def gather_daily_stats() -> dict:
 
 async def generate_digest_insights(stats: dict) -> str:
     """Send daily stats to Claude for analysis and insights."""
-    # Trim to key metrics only (avoid oversized prompt)
+    conversions = stats.get("conversions_today", 0)
+    paid_cancels = stats.get("cancellations_paid", 0)
+    trial_starts = stats.get("new_subscriptions", 0)
+    trial_cancels = stats.get("cancellations_trial", 0)
+
     slim = {
-        "conversions_today": stats.get("conversions_today", 0),
-        "new_subscriptions_trial_starts": stats.get("new_subscriptions", 0),
-        "new_subs_by_source": stats.get("new_subs_by_source", []),
-        "cancellations": stats.get("cancellations", 0),
-        "cancellations_paid_subscribers": stats.get("cancellations_paid", 0),
-        "cancellations_trial_users": stats.get("cancellations_trial", 0),
+        "net_paid_growth": conversions - paid_cancels,
+        "net_trial_growth": trial_starts - trial_cancels,
+        "conversions": conversions,
+        "trial_starts": trial_starts,
+        "paid_cancels": paid_cancels,
+        "trial_cancels": trial_cancels,
         "gross_mrr": stats.get("gross_mrr", "$0"),
         "net_mrr": stats.get("net_mrr", "$0"),
-        "total_fees": stats.get("total_fees", "$0"),
         "active_subscribers": stats.get("active_subscribers", 0),
         "trialing": stats.get("trialing", 0),
         "new_leads": stats.get("new_leads", 0),
-        "leads_by_source": stats.get("leads_by_source", []),
         "page_views_24h": stats.get("page_views_24h", 0),
-        "top_pages": stats.get("top_pages", []),
-        "chat_sessions_24h": stats.get("chat_sessions_24h", 0),
-        "mrr_by_source": stats.get("mrr_by_source", []),
-        "fee_breakdown": stats.get("fee_breakdown", {}),
-        "subs_by_utm_source_24h": stats.get("subs_by_utm_24h", []),
-        "top_traffic_sources_7d": stats.get("top_traffic_7d", []),
     }
-    stats_text = json.dumps(slim, indent=2, default=str)
-    prompt = f"Here are today's metrics for Movement & Miles (fitness subscription app). Generate a brief morning digest with key insights and any recommended actions.\n\n{stats_text}"
+
+    # Only include UTM data if present
+    utm_subs = stats.get("subs_by_utm_24h", [])
+    utm_traffic = stats.get("top_traffic_7d", [])
+    if utm_subs:
+        slim["subscriber_channels_24h"] = utm_subs
+    if utm_traffic:
+        slim["top_traffic_source_7d"] = utm_traffic[0]
+
+    stats_text = json.dumps(slim, default=str)
+    prompt = f"Today's Movement & Miles metrics:\n{stats_text}"
     print(f"[Digest] Prompt length: {len(prompt)} chars")
-    return await call_anthropic_raw(DIGEST_SYSTEM_PROMPT, [{"role": "user", "content": prompt}], max_tokens=500)
+    return await call_anthropic_raw(DIGEST_SYSTEM_PROMPT, [{"role": "user", "content": prompt}], max_tokens=400)
 
 
 def build_digest_html(stats: dict, insights: str) -> str:
