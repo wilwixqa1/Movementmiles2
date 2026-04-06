@@ -4368,7 +4368,7 @@ async def admin_stats(request: Request):
         views_by_page = await conn.fetch(
             """SELECT page, COUNT(*) as views FROM page_views
                WHERE created_at > NOW() - INTERVAL '7 days'
-               GROUP BY page ORDER BY views DESC"""
+               GROUP BY page ORDER BY views DESC LIMIT 10"""
         )
         views_by_day = await conn.fetch(
             """SELECT created_at::date as day, COUNT(*) as views FROM page_views
@@ -4756,7 +4756,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.4.0",
+        "version": "22.5.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,

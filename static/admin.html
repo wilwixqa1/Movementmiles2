@@ -564,7 +564,7 @@
     <!-- Page Views Charts -->
     <div class="views-grid">
       <div class="card">
-        <div class="section-title">Views by Page (7 days)</div>
+        <div class="section-title">Top Pages (7 days)</div>
         <div id="chart-by-page" class="bar-chart"></div>
       </div>
       <div class="card">
@@ -1046,8 +1046,10 @@ function loadStats() {
     var chatSub = d.chats.by_type.map(function(c){return c.session_type+': '+c.count}).join(', ');
     document.getElementById('s-chats-sub').textContent = chatSub || 'No sessions yet';
 
-    renderBarChart('chart-by-page', d.page_views.by_page.map(function(r){
-      return {label: r.page, value: r.views, color: 'navy'};
+    renderBarChart('chart-by-page', d.page_views.by_page.slice(0, 10).map(function(r){
+      var name = r.page.replace(/\s*[—|]\s*Movement\s*&?\s*Miles$/i, '').trim() || r.page;
+      if (name.length > 30) name = name.substring(0, 28) + '…';
+      return {label: name, value: r.views, color: 'navy'};
     }));
     renderBarChart('chart-by-day', d.page_views.by_day.map(function(r){
       return {label: r.day.slice(5), value: r.views, color: 'navy'};
