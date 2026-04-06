@@ -221,6 +221,24 @@ async def startup():
                 """)
             print("[Startup] Block 3: Analytics tables ready")
 
+            # Block 3b: UTM links table (S23)
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS utm_links (
+                        id SERIAL PRIMARY KEY,
+                        label TEXT DEFAULT '',
+                        base_url TEXT NOT NULL,
+                        utm_source TEXT DEFAULT '',
+                        utm_medium TEXT DEFAULT '',
+                        utm_campaign TEXT DEFAULT '',
+                        utm_term TEXT DEFAULT '',
+                        utm_content TEXT DEFAULT '',
+                        ym_source TEXT DEFAULT '',
+                        full_url TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+
             # Block 4: Indexes (non-blocking, failure will not kill startup)
             try:
                 async with db_pool.acquire() as conn:
@@ -4239,6 +4257,63 @@ async def delete_ad_spend(request: Request):
         await conn.execute("DELETE FROM ad_spend WHERE month = $1 AND channel = $2", month, channel)
 
     return {"status": "ok"}
+
+
+# --- S23: UTM Links CRUD ---
+
+@app.post("/api/admin/utm-links")
+async def save_utm_link(request: Request):
+    """Save a generated UTM link."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json()
+    base_url = (body.get("base_url") or "").strip()
+    utm_source = (body.get("utm_source") or "").strip()
+    if not base_url or not utm_source:
+        raise HTTPException(status_code=400, detail="base_url and utm_source required")
+    label = (body.get("label") or "").strip()
+    utm_medium = (body.get("utm_medium") or "").strip()
+    utm_campaign = (body.get("utm_campaign") or "").strip()
+    utm_term = (body.get("utm_term") or "").strip()
+    utm_content = (body.get("utm_content") or "").strip()
+    ym_source = (body.get("ym_source") or "").strip()
+    full_url = (body.get("full_url") or "").strip()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO utm_links (label, base_url, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source, full_url)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, created_at""",
+            label, base_url, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source, full_url
+        )
+    return {"status": "ok", "id": row["id"], "created_at": str(row["created_at"])}
+
+
+@app.get("/api/admin/utm-links")
+async def get_utm_links(request: Request):
+    """List all saved UTM links."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM utm_links ORDER BY created_at DESC")
+    return {"links": [dict(r) for r in rows]}
+
+
+@app.delete("/api/admin/utm-links")
+async def delete_utm_link(request: Request):
+    """Delete a UTM link by ID."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    link_id = request.query_params.get("id")
+    if not link_id:
+        raise HTTPException(status_code=400, detail="id required")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM utm_links WHERE id = $1", int(link_id))
+    return {"status": "ok", "deleted": int(link_id)}
 
 
 # --- Session 11: Attach Email + Search (consolidated) ---

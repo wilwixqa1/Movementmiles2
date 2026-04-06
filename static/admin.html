@@ -491,29 +491,25 @@
           <input type="text" id="ym-source" placeholder="e.g. ig_bio, fb_ad" oninput="updateUtmPreview()" />
         </div>
       </div>
-            <div class="utm-actions">
-        <button class="utm-copy-btn" id="utm-copy-btn" onclick="copyUtmUrl()">Copy Link</button>
+      <div style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap">
+        <div class="utm-field" style="flex:1;min-width:160px">
+          <label>Link Label (optional)</label>
+          <input type="text" id="utm-label" placeholder="e.g. Meg IG Bio, MM FB Post" />
+        </div>
+        <div class="utm-actions">
+          <button class="utm-copy-btn" id="utm-copy-btn" onclick="copyUtmUrl()">Copy &amp; Save Link</button>
+        </div>
       </div>
 
-      <!-- Active UTM Links Reference -->
+      <!-- Saved UTM Links -->
       <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
         <div style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none" onclick="var b=document.getElementById('utm-links-body');var c=document.getElementById('utm-links-chev');if(b.style.display==='none'){b.style.display='block';c.style.transform='rotate(90deg)'}else{b.style.display='none';c.style.transform=''}">
           <span style="font-size:.65rem;color:var(--navy-mid);transition:transform .2s" id="utm-links-chev">&#9654;</span>
-          <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--navy-mid)">Active UTM Links</span>
-          <span style="font-size:.7rem;color:var(--navy-mid);font-weight:400">(7 links)</span>
+          <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--navy-mid)">Saved UTM Links</span>
+          <span style="font-size:.7rem;color:var(--navy-mid);font-weight:400" id="utm-links-count"></span>
         </div>
         <div id="utm-links-body" style="display:none;margin-top:12px">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid var(--border);border-radius:8px;overflow:hidden">
-            <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase">Label</th><th style="padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase">Source</th><th style="padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase">Medium</th><th style="padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase">Campaign</th><th style="padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase">Destination</th></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Meg IG</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">bio_link</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mt_instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Website</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Meg IG</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">bio_link</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mt_instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Checkout</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">MM IG</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">bio_link</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mm_instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Website</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">MM IG</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">bio_link</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mm_instagram</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Checkout</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">MM FB</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">facebook</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">social</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mmfb_organic</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Website</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">MM FB</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">facebook</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">social</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">mmfb_organic</td><td style="padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)">Checkout</td></tr>
-            <tr><td style="padding:6px 12px;font-size:.82rem">MM Email</td><td style="padding:6px 12px;font-size:.82rem">email</td><td style="padding:6px 12px;font-size:.82rem">email</td><td style="padding:6px 12px;font-size:.82rem">--</td><td style="padding:6px 12px;font-size:.82rem">Checkout</td></tr>
-          </table>
-          <p style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">These links are live across Instagram, Facebook, and email. Update this table when new links are deployed.</p>
+          <div id="utm-links-table"></div>
         </div>
       </div>
     </div>
@@ -750,6 +746,7 @@ function doLogin() {
     var monthStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
     document.getElementById('adspend-month').value = monthStr;
     loadStats();
+    loadUtmLinks();
   }).catch(function() {
     var err = document.getElementById('login-error');
     err.style.display = 'block';
@@ -848,18 +845,78 @@ function copyUtmUrl() {
 
   var sep = base.indexOf('?') > -1 ? '&' : '?';
   var url = base + sep + params.join('&');
+  var label = (document.getElementById('utm-label') ? document.getElementById('utm-label').value.trim() : '');
 
   navigator.clipboard.writeText(url).then(function() {
     var btn = document.getElementById('utm-copy-btn');
     btn.textContent = 'Copied!';
     btn.className = 'utm-copy-btn copied';
     setTimeout(function() {
-      btn.textContent = 'Copy Link';
+      btn.textContent = 'Copy & Save Link';
       btn.className = 'utm-copy-btn';
     }, 2000);
   }).catch(function() {
     prompt('Copy this URL:', url);
   });
+
+  // Save to DB
+  fetch('/api/admin/utm-links', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin-Password': adminPw},
+    body: JSON.stringify({
+      label: label, base_url: base, utm_source: source, utm_medium: medium,
+      utm_campaign: campaign, utm_term: term, utm_content: content,
+      ym_source: ymSource, full_url: url
+    })
+  }).then(function(r) { return r.json(); }).then(function() {
+    loadUtmLinks();
+  }).catch(function(e) { console.error('UTM save error:', e); });
+}
+
+function loadUtmLinks() {
+  fetch('/api/admin/utm-links', {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    renderUtmLinks(d.links || []);
+  }).catch(function() {});
+}
+
+function renderUtmLinks(links) {
+  var countEl = document.getElementById('utm-links-count');
+  var tableEl = document.getElementById('utm-links-table');
+  countEl.textContent = '(' + links.length + ' link' + (links.length !== 1 ? 's' : '') + ')';
+  if (links.length === 0) {
+    tableEl.innerHTML = '<p style="font-size:.82rem;color:var(--navy-mid)">No saved links yet. Links are saved automatically when you copy them.</p>';
+    return;
+  }
+  var th = 'padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase';
+  var td = 'padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)';
+  var html = '<table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid var(--border);border-radius:8px;overflow:hidden">';
+  html += '<tr style="background:#f7f7f7"><th style="'+th+'">Label</th><th style="'+th+'">Source</th><th style="'+th+'">Medium</th><th style="'+th+'">Campaign</th><th style="'+th+'">URL</th><th style="'+th+'"></th></tr>';
+  links.forEach(function(l) {
+    var dest = l.base_url.indexOf('ymove') > -1 ? 'Checkout' : 'Website';
+    var displayLabel = escHtml(l.label || dest);
+    html += '<tr>';
+    html += '<td style="'+td+'">'+displayLabel+'</td>';
+    html += '<td style="'+td+'">'+escHtml(l.utm_source)+'</td>';
+    html += '<td style="'+td+'">'+escHtml(l.utm_medium || '--')+'</td>';
+    html += '<td style="'+td+'">'+escHtml(l.utm_campaign || '--')+'</td>';
+    html += '<td style="'+td+';max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="'+escHtml(l.full_url)+'" target="_blank" style="color:var(--navy);font-size:.78rem">'+dest+'</a></td>';
+    html += '<td style="'+td+';text-align:center"><span onclick="deleteUtmLink('+l.id+')" style="color:var(--red);cursor:pointer;font-size:.78rem" title="Delete">&#10005;</span></td>';
+    html += '</tr>';
+  });
+  html += '</table>';
+  tableEl.innerHTML = html;
+}
+
+function deleteUtmLink(id) {
+  if (!confirm('Delete this UTM link?')) return;
+  fetch('/api/admin/utm-links?id=' + id, {
+    method: 'DELETE',
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function() {
+    loadUtmLinks();
+  }).catch(function(e) { console.error('UTM delete error:', e); });
 }
 
 function escHtml(s) {
