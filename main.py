@@ -4756,7 +4756,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.5.0",
+        "version": "22.6.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,

@@ -573,24 +573,6 @@
       </div>
     </div>
 
-    <!-- Leads Table -->
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <div class="section-title" style="margin-bottom:0">Recent Leads</div>
-        <button class="export-btn" onclick="exportCSV()">Download CSV</button>
-      </div>
-      <div style="overflow-x:auto">
-        <table>
-          <thead>
-            <tr><th>Date</th><th>Name</th><th>Email</th><th>Level</th><th>Goals</th><th>Plan</th><th>Referral</th></tr>
-          </thead>
-          <tbody id="leads-tbody">
-            <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
     <hr class="divider"/>
 
     <!-- ============================================ -->
@@ -1080,16 +1062,6 @@ function loadStats() {
     }
 
     // Leads table
-    var tbody = document.getElementById('leads-tbody');
-    if (d.leads.recent.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty-msg">No leads captured yet.</td></tr>';
-    } else {
-      tbody.innerHTML = d.leads.recent.map(function(l){
-        var dt = l.created_at ? new Date(l.created_at).toLocaleDateString() : '--';
-        return '<tr><td>'+dt+'</td><td>'+(l.first_name||'--')+'</td><td>'+(l.email||'--')+'</td><td>'+(l.experience_level||'--')+'</td><td>'+(l.goals||'--')+'</td><td>'+(l.recommended_plan||'--')+'</td><td>'+(l.referral_source||'--')+'</td></tr>';
-      }).join('');
-    }
-
     // --- Ad Spend table ---
     renderAdSpendTable(d.ad_spend || []);
 
