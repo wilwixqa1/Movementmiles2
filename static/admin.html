@@ -49,16 +49,16 @@
   tr:last-child td{border-bottom:none}
   tr:hover td{background:rgba(83,108,124,.04)}
 
-  .bar-chart{display:flex;align-items:flex-end;gap:12px;height:160px;padding:16px 0}
-  .bar-col{display:flex;flex-direction:column;align-items:center;gap:6px;flex:1}
+  .bar-chart{display:flex;align-items:flex-end;gap:8px;height:160px;padding:24px 0 0}
+  .bar-col{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;min-width:0}
   .bar{border-radius:4px 4px 0 0;width:100%;min-height:4px;transition:height .3s}
   .bar.navy{background:var(--navy)}
   .bar.green{background:var(--green)}
   .bar.orange{background:var(--orange)}
   .bar.red{background:var(--red)}
   .bar.mid{background:var(--navy-mid)}
-  .bar-label{font-size:.7rem;color:var(--navy-mid);font-weight:500;text-align:center}
-  .bar-value{font-size:.75rem;font-weight:600;color:var(--navy)}
+  .bar-label{font-size:.65rem;color:var(--navy-mid);font-weight:500;text-align:center;line-height:1.2;max-height:2.4em;overflow:hidden;word-break:break-word;width:100%}
+  .bar-value{font-size:.72rem;font-weight:600;color:var(--navy)}
 
   .views-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:24px}
 
@@ -1066,9 +1066,11 @@ function loadStats() {
     var chatSub = d.chats.by_type.map(function(c){return c.session_type+': '+c.count}).join(', ');
     document.getElementById('s-chats-sub').textContent = chatSub || 'No sessions yet';
 
-    renderBarChart('chart-by-page', d.page_views.by_page.slice(0, 10).map(function(r){
+    renderBarChart('chart-by-page', d.page_views.by_page.slice(0, 8).map(function(r){
       var name = r.page.replace(/\s*[—|]\s*Movement\s*&?\s*Miles$/i, '').trim() || r.page;
-      if (name.length > 30) name = name.substring(0, 28) + '…';
+      if (name === 'Movement & Miles' || name === '/') name = 'Home';
+      name = name.replace(/^About\s+Meg\s*[—–-]\s*/, 'About Meg');
+      if (name.length > 18) name = name.substring(0, 16) + '…';
       return {label: name, value: r.views, color: 'navy'};
     }));
     renderBarChart('chart-by-day', d.page_views.by_day.map(function(r){
