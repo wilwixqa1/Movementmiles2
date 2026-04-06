@@ -645,7 +645,7 @@
         </div>
         <div class="tool-card">
           <h3>ymove API Verify</h3>
-          <p>Discover ymove API endpoints or verify emails against ymove. Blocked until Tosh provides siteId.</p>
+          <p>Discover ymove API endpoints or verify emails against ymove. Connected to siteId 75.</p>
           <button class="tool-btn tool-btn-navy" id="btn-ymove" onclick="doYmoveDiscover()">Discover API</button>
           <div class="tool-result" id="res-ymove"></div>
         </div>
@@ -656,10 +656,10 @@
           <div class="tool-result" id="res-batches"></div>
         </div>
         <div class="tool-card">
-          <h3>Reactivation Status</h3>
-          <p>193 candidates waiting for ymove verification. Once Tosh provides siteId, verify and reactivate confirmed-active subs.</p>
-          <div style="padding:8px 0;font-size:.82rem;color:var(--orange);font-weight:600">BLOCKED: Waiting on Tosh for ymove siteId</div>
-          <div style="font-size:.8rem;color:var(--navy-mid)">Apple active in DB: ~582 | Meg says: ~796 | Gap: ~193</div>
+          <h3>ymove Sync Status</h3>
+          <p>Daily shadow sync runs at 8:00 AM ET. Verifies all Apple/Google subs against ymove ground truth.</p>
+          <div style="font-size:.82rem;color:var(--green);font-weight:600">LIVE: siteId 75, daily sync active</div>
+          <button class="tool-btn tool-btn-navy" style="margin-top:12px" onclick="runManualSync()">Run Sync Now</button>
         </div>
       </div>
     </div>
@@ -1852,8 +1852,8 @@ function doYmoveDiscover() {
       msg += "\n[" + icon + "] " + r.pattern;
       if (r.body_preview && r.body_preview.length < 120) msg += " -> " + r.body_preview.replace(/<[^>]+>/g, "");
     });
-    if (promising === 0) msg += "\n\nBLOCKED: Need siteId from Tosh. All endpoints return siteId null.";
-    res.className = "tool-result " + (promising > 0 ? "ok" : "warn");
+    if (promising === 0) msg += "\n\nNo working endpoints found. Check API key and siteId.";
+    res.className = "tool-result " + (promising > 0 ? "ok" : "err");
     res.style.whiteSpace = "pre-wrap";
     res.textContent = msg;
     btn.disabled = false;
