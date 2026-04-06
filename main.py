@@ -3015,15 +3015,19 @@ async def ymove_import_new(request: Request):
             provider = v["provider"]
             email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
             syn_id = f"ymove_new_{provider}_{email_hash}"
+            # S23: Use ymove signupDate as created_at if available
+            raw = v.get("raw", {})
+            signup_str = raw.get("signupDate") or raw.get("createdAt") or ""
+            signup_dt = _parse_iso(signup_str) if signup_str else None
             try:
                 await conn.execute("""
                     INSERT INTO subscriptions (
                         stripe_customer_id, stripe_subscription_id, email, status,
                         plan_interval, plan_amount, currency, source,
                         created_at, updated_at, import_batch
-                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, COALESCE($5, NOW()), NOW(), $4)
                     ON CONFLICT (stripe_subscription_id) DO NOTHING
-                """, syn_id, email, provider, batch_id)
+                """, syn_id, email, provider, batch_id, signup_dt)
                 imported += 1
             except Exception as e:
                 print(f"[ymove import] Error for {email}: {e}")
@@ -3039,6 +3043,121 @@ async def ymove_import_new(request: Request):
         "not_active_in_ymove": len(not_active),
         "est_mrr_added_cents": imported * 1999,
         "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}"
+    }
+
+
+@app.post("/api/admin/backfill-ymove-dates")
+async def backfill_ymove_dates(request: Request):
+    """Backfill created_at on ymove-imported subs using their real signupDate from ymove API.
+    Finds subs with import_batch LIKE 'ymove_import_%' or 'ymove_react_%', looks up each in ymove,
+    and updates created_at to signupDate if available and earlier than current created_at.
+    Body: {"preview": true/false}"""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    body = await request.json()
+    preview = body.get("preview", True)
+
+    async with db_pool.acquire() as conn:
+        candidates = await conn.fetch(
+            """SELECT id, email, source, created_at, import_batch, stripe_subscription_id
+               FROM subscriptions
+               WHERE import_batch LIKE 'ymove_import_%' OR import_batch LIKE 'ymove_react_%'
+               ORDER BY created_at DESC"""
+        )
+
+    if not candidates:
+        return {"status": "ok", "message": "No ymove-imported subs found", "updated": 0}
+
+    updated = 0
+    skipped = 0
+    errors = 0
+    details = []
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for i, row in enumerate(candidates):
+            email = (row["email"] or "").strip().lower()
+            if not email:
+                skipped += 1
+                continue
+
+            if i > 0 and i % 10 == 0:
+                await asyncio.sleep(1.5)
+
+            try:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": YMOVE_API_KEY},
+                    params={"email": email}
+                )
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("retry-after", "5"))
+                    await asyncio.sleep(retry_after)
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"email": email}
+                    )
+                if resp.status_code != 200:
+                    errors += 1
+                    continue
+
+                data = resp.json()
+                user = data.get("user", {})
+                signup_str = user.get("signupDate") or user.get("createdAt") or ""
+                if not signup_str:
+                    skipped += 1
+                    details.append({"email": email, "action": "skipped", "reason": "no signupDate in ymove"})
+                    continue
+
+                signup_dt = _parse_iso(signup_str)
+                if not signup_dt:
+                    skipped += 1
+                    details.append({"email": email, "action": "skipped", "reason": f"unparseable date: {signup_str}"})
+                    continue
+
+                current_created = row["created_at"]
+                if signup_dt >= current_created:
+                    skipped += 1
+                    details.append({"email": email, "action": "skipped", "reason": "ymove date not earlier"})
+                    continue
+
+                detail = {
+                    "email": email,
+                    "old_created_at": str(current_created),
+                    "new_created_at": str(signup_dt),
+                    "batch": row["import_batch"],
+                }
+
+                if preview:
+                    detail["action"] = "would_update"
+                else:
+                    async with db_pool.acquire() as conn2:
+                        await conn2.execute(
+                            "UPDATE subscriptions SET created_at = $1, updated_at = NOW() WHERE id = $2",
+                            signup_dt, row["id"]
+                        )
+                    detail["action"] = "updated"
+
+                details.append(detail)
+                updated += 1
+
+            except Exception as e:
+                errors += 1
+                details.append({"email": email, "action": "error", "reason": str(e)})
+
+    return {
+        "status": "preview" if preview else "ok",
+        "total_candidates": len(candidates),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "details": details[:50],
+        "note": "Set preview: false to apply" if preview else "Done. MRR trend chart should now reflect accurate dates."
     }
 
 
