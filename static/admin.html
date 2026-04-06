@@ -285,7 +285,13 @@
     <!-- Revenue Charts -->
     <div class="views-grid">
       <div class="card">
-        <div class="section-title">MRR Trend (Last 6 Months)</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div class="section-title" style="margin-bottom:0" id="mrr-trend-title">MRR Trend (12 Weeks)</div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn active" id="mrr-btn-week" onclick="setMrrView('week')" style="padding:4px 12px;font-size:.72rem">Weeks</button>
+            <button class="quick-btn" id="mrr-btn-month" onclick="setMrrView('month')" style="padding:4px 12px;font-size:.72rem">Months</button>
+          </div>
+        </div>
         <div id="chart-mrr-trend" class="bar-chart"></div>
       </div>
       <div class="card">
@@ -1101,10 +1107,18 @@ function loadStats() {
     // --- Revenue charts ---
     var sourceColors = {stripe:'navy', apple:'mid', google:'green'};
 
-    renderBarChart('chart-mrr-trend', (subs.mrr_trend || []).map(function(r) {
+    // S23: Store both trend datasets for toggle
+    window._mrrTrendWeekly = (subs.mrr_trend || []).map(function(r) {
       var dollars = (r.mrr_cents / 100).toFixed(0);
-      return {label: r.month.slice(5), value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
-    }));
+      return {label: r.period.slice(5), value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
+    });
+    window._mrrTrendMonthly = (subs.mrr_trend_monthly || []).map(function(r) {
+      var dollars = (r.mrr_cents / 100).toFixed(0);
+      var label = r.period.slice(2); // YY-MM
+      return {label: label, value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
+    });
+    var mrrView = window._mrrView || 'week';
+    renderBarChart('chart-mrr-trend', mrrView === 'month' ? window._mrrTrendMonthly : window._mrrTrendWeekly);
 
     renderBarChart('chart-mrr-source', (subs.mrr_by_source || []).map(function(r) {
       var dollars = (r.mrr_cents / 100).toFixed(0);
@@ -1339,6 +1353,15 @@ function tagClass(eventType) {
   if (eventType.indexOf('updated') > -1) return 'active';
   if (eventType.indexOf('deleted') > -1) return 'canceled';
   return 'active';
+}
+
+function setMrrView(view) {
+  window._mrrView = view;
+  document.getElementById('mrr-btn-week').className = 'quick-btn' + (view === 'week' ? ' active' : '');
+  document.getElementById('mrr-btn-month').className = 'quick-btn' + (view === 'month' ? ' active' : '');
+  document.getElementById('mrr-trend-title').textContent = view === 'month' ? 'MRR Trend (12 Months)' : 'MRR Trend (12 Weeks)';
+  var data = view === 'month' ? window._mrrTrendMonthly : window._mrrTrendWeekly;
+  if (data) renderBarChart('chart-mrr-trend', data);
 }
 
 function renderBarChart(containerId, data) {

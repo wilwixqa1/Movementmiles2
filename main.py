@@ -4625,16 +4625,31 @@ async def admin_stats(request: Request):
             "SELECT COUNT(*) FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''"
         )
 
-        # Phase 5b: MRR trend (weekly reconstructed, last 6 months)
-        mrr_trend = await conn.fetch(
+        # Phase 5b: MRR trend - weekly (last 12 weeks) + monthly (last 12 months)
+        mrr_trend_weekly = await conn.fetch(
             """SELECT
-                to_char(w, 'YYYY-MM-DD') as week,
+                to_char(w, 'YYYY-MM-DD') as period,
                 COALESCE(SUM(CASE WHEN s.plan_interval='month' THEN s.plan_amount ELSE 0 END), 0) as monthly_total,
                 COALESCE(SUM(CASE WHEN s.plan_interval='year' THEN s.plan_amount/12 ELSE 0 END), 0) as annual_total
                FROM generate_series(
-                   date_trunc('week', NOW() - INTERVAL '6 months'),
+                   date_trunc('week', NOW() - INTERVAL '12 weeks'),
                    date_trunc('week', NOW()),
                    '1 week'::interval
+               ) AS w
+               LEFT JOIN subscriptions s ON s.created_at <= w
+                   AND (s.canceled_at IS NULL OR s.canceled_at > w)
+                   AND s.status != 'incomplete_expired'
+               GROUP BY w ORDER BY w"""
+        )
+        mrr_trend_monthly = await conn.fetch(
+            """SELECT
+                to_char(w, 'YYYY-MM') as period,
+                COALESCE(SUM(CASE WHEN s.plan_interval='month' THEN s.plan_amount ELSE 0 END), 0) as monthly_total,
+                COALESCE(SUM(CASE WHEN s.plan_interval='year' THEN s.plan_amount/12 ELSE 0 END), 0) as annual_total
+               FROM generate_series(
+                   date_trunc('month', NOW() - INTERVAL '12 months'),
+                   date_trunc('month', NOW()),
+                   '1 month'::interval
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
                    AND (s.canceled_at IS NULL OR s.canceled_at > w)
@@ -4856,8 +4871,12 @@ async def admin_stats(request: Request):
                 for r in mrr_by_source
             ],
             "mrr_trend": [
-                {"month": r["week"], "mrr_cents": (r["monthly_total"] or 0) + (r["annual_total"] or 0)}
-                for r in mrr_trend
+                {"period": r["period"], "mrr_cents": (r["monthly_total"] or 0) + (r["annual_total"] or 0)}
+                for r in mrr_trend_weekly
+            ],
+            "mrr_trend_monthly": [
+                {"period": r["period"], "mrr_cents": (r["monthly_total"] or 0) + (r["annual_total"] or 0)}
+                for r in mrr_trend_monthly
             ],
             "arr_cents": arr_cents,
             "arr_display": f"${arr_cents / 100:,.2f}",
