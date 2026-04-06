@@ -4488,6 +4488,26 @@ async def admin_stats(request: Request):
                GROUP BY source"""
         )
 
+        # S22: Subscription UTM attribution (from ymove meta parameters)
+        subs_by_utm_source = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source, ''), 'none') as channel, COUNT(*) as count
+               FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''
+               GROUP BY channel ORDER BY count DESC"""
+        )
+        subs_by_utm_medium = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_medium, ''), 'none') as medium, COUNT(*) as count
+               FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''
+               GROUP BY medium ORDER BY count DESC"""
+        )
+        subs_by_utm_campaign = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_campaign, ''), 'none') as campaign, COUNT(*) as count
+               FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''
+               GROUP BY campaign ORDER BY count DESC LIMIT 10"""
+        )
+        subs_with_utm = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''"
+        )
+
         # Phase 5b: MRR trend (last 6 months)
         mrr_trend = await conn.fetch(
             """SELECT
@@ -4719,6 +4739,12 @@ async def admin_stats(request: Request):
             {"month": r["month"], "channel": r["channel"], "amount_cents": r["amount_cents"]}
             for r in ad_spend_rows
         ],
+        "subscription_utm": {
+            "total_with_utm": subs_with_utm or 0,
+            "by_source": [{"channel": r["channel"], "count": r["count"]} for r in subs_by_utm_source],
+            "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
+            "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
+        },
     }
 
 
@@ -4756,7 +4782,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.6.0",
+        "version": "22.7.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
