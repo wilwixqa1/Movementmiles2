@@ -393,6 +393,12 @@ RULES:
 - If a day had zero activity in some area, just note it briefly, don't over-analyze
 - Platform fee context: Apple and Google take 15%, Stripe takes ~2.9%
 
+MARKETING ATTRIBUTION:
+- "subs_by_utm_source_24h" shows which marketing channels drove new subscribers in the last 24 hours (only Stripe signups with UTM tracking, not Apple/Google).
+- "top_traffic_sources_7d" shows which channels drove the most page views in the last 7 days.
+- If UTM data is present, briefly note which channels are performing. If empty, don't mention it (UTM tracking is new and data is still building up).
+- Keep marketing commentary to one bullet max.
+
 FORMAT your response as a short paragraph overview, then bullet points for key insights. Keep total response under 200 words."""
 
 
@@ -1478,6 +1484,22 @@ async def gather_daily_stats() -> dict:
                ORDER BY created_at DESC LIMIT 30"""
         )
 
+        # S23: Subscription UTM attribution (new subs in last 24h with UTMs)
+        subs_by_utm_24h = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source,''), 'direct') as channel, COUNT(*) as count
+               FROM subscriptions WHERE created_at > NOW() - INTERVAL '24 hours'
+               AND created_at <= NOW() AND utm_source != ''
+               GROUP BY channel ORDER BY count DESC"""
+        )
+
+        # S23: Top traffic source (7d page views by UTM)
+        top_traffic_7d = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source,''), 'direct') as channel, COUNT(*) as views
+               FROM page_views WHERE created_at > NOW() - INTERVAL '7 days'
+               AND utm_source != ''
+               GROUP BY channel ORDER BY views DESC LIMIT 5"""
+        )
+
     # Calculate fees
     fee_breakdown = {}
     total_fees_cents = 0
@@ -1520,6 +1542,8 @@ async def gather_daily_stats() -> dict:
         "chat_sessions_24h": chats_24h or 0,
         "events_24h": len(recent_events),
         "mrr_by_source": [{"source": r["source"], "mrr_cents": r["mrr_cents"] or 0} for r in mrr_by_source],
+        "subs_by_utm_24h": [{"channel": r["channel"], "count": r["count"]} for r in subs_by_utm_24h],
+        "top_traffic_7d": [{"channel": r["channel"], "views": r["views"]} for r in top_traffic_7d],
     }
 
 
@@ -1545,6 +1569,8 @@ async def generate_digest_insights(stats: dict) -> str:
         "chat_sessions_24h": stats.get("chat_sessions_24h", 0),
         "mrr_by_source": stats.get("mrr_by_source", []),
         "fee_breakdown": stats.get("fee_breakdown", {}),
+        "subs_by_utm_source_24h": stats.get("subs_by_utm_24h", []),
+        "top_traffic_sources_7d": stats.get("top_traffic_7d", []),
     }
     stats_text = json.dumps(slim, indent=2, default=str)
     prompt = f"Here are today's metrics for Movement & Miles (fitness subscription app). Generate a brief morning digest with key insights and any recommended actions.\n\n{stats_text}"
@@ -1696,6 +1722,26 @@ def build_digest_html(stats: dict, insights: str) -> str:
     <tr style="background:#f7f7f7"><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Source</th><th style="padding:8px 12px;font-size:11px;text-align:left;color:#536c7c;font-weight:600;text-transform:uppercase">Count</th></tr>
     {lead_source_rows}
   </table>
+</td></tr>"""
+
+    # S23: Marketing attribution section
+    subs_utm = stats.get("subs_by_utm_24h", [])
+    top_traffic = stats.get("top_traffic_7d", [])
+    if subs_utm or top_traffic:
+        marketing_lines = ""
+        if subs_utm:
+            parts = ", ".join(f"{u['count']} from {u['channel']}" for u in subs_utm)
+            marketing_lines += f'<p style="margin:0 0 6px;font-size:14px;color:#333"><strong>New subscribers (24h):</strong> {parts}</p>'
+        if top_traffic:
+            top = top_traffic[0]
+            marketing_lines += f'<p style="margin:0;font-size:14px;color:#333"><strong>Top traffic source (7d):</strong> {top["channel"]} ({top["views"]:,} views)</p>'
+        html += f"""
+<!-- Marketing Attribution -->
+<tr><td style="padding:0 32px 24px">
+  <h2 style="margin:0 0 12px;color:#182241;font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Marketing</h2>
+  <div style="background:#f0f4f8;border-radius:8px;padding:16px 20px">
+    {marketing_lines}
+  </div>
 </td></tr>"""
 
     html += f"""
