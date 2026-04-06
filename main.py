@@ -4640,7 +4640,8 @@ async def admin_stats(request: Request):
         )
 
         # Phase 5b: MRR trend - weekly (last 12 weeks) + monthly (last 12 months)
-        # S23: reactivated_at ensures reactivated subs only count from their reactivation date
+        # Note: reactivated subs count from their created_at because they were paying
+        # on Apple/Google the whole time - our DB just had bad data before S19 reconciliation.
         mrr_trend_weekly = await conn.fetch(
             """SELECT
                 to_char(w, 'YYYY-MM-DD') as period,
@@ -4653,7 +4654,6 @@ async def admin_stats(request: Request):
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
                    AND (s.canceled_at IS NULL OR s.canceled_at > w)
-                   AND (s.reactivated_at IS NULL OR s.reactivated_at <= w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
@@ -4669,7 +4669,6 @@ async def admin_stats(request: Request):
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
                    AND (s.canceled_at IS NULL OR s.canceled_at > w)
-                   AND (s.reactivated_at IS NULL OR s.reactivated_at <= w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
