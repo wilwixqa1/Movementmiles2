@@ -239,6 +239,20 @@ async def startup():
                     )
                 """)
 
+            # Block 3c: reactivated_at column + backfill (S23)
+            async with db_pool.acquire() as conn:
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS reactivated_at TIMESTAMPTZ")
+                # Backfill: tag subs reactivated by ymove verification batches
+                backfilled = await conn.execute(
+                    """UPDATE subscriptions SET reactivated_at = updated_at
+                       WHERE import_batch LIKE 'ymove_react_%'
+                       AND reactivated_at IS NULL
+                       AND status = 'active'"""
+                )
+                count = int(backfilled.split(" ")[-1]) if backfilled else 0
+                if count > 0:
+                    print(f"[Startup] Block 3c: Backfilled reactivated_at on {count} subs")
+
             # Block 4: Indexes (non-blocking, failure will not kill startup)
             try:
                 async with db_pool.acquire() as conn:
@@ -2318,7 +2332,7 @@ async def ymove_reactivate(request: Request):
                 details.append({"email": email_lower, "action": "would_reactivate", "sub_id": row["stripe_subscription_id"], "source": row["source"], "canceled_at": str(row["canceled_at"] or "")})
                 reactivated += 1
             else:
-                await conn.execute("UPDATE subscriptions SET status = 'active', canceled_at = NULL, updated_at = NOW(), import_batch = $1 WHERE id = $2", batch_id, row["id"])
+                await conn.execute("UPDATE subscriptions SET status = 'active', canceled_at = NULL, reactivated_at = NOW(), updated_at = NOW(), import_batch = $1 WHERE id = $2", batch_id, row["id"])
                 reactivated += 1
                 details.append({"email": email_lower, "action": "reactivated", "sub_id": row["stripe_subscription_id"], "source": row["source"]})
 
@@ -2843,7 +2857,7 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
             try:
                 result = await conn.execute(
                     """UPDATE subscriptions SET status = 'active', canceled_at = NULL,
-                       updated_at = NOW(), import_batch = $1
+                       reactivated_at = NOW(), updated_at = NOW(), import_batch = $1
                        WHERE id = $2 AND status = 'canceled'""",
                     batch_id, item["db_id"]
                 )
@@ -4626,6 +4640,7 @@ async def admin_stats(request: Request):
         )
 
         # Phase 5b: MRR trend - weekly (last 12 weeks) + monthly (last 12 months)
+        # S23: reactivated_at ensures reactivated subs only count from their reactivation date
         mrr_trend_weekly = await conn.fetch(
             """SELECT
                 to_char(w, 'YYYY-MM-DD') as period,
@@ -4638,6 +4653,7 @@ async def admin_stats(request: Request):
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
                    AND (s.canceled_at IS NULL OR s.canceled_at > w)
+                   AND (s.reactivated_at IS NULL OR s.reactivated_at <= w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
@@ -4653,6 +4669,7 @@ async def admin_stats(request: Request):
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
                    AND (s.canceled_at IS NULL OR s.canceled_at > w)
+                   AND (s.reactivated_at IS NULL OR s.reactivated_at <= w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
@@ -5136,7 +5153,7 @@ async def import_meg_apple_google(request: Request, file: UploadFile = File(...)
             try:
                 result = await conn.execute("""
                     UPDATE subscriptions SET status = 'active', canceled_at = NULL,
-                        updated_at = NOW(), import_batch = $1
+                        reactivated_at = NOW(), updated_at = NOW(), import_batch = $1
                     WHERE id = (
                         SELECT id FROM subscriptions
                         WHERE lower(email) = $2 AND status = 'canceled' AND source IN ('apple', 'google')
