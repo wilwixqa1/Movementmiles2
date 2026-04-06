@@ -4,7 +4,7 @@
 var GS_API = '/api/chat';
 var gsHistory = [];
 
-var STRIPE_CHECKOUT_URL = 'https://buy.stripe.com/test_cNiaEWajyfKq9xa47R0kE00';
+var STRIPE_CHECKOUT_URL = 'https://ymove.app/join/movementandmiles';
 
 function gsParseButtons(text) {
   var match = text.match(/\[([^\]]+)\]\s*$/);
