@@ -106,6 +106,9 @@ async def startup():
                 # UTM tracking columns on leads
                 for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source']:
                     await conn.execute(f"ALTER TABLE leads ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+                # S22: UTM tracking columns on page_views
+                for col in ['utm_source', 'utm_medium', 'utm_campaign']:
+                    await conn.execute(f"ALTER TABLE page_views ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
             print("[Startup] Block 1: Core tables ready")
 
             # Block 2: Subscription tables + ALTER columns
@@ -587,6 +590,9 @@ class PageViewRequest(BaseModel):
     page: str = ""
     path: str = ""
     referrer: str = ""
+    utm_source: str = ""
+    utm_medium: str = ""
+    utm_campaign: str = ""
 
 class LoginRequest(BaseModel):
     password: str
@@ -651,8 +657,8 @@ async def track_page_view(pv: PageViewRequest, request: Request):
             ua = request.headers.get("user-agent", "")
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO page_views (page, path, referrer, user_agent) VALUES ($1, $2, $3, $4)",
-                    pv.page, pv.path, pv.referrer, ua
+                    "INSERT INTO page_views (page, path, referrer, user_agent, utm_source, utm_medium, utm_campaign) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    pv.page, pv.path, pv.referrer, ua, pv.utm_source, pv.utm_medium, pv.utm_campaign
                 )
         except Exception as e:
             print(f"Page view error: {e}")
@@ -4375,6 +4381,13 @@ async def admin_stats(request: Request):
                WHERE created_at > NOW() - INTERVAL '7 days'
                GROUP BY day ORDER BY day"""
         )
+        # S22: Page views by UTM source (7 days)
+        pv_by_utm_source = await conn.fetch(
+            """SELECT COALESCE(NULLIF(utm_source, ''), 'direct') as channel, COUNT(*) as views
+               FROM page_views
+               WHERE created_at > NOW() - INTERVAL '7 days'
+               GROUP BY channel ORDER BY views DESC"""
+        )
 
         # Chat sessions
         total_chats = await conn.fetchval("SELECT COUNT(*) FROM chat_sessions")
@@ -4688,6 +4701,7 @@ async def admin_stats(request: Request):
             "today": today_views,
             "by_page": [{"page": r["page"], "views": r["views"]} for r in views_by_page],
             "by_day": [{"day": str(r["day"]), "views": r["views"]} for r in views_by_day],
+            "by_utm_source": [{"channel": r["channel"], "views": r["views"]} for r in pv_by_utm_source],
         },
         "chats": {
             "total": total_chats,
@@ -4782,7 +4796,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "22.7.0",
+        "version": "22.8.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
