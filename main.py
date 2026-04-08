@@ -2775,7 +2775,7 @@ async def _run_shadow_sync(run_id: int):
                     active_stripe_in_ymove += 1
                 elif email in all_known_emails:
                     # Known email but no active sub of any kind. Real cross-platform switcher.
-                    cross_platform_switchers.append({"email": email})
+                    cross_platform_switchers.append({"email": email, "provider": ymove_all_emails.get(email, "apple")})
                 else:
                     truly_new.append({"email": email, "provider": ymove_all_emails.get(email, "apple")})
 
@@ -3240,8 +3240,32 @@ async def run_daily_shadow_sync():
             else:
                 print("[Daily Sync] No changes to apply. Database is in sync.")
 
-            if switchers > 0:
-                print(f"[Daily Sync] Note: {switchers} cross-platform switchers found (NOT auto-imported, needs manual review).")
+            # S22: Auto-import cross-platform switchers (known real users who re-subscribed on different platform)
+            switcher_list = res_data.get("cross_platform_switchers", [])
+            if switcher_list:
+                switch_batch_id = f"autosync_switch_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                switch_imported = 0
+                switch_errors = 0
+                async with db_pool.acquire() as conn:
+                    for item in switcher_list:
+                        email = item["email"]
+                        provider = item.get("provider", "apple")
+                        email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+                        syn_id = f"ymove_switch_{provider}_{email_hash}"
+                        try:
+                            await conn.execute("""
+                                INSERT INTO subscriptions (
+                                    stripe_customer_id, stripe_subscription_id, email, status,
+                                    plan_interval, plan_amount, currency, source,
+                                    created_at, updated_at, import_batch
+                                ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                                ON CONFLICT (stripe_subscription_id) DO NOTHING
+                            """, syn_id, email, provider, switch_batch_id)
+                            switch_imported += 1
+                        except Exception as e:
+                            print(f"[Daily Sync] Switcher import error for {email}: {e}")
+                            switch_errors += 1
+                print(f"[Daily Sync] Auto-imported {switch_imported} cross-platform switchers ({switch_errors} errors, batch_id={switch_batch_id})")
 
             # S22: Auto-import truly new subscribers (filtered for test accounts)
             truly_new_list = res_data.get("truly_new", [])
@@ -5133,7 +5157,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "23.0.0",
+        "version": "23.1.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
