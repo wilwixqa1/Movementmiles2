@@ -2507,7 +2507,7 @@ async def ymove_shadow_sync(request: Request):
                 "active_stripe_in_ymove": res_data.get("active_stripe_in_ymove", 0),
                 "truly_new": len(res_data.get("truly_new", [])),
                 "unchanged": res_data.get("unchanged", 0),
-                "not_found": res_data.get("not_found_in_ymove", 0),
+                "not_found": len(res_data.get("not_found_in_ymove", [])),
                 "pull_all_status": res_data.get("pull_all_status", "unknown"),
             }
         return result
@@ -2532,7 +2532,7 @@ async def ymove_shadow_sync(request: Request):
             "active_stripe_in_ymove": res_data.get("active_stripe_in_ymove", 0),
             "truly_new": res_data.get("truly_new", []),
             "unchanged": res_data.get("unchanged", 0),
-            "not_found_in_ymove": res_data.get("not_found_in_ymove", 0),
+            "not_found_in_ymove": res_data.get("not_found_in_ymove", []),
             "errors": res_data.get("errors", 0),
             "pull_all_status": res_data.get("pull_all_status", "unknown"),
             "pull_all_emails_found": res_data.get("pull_all_emails_found", 0),
@@ -2735,7 +2735,7 @@ async def _run_shadow_sync(run_id: int):
         active_stripe_in_ymove = 0     # Active Stripe users ymove also tracks (no action)
         truly_new = []
         unchanged = 0
-        not_found = 0
+        not_found = []
         verify_errors = 0
 
         # Categorize our active subs based on ymove verification
@@ -2753,7 +2753,14 @@ async def _run_shadow_sync(run_id: int):
                         "db_id": r["id"],
                     })
             elif ymove_status == "not_found":
-                not_found += 1
+                r = our_active_lookup.get(email)
+                if r:
+                    not_found.append({
+                        "email": email,
+                        "sub_id": r["stripe_subscription_id"],
+                        "source": r["source"],
+                        "db_id": r["id"],
+                    })
             else:
                 verify_errors += 1
 
@@ -2810,7 +2817,7 @@ async def _run_shadow_sync(run_id: int):
         print(f"[Shadow Sync] Run {run_id} COMPLETED. "
               f"Deactivate: {len(to_deactivate)}, Reactivate: {len(to_reactivate)}, "
               f"Switchers: {len(cross_platform_switchers)}, Stripe-in-ymove: {active_stripe_in_ymove}, "
-              f"New: {len(truly_new)}, Unchanged: {unchanged}, Not found: {not_found}")
+              f"New: {len(truly_new)}, Unchanged: {unchanged}, Not found: {len(not_found)}")
 
     except Exception as e:
         print(f"[Shadow Sync] Run {run_id} FAILED: {e}")
@@ -5157,7 +5164,7 @@ async def health():
     return {
         "status": "ok",
         "service": "Movement & Miles",
-        "version": "23.1.0",
+        "version": "23.2.0",
         "database": db_status,
         "stripe": stripe_status,
         "daily_digest": digest_status,
