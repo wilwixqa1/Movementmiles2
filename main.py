@@ -577,6 +577,26 @@ def _get_date(row):
     return None
 
 
+# S22: Shared test account filter (used by ymove-import-new and daily shadow sync)
+_TEST_EMAIL_DOMAINS = ["ymove.app"]
+_TEST_EMAIL_PATTERNS = ["test", "dsfg", "asdf", "qwer", "dkek", "sjwj", "ffas", "fasd"]
+
+
+def _is_test_email(email: str) -> bool:
+    """Check if an email looks like a test account."""
+    if not email or "@" not in email:
+        return True
+    em = email.strip().lower()
+    domain = em.split("@")[-1]
+    local = em.split("@")[0]
+    if domain in _TEST_EMAIL_DOMAINS:
+        return True
+    for pat in _TEST_EMAIL_PATTERNS:
+        if pat in local:
+            return True
+    return False
+
+
 # --- Pydantic Models ---
 
 class ChatRequest(BaseModel):
@@ -2633,7 +2653,7 @@ async def _run_shadow_sync(run_id: int):
         print(f"[Shadow Sync] Phase 1 done: verified {processed} emails")
 
         # --- Phase 2: Best-effort pull all subscribed members ---
-        ymove_all_emails = set()
+        ymove_all_emails = {}  # email -> provider (S22: dict for auto-import)
         pull_all_status = "starting"
         pull_all_pages = 0
         total_pages_est = 0
@@ -2669,7 +2689,10 @@ async def _run_shadow_sync(run_id: int):
                     for u in users:
                         em = (u.get("email") or "").strip().lower()
                         if em:
-                            ymove_all_emails.add(em)
+                            provider = (u.get("subscriptionProvider") or "apple").lower()
+                            if provider not in ("apple", "google"):
+                                provider = "apple"
+                            ymove_all_emails[em] = provider
 
                     total_pages_est = data.get("totalPages", 1)
                     pull_all_pages = page
@@ -2754,7 +2777,7 @@ async def _run_shadow_sync(run_id: int):
                     # Known email but no active sub of any kind. Real cross-platform switcher.
                     cross_platform_switchers.append({"email": email})
                 else:
-                    truly_new.append({"email": email})
+                    truly_new.append({"email": email, "provider": ymove_all_emails.get(email, "apple")})
 
         # Build final results
         results = {
@@ -3217,8 +3240,40 @@ async def run_daily_shadow_sync():
             else:
                 print("[Daily Sync] No changes to apply. Database is in sync.")
 
-            if switchers > 0 or truly_new > 0:
-                print(f"[Daily Sync] Note: {switchers} cross-platform switchers and {truly_new} truly new subs found but NOT auto-imported. Review manually.")
+            if switchers > 0:
+                print(f"[Daily Sync] Note: {switchers} cross-platform switchers found (NOT auto-imported, needs manual review).")
+
+            # S22: Auto-import truly new subscribers (filtered for test accounts)
+            truly_new_list = res_data.get("truly_new", [])
+            if truly_new_list:
+                real_new = [t for t in truly_new_list if not _is_test_email(t.get("email", ""))]
+                test_skipped = len(truly_new_list) - len(real_new)
+                if real_new:
+                    import_batch_id = f"autosync_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    imported = 0
+                    import_errors = 0
+                    async with db_pool.acquire() as conn:
+                        for item in real_new:
+                            email = item["email"]
+                            provider = item.get("provider", "apple")
+                            email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+                            syn_id = f"ymove_new_{provider}_{email_hash}"
+                            try:
+                                await conn.execute("""
+                                    INSERT INTO subscriptions (
+                                        stripe_customer_id, stripe_subscription_id, email, status,
+                                        plan_interval, plan_amount, currency, source,
+                                        created_at, updated_at, import_batch
+                                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                                """, syn_id, email, provider, import_batch_id)
+                                imported += 1
+                            except Exception as e:
+                                print(f"[Daily Sync] Import error for {email}: {e}")
+                                import_errors += 1
+                    print(f"[Daily Sync] Auto-imported {imported} new subscribers ({test_skipped} test accounts skipped, {import_errors} errors, batch_id={import_batch_id})")
+                else:
+                    print(f"[Daily Sync] {len(truly_new_list)} truly new found but all were test accounts ({test_skipped} skipped).")
         else:
             status = run["status"] if run else "unknown"
             error = run.get("error", "") if run else ""
