@@ -2064,7 +2064,8 @@ async def admin_ymove_log(request: Request):
 @app.get("/api/admin/provider-test")
 async def provider_test_get(request: Request):
     """S23: GET version of provider test - hit this in your browser.
-    Compare individual vs bulk ymove API provider fields."""
+    Compare individual vs bulk ymove API provider fields.
+    Uses subscription ID patterns to pick KNOWN-GOOD users from each source."""
     pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
     require_admin(pw)
 
@@ -2074,21 +2075,53 @@ async def provider_test_get(request: Request):
     if not db_pool:
         return JSONResponse(status_code=500, content={"error": "No database connected"})
 
-    # Pick one known sub from each source
+    # Pick KNOWN-GOOD users based on subscription ID pattern (not source label which may be wrong)
     test_emails = {}
     async with db_pool.acquire() as conn:
-        for src in ("apple", "google", "stripe"):
-            row = await conn.fetchrow(
-                """SELECT email, stripe_subscription_id, source FROM subscriptions
-                   WHERE source = $1 AND status = 'active' AND email != '' AND email IS NOT NULL
-                   ORDER BY created_at DESC LIMIT 1""", src
-            )
-            if row:
-                test_emails[src] = {"email": row["email"], "sub_id": row["stripe_subscription_id"]}
+        # Stripe: sub_* prefix = came from Stripe webhook directly, 100% Stripe
+        row = await conn.fetchrow(
+            """SELECT email, stripe_subscription_id, source FROM subscriptions
+               WHERE stripe_subscription_id LIKE 'sub_%' AND status = 'active'
+               AND email != '' AND email IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if row:
+            test_emails["stripe_verified"] = {"email": row["email"], "sub_id": row["stripe_subscription_id"], "source": row["source"], "why": "sub_* prefix = direct Stripe webhook"}
+
+        # Apple: numeric ID = Apple transactionId from ymove webhook with provider=apple
+        row = await conn.fetchrow(
+            """SELECT email, stripe_subscription_id, source FROM subscriptions
+               WHERE stripe_subscription_id ~ '^[0-9]+$' AND status = 'active'
+               AND email != '' AND email IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if row:
+            test_emails["apple_verified"] = {"email": row["email"], "sub_id": row["sub_id"] if "sub_id" in row else row["stripe_subscription_id"], "source": row["source"], "why": "numeric ID = Apple transactionId from ymove webhook"}
+
+        # Google: ym_google_* prefix = came from ymove webhook with provider=google
+        row = await conn.fetchrow(
+            """SELECT email, stripe_subscription_id, source FROM subscriptions
+               WHERE stripe_subscription_id LIKE 'ym_google_%' AND status = 'active'
+               AND email != '' AND email IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if row:
+            test_emails["google_verified"] = {"email": row["email"], "sub_id": row["stripe_subscription_id"], "source": row["source"], "why": "ym_google_* prefix = ymove webhook with provider=google"}
+
+        # Shadow sync import: ymove_new_* = came from shadow sync (provider unknown)
+        row = await conn.fetchrow(
+            """SELECT email, stripe_subscription_id, source FROM subscriptions
+               WHERE stripe_subscription_id LIKE 'ymove_new_%' AND status = 'active'
+               AND email != '' AND email IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if row:
+            test_emails["shadow_sync_import"] = {"email": row["email"], "sub_id": row["stripe_subscription_id"], "source": row["source"], "why": "ymove_new_* = shadow sync import, provider was guessed"}
 
     results = {}
     async with httpx.AsyncClient(timeout=15.0) as client:
-        for src, info in test_emails.items():
+        # Individual lookups for each test user
+        for label, info in test_emails.items():
             try:
                 resp = await client.get(
                     f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
@@ -2097,53 +2130,66 @@ async def provider_test_get(request: Request):
                 )
                 raw = resp.json() if resp.status_code == 200 else {"http_status": resp.status_code}
                 user_obj = raw.get("user", {})
-                results[src] = {
+                results[label] = {
                     "email": info["email"],
                     "our_sub_id": info["sub_id"],
-                    "our_source": src,
-                    "individual_lookup": {
-                        "subscriptionProvider": user_obj.get("subscriptionProvider"),
-                        "all_provider_fields": {k: v for k, v in user_obj.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
-                        "full_user_keys": list(user_obj.keys()),
-                    }
+                    "our_source_label": info["source"],
+                    "id_pattern_means": info["why"],
+                    "ymove_subscriptionProvider": user_obj.get("subscriptionProvider"),
+                    "ymove_activeSubscription": user_obj.get("activeSubscription"),
+                    "ymove_all_fields": {k: v for k, v in user_obj.items()},
                 }
             except Exception as e:
-                results[src] = {"email": info["email"], "error": str(e)}
+                results[label] = {"email": info["email"], "error": str(e)}
             await asyncio.sleep(1.5)
 
-        # Bulk lookup page 1
+        # Bulk: scan ALL pages and count how many have non-null provider
+        bulk_stats = {"total_users": 0, "null_provider": 0, "non_null_provider": 0, "provider_values": {}, "sample_non_null": [], "pages_scanned": 0}
         try:
-            resp = await client.get(
-                f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
-                headers={"X-Authorization": ymove_key},
-                params={"status": "subscribed", "page": "1"}
-            )
-            if resp.status_code == 200:
-                bulk_data = resp.json()
-                bulk_users = bulk_data.get("users", [])
-                bulk_by_email = {(u.get("email") or "").strip().lower(): u for u in bulk_users}
-                for src, info in test_emails.items():
-                    bulk_user = bulk_by_email.get(info["email"].lower())
-                    if bulk_user:
-                        results[src]["bulk_lookup"] = {
-                            "subscriptionProvider": bulk_user.get("subscriptionProvider"),
-                            "all_provider_fields": {k: v for k, v in bulk_user.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
-                        }
+            page = 1
+            while page <= 30:  # safety cap
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                    headers={"X-Authorization": ymove_key},
+                    params={"status": "subscribed", "page": str(page)}
+                )
+                if resp.status_code == 429:
+                    await asyncio.sleep(5)
+                    continue
+                if resp.status_code != 200:
+                    bulk_stats["stopped_at"] = f"page {page}, HTTP {resp.status_code}"
+                    break
+                data = resp.json()
+                users = data.get("users", [])
+                if not users:
+                    break
+                for u in users:
+                    bulk_stats["total_users"] += 1
+                    prov = u.get("subscriptionProvider")
+                    if prov is None or prov == "" or prov == "null":
+                        bulk_stats["null_provider"] += 1
                     else:
-                        results[src]["bulk_lookup"] = "not_found_on_page_1"
-                results["_bulk_sample"] = [
-                    {k: v for k, v in u.items() if "provider" in k.lower() or "payment" in k.lower() or "email" in k.lower()}
-                    for u in bulk_users[:3]
-                ]
-            else:
-                results["_bulk_error"] = {"http_status": resp.status_code}
+                        bulk_stats["non_null_provider"] += 1
+                        prov_str = str(prov).lower()
+                        bulk_stats["provider_values"][prov_str] = bulk_stats["provider_values"].get(prov_str, 0) + 1
+                        if len(bulk_stats["sample_non_null"]) < 5:
+                            bulk_stats["sample_non_null"].append({"email": u.get("email"), "provider": prov})
+                bulk_stats["pages_scanned"] = page
+                total_pages = data.get("totalPages", 1)
+                if page >= total_pages:
+                    break
+                page += 1
+                await asyncio.sleep(1.0)
         except Exception as e:
-            results["_bulk_error"] = str(e)
+            bulk_stats["error"] = str(e)
+
+        results["_bulk_scan"] = bulk_stats
 
     return {
-        "test": "provider_field_comparison",
-        "purpose": "Compare individual member-lookup vs bulk member-lookup/all provider fields",
-        "results": results
+        "test": "provider_field_comparison_v2",
+        "purpose": "Test KNOWN-GOOD users by ID pattern + scan ALL bulk pages for any non-null providers",
+        "results": results,
+        "conclusion": "If non_null_provider > 0, the API works for some users. If 0, Tosh needs to fix it."
     }
 
 

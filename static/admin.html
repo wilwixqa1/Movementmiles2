@@ -1646,7 +1646,7 @@ function doProviderTest() {
   var res = document.getElementById("res-provider-test");
   btn.disabled = true;
   res.className = "tool-result loading";
-  res.textContent = "Testing ymove API provider fields (takes ~10s)...";
+  res.textContent = "Testing ymove API provider fields across all pages (may take 30-60s)...";
   fetch("/api/admin/provider-test", {
     headers: {"X-Admin-Password": adminPw}
   }).then(function(r) {
@@ -1654,29 +1654,54 @@ function doProviderTest() {
     return r.json();
   }).then(function(d) {
     res.className = "tool-result ok";
-    var html = '<h4 style="margin:0 0 12px">Provider Field Comparison</h4>';
+    var html = '<h4 style="margin:0 0 12px">Provider Field Test (v2)</h4>';
     var r = d.results || {};
-    ['apple', 'google', 'stripe'].forEach(function(src) {
-      if (!r[src]) return;
-      var item = r[src];
-      var indivProvider = (item.individual_lookup || {}).subscriptionProvider;
-      var bulkProvider = item.bulk_lookup && typeof item.bulk_lookup === 'object' ? item.bulk_lookup.subscriptionProvider : item.bulk_lookup;
-      var match = indivProvider === bulkProvider;
+
+    // Individual lookups by verified ID pattern
+    ['stripe_verified', 'apple_verified', 'google_verified', 'shadow_sync_import'].forEach(function(key) {
+      if (!r[key]) return;
+      var item = r[key];
+      var prov = item.ymove_subscriptionProvider;
       html += '<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:10px">';
-      html += '<strong style="text-transform:capitalize">' + src + '</strong> — ' + item.email + '<br>';
-      html += 'Individual lookup provider: <strong style="color:' + (indivProvider ? '#2d6a2d' : '#c62828') + '">' + (indivProvider || 'null') + '</strong><br>';
-      html += 'Bulk lookup provider: <strong style="color:' + (bulkProvider ? '#2d6a2d' : '#c62828') + '">' + (bulkProvider || 'null') + '</strong><br>';
-      html += 'Match: ' + (match ? '✅' : '❌') + '<br>';
-      if (item.individual_lookup && item.individual_lookup.all_provider_fields) {
-        html += '<details><summary style="cursor:pointer;color:#666;font-size:.8rem">All provider fields</summary>';
-        html += '<pre style="font-size:.75rem;white-space:pre-wrap;margin:4px 0">' + JSON.stringify(item.individual_lookup.all_provider_fields, null, 2) + '</pre></details>';
+      html += '<strong>' + key.replace(/_/g, ' ') + '</strong><br>';
+      html += '<span style="font-size:.8rem;color:#666">' + (item.id_pattern_means || '') + '</span><br>';
+      html += 'Email: ' + item.email + '<br>';
+      html += 'Our sub ID: <code style="font-size:.78rem">' + (item.our_sub_id || '') + '</code><br>';
+      html += 'Our source label: <strong>' + (item.our_source_label || '') + '</strong><br>';
+      html += 'ymove subscriptionProvider: <strong style="color:' + (prov ? '#2d6a2d' : '#c62828') + '">' + (prov || 'null') + '</strong><br>';
+      if (item.ymove_all_fields) {
+        html += '<details><summary style="cursor:pointer;color:#666;font-size:.8rem">Full ymove response</summary>';
+        html += '<pre style="font-size:.72rem;white-space:pre-wrap;margin:4px 0">' + JSON.stringify(item.ymove_all_fields, null, 2) + '</pre></details>';
       }
       html += '</div>';
     });
-    if (r._bulk_sample) {
-      html += '<details><summary style="cursor:pointer;color:#666">Bulk API sample (first 3 users)</summary>';
-      html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(r._bulk_sample, null, 2) + '</pre></details>';
+
+    // Bulk scan results
+    if (r._bulk_scan) {
+      var bs = r._bulk_scan;
+      html += '<div style="border:2px solid #1a237e;border-radius:8px;padding:12px;margin-top:12px">';
+      html += '<h4 style="margin:0 0 8px">Bulk API Full Scan</h4>';
+      html += 'Pages scanned: <strong>' + bs.pages_scanned + '</strong><br>';
+      html += 'Total users: <strong>' + bs.total_users + '</strong><br>';
+      html += 'Null provider: <strong style="color:#c62828">' + bs.null_provider + '</strong><br>';
+      html += 'Non-null provider: <strong style="color:#2d6a2d">' + bs.non_null_provider + '</strong><br>';
+      if (bs.provider_values && Object.keys(bs.provider_values).length > 0) {
+        html += 'Provider breakdown: ';
+        Object.keys(bs.provider_values).forEach(function(k) { html += k + '=' + bs.provider_values[k] + ' '; });
+        html += '<br>';
+      }
+      if (bs.sample_non_null && bs.sample_non_null.length > 0) {
+        html += '<details><summary style="cursor:pointer;color:#666;font-size:.8rem">Sample non-null users</summary>';
+        html += '<pre style="font-size:.72rem;white-space:pre-wrap">' + JSON.stringify(bs.sample_non_null, null, 2) + '</pre></details>';
+      }
+      if (bs.non_null_provider === 0) {
+        html += '<div style="background:#ffebee;padding:8px;border-radius:6px;margin-top:8px;font-size:.82rem"><strong>Conclusion:</strong> subscriptionProvider is null for ALL ' + bs.total_users + ' users. Tosh needs to fix this field.</div>';
+      } else {
+        html += '<div style="background:#e8f5e9;padding:8px;border-radius:6px;margin-top:8px;font-size:.82rem"><strong>Conclusion:</strong> ' + bs.non_null_provider + '/' + bs.total_users + ' users have provider data. We can use this!</div>';
+      }
+      html += '</div>';
     }
+
     res.innerHTML = html;
     btn.disabled = false;
   }).catch(function(e) {
