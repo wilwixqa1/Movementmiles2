@@ -2689,9 +2689,9 @@ async def _run_shadow_sync(run_id: int):
                     for u in users:
                         em = (u.get("email") or "").strip().lower()
                         if em:
-                            provider = (u.get("subscriptionProvider") or "apple").lower()
-                            if provider not in ("apple", "google"):
-                                provider = "apple"
+                            provider = (u.get("subscriptionProvider") or "undetermined").lower()
+                            if provider not in ("apple", "google", "stripe", "undetermined"):
+                                provider = "undetermined"
                             ymove_all_emails[em] = provider
 
                     total_pages_est = data.get("totalPages", 1)
@@ -2782,9 +2782,9 @@ async def _run_shadow_sync(run_id: int):
                     active_stripe_in_ymove += 1
                 elif email in all_known_emails:
                     # Known email but no active sub of any kind. Real cross-platform switcher.
-                    cross_platform_switchers.append({"email": email, "provider": ymove_all_emails.get(email, "apple")})
+                    cross_platform_switchers.append({"email": email, "provider": ymove_all_emails.get(email, "undetermined")})
                 else:
-                    truly_new.append({"email": email, "provider": ymove_all_emails.get(email, "apple")})
+                    truly_new.append({"email": email, "provider": ymove_all_emails.get(email, "undetermined")})
 
         # Build final results
         results = {
@@ -2999,9 +2999,9 @@ async def ymove_import_new(request: Request):
                         # Try to determine provider from response
                         user_data = data.get("user", {})
                         provider = (user_data.get("subscriptionProvider") or
-                                    user_data.get("provider") or "apple").lower()
-                        if provider not in ("apple", "google"):
-                            provider = "apple"
+                                    user_data.get("provider") or "undetermined").lower()
+                        if provider not in ("apple", "google", "stripe", "undetermined"):
+                            provider = "undetermined"
                         verified.append({"email": email, "provider": provider, "raw": user_data})
                     else:
                         not_active.append({"email": email, "status": status})
@@ -3256,7 +3256,7 @@ async def run_daily_shadow_sync():
                 async with db_pool.acquire() as conn:
                     for item in switcher_list:
                         email = item["email"]
-                        provider = item.get("provider", "apple")
+                        provider = item.get("provider", "undetermined")
                         email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
                         syn_id = f"ymove_switch_{provider}_{email_hash}"
                         try:
@@ -3286,7 +3286,7 @@ async def run_daily_shadow_sync():
                     async with db_pool.acquire() as conn:
                         for item in real_new:
                             email = item["email"]
-                            provider = item.get("provider", "apple")
+                            provider = item.get("provider", "undetermined")
                             email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
                             syn_id = f"ymove_new_{provider}_{email_hash}"
                             try:

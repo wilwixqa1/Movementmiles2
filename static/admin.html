@@ -76,6 +76,7 @@
   .tag-src-stripe{background:#e8eaf6;color:#635bff}
   .tag-src-apple{background:#f0f0f0;color:#333}
   .tag-src-google{background:#e8f4e8;color:#0f9d58}
+  .tag-src-undetermined{background:#fff3e0;color:#e65100}
 
   .empty-msg{text-align:center;padding:40px;color:var(--navy-mid);font-size:.9rem}
 
@@ -1105,7 +1106,7 @@ function loadStats() {
     document.getElementById('s-sub-age').textContent = Math.round(subs.avg_sub_age_days || 0);
 
     // --- Revenue charts ---
-    var sourceColors = {stripe:'navy', apple:'mid', google:'green'};
+    var sourceColors = {stripe:'navy', apple:'mid', google:'green', undetermined:'orange'};
 
     // S23: Store both trend datasets for toggle
     window._mrrTrendWeekly = (subs.mrr_trend || []).map(function(r) {
