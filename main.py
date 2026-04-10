@@ -3657,6 +3657,7 @@ async def provider_cleanup(request: Request):
         return {"status": "ok", "message": "No ymove_new_*/ymove_switch_* active records found. Nothing to clean up."}
 
     stripe_duplicates = []  # Have real sub_* record already — cancel the ymove_new_* copy
+    apple_google_duplicates = []  # Have real Apple transactionId or ym_google_* record — cancel the ymove_new_* copy
     meg_identified = []     # Meg import tells us the provider
     stripe_orphans = []     # Stripe confirms active but we don't have a sub_* record
     non_stripe = []
@@ -3681,7 +3682,29 @@ async def provider_cleanup(request: Request):
                     "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
                     "old_source": r["source"], "action": "cancel_duplicate",
                     "real_sub_id": existing_stripe["stripe_subscription_id"],
-                    "note": f"Duplicate — real Stripe sub exists: {existing_stripe['stripe_subscription_id']}"
+                    "note": f"Duplicate of Stripe sub: {existing_stripe['stripe_subscription_id']}"
+                })
+                continue
+
+            # Step 1b: do we already have a real Apple (numeric ID) or Google (ym_google_*) record?
+            existing_ag = await conn.fetchrow(
+                """SELECT id, stripe_subscription_id, source, status FROM subscriptions
+                   WHERE lower(email) = $1
+                   AND id != $2
+                   AND status IN ('active', 'trialing')
+                   AND (
+                       (stripe_subscription_id ~ '^[0-9]+$')
+                       OR (stripe_subscription_id LIKE 'ym_google_%%')
+                   )
+                   ORDER BY created_at DESC LIMIT 1""", email, r["id"]
+            )
+            if existing_ag:
+                apple_google_duplicates.append({
+                    "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                    "old_source": r["source"], "action": "cancel_duplicate",
+                    "real_sub_id": existing_ag["stripe_subscription_id"],
+                    "real_source": existing_ag["source"],
+                    "note": f"Duplicate of {existing_ag['source']} sub: {existing_ag['stripe_subscription_id']}"
                 })
                 continue
 
@@ -3735,15 +3758,17 @@ async def provider_cleanup(request: Request):
             "batch_id": batch_id,
             "total_candidates": len(candidates),
             "stripe_duplicates_to_cancel": len(stripe_duplicates),
+            "apple_google_duplicates_to_cancel": len(apple_google_duplicates),
             "meg_identified": len(meg_identified),
             "stripe_orphans_to_reclassify": len(stripe_orphans),
             "non_stripe_to_undetermined": len(non_stripe),
             "stripe_errors": stripe_errors,
             "duplicate_details": stripe_duplicates[:20],
+            "ag_duplicate_details": apple_google_duplicates[:20],
             "meg_details": meg_identified[:20],
             "orphan_details": stripe_orphans[:20],
             "undetermined_details": non_stripe[:20],
-            "note": "Send preview: false to apply. Duplicates get cancelled. Meg-identified get correct source. Stripe orphans get source='stripe'. Rest get source='undetermined'."
+            "note": "Send preview: false to apply. All duplicates get cancelled. Meg-identified get correct source. Stripe orphans get source='stripe'. Rest get source='undetermined'."
         }
 
     # Apply changes
@@ -3754,8 +3779,19 @@ async def provider_cleanup(request: Request):
     errors = 0
 
     async with db_pool.acquire() as conn:
-        # Cancel duplicates (they have real sub_* records already)
+        # Cancel Stripe duplicates
         for item in stripe_duplicates:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), import_batch = $1, updated_at = NOW() WHERE id = $2",
+                    batch_id, item["id"]
+                )
+                cancelled_dupes += 1
+            except Exception as e:
+                errors += 1
+
+        # Cancel Apple/Google duplicates
+        for item in apple_google_duplicates:
             try:
                 await conn.execute(
                     "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), import_batch = $1, updated_at = NOW() WHERE id = $2",

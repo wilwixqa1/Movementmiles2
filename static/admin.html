@@ -2082,6 +2082,7 @@ function doProviderCleanup(preview) {
       html += '<h4 style="margin:0 0 8px">Cleanup Preview</h4>';
       html += '<div>Total candidates: <strong>' + d.total_candidates + '</strong></div>';
       html += '<div>Stripe duplicates to cancel: <strong style="color:#c62828">' + (d.stripe_duplicates_to_cancel || 0) + '</strong></div>';
+      html += '<div>Apple/Google duplicates to cancel: <strong style="color:#c62828">' + (d.apple_google_duplicates_to_cancel || 0) + '</strong></div>';
       html += '<div>Meg-identified (Apple/Google): <strong style="color:#2d6a2d">' + (d.meg_identified || 0) + '</strong></div>';
       html += '<div>Stripe orphans to reclassify: <strong style="color:#635bff">' + (d.stripe_orphans_to_reclassify || 0) + '</strong></div>';
       html += '<div>Undetermined: <strong style="color:#e65100">' + (d.non_stripe_to_undetermined || 0) + '</strong></div>';
@@ -2092,6 +2093,14 @@ function doProviderCleanup(preview) {
         html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#c62828"><strong>Stripe duplicates to cancel (' + d.duplicate_details.length + ')</strong></summary>';
         d.duplicate_details.forEach(function(item) {
           html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — cancel ' + item.sub_id + ' (real: ' + item.real_sub_id + ')</div>';
+        });
+        html += '</details>';
+      }
+
+      if (d.ag_duplicate_details && d.ag_duplicate_details.length > 0) {
+        html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#c62828"><strong>Apple/Google duplicates to cancel (' + d.ag_duplicate_details.length + ')</strong></summary>';
+        d.ag_duplicate_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — cancel ' + item.sub_id + ' (real ' + item.real_source + ': ' + item.real_sub_id + ')</div>';
         });
         html += '</details>';
       }
