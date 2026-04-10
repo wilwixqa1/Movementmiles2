@@ -692,7 +692,7 @@
     <div class="section-toggle" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
-      <span class="toggle-hint">(4 tools)</span>
+      <span class="toggle-hint">(7 tools)</span>
     </div>
     <div class="collapsible" id="body-tools">
       <div class="tools-grid">
@@ -725,6 +725,27 @@
           <p>Manually trigger a daily digest email right now. Sends to configured recipients with [TEST] prefix.</p>
           <button class="tool-btn tool-btn-green" id="btn-test-digest" onclick="doTestDigest()">Send Test Digest</button>
           <div class="tool-result" id="res-test-digest"></div>
+        </div>
+
+        <div class="tool-card">
+          <h3 style="color:#e65100">Provider Test</h3>
+          <p>Tests whether ymove individual lookup and bulk lookup return provider data. Picks one Apple, Google, and Stripe user and compares both API responses.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-provider-test" onclick="doProviderTest()">Run Provider Test</button>
+          <div class="tool-result" id="res-provider-test" style="max-height:500px;overflow-y:auto"></div>
+        </div>
+
+        <div class="tool-card">
+          <h3 style="color:#e65100">Reconciliation Audit</h3>
+          <p>Deep audit: every batch operation, duplicates, source mismatches, data origins, missing emails. Shows exactly what has been done to the database and where gaps exist.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-recon-audit" onclick="doReconAudit()">Run Reconciliation Audit</button>
+          <div class="tool-result" id="res-recon-audit" style="max-height:500px;overflow-y:auto"></div>
+        </div>
+
+        <div class="tool-card">
+          <h3 style="color:#e65100">Data Audit</h3>
+          <p>15+ data quality checks: duplicates, stale trials, plan amount anomalies, MRR accuracy, conversion tracking, and risk scoring.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-data-audit" onclick="doDataAudit()">Run Data Audit</button>
+          <div class="tool-result" id="res-data-audit" style="max-height:500px;overflow-y:auto"></div>
         </div>
 
       </div>
@@ -1584,6 +1605,202 @@ function doTestDigest() {
   }).then(function(d) {
     res.className = "tool-result ok";
     res.textContent = "Digest sent to " + (d.recipients || []).join(", ") + ". MRR: " + (d.stats_summary ? d.stats_summary.gross_mrr : "n/a");
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+// --- Session 23: Diagnostic Tools ---
+
+function formatJson(obj, indent) {
+  indent = indent || 0;
+  var pad = '  '.repeat(indent);
+  if (obj === null || obj === undefined) return pad + 'null';
+  if (typeof obj === 'string') return pad + '"' + obj + '"';
+  if (typeof obj === 'number' || typeof obj === 'boolean') return pad + String(obj);
+  if (Array.isArray(obj)) {
+    if (obj.length === 0) return pad + '[]';
+    var items = obj.map(function(v) { return formatJson(v, indent + 1); });
+    return pad + '[\n' + items.join(',\n') + '\n' + pad + ']';
+  }
+  if (typeof obj === 'object') {
+    var keys = Object.keys(obj);
+    if (keys.length === 0) return pad + '{}';
+    var lines = keys.map(function(k) { 
+      var val = obj[k];
+      if (typeof val === 'object' && val !== null) {
+        return pad + '  "' + k + '":\n' + formatJson(val, indent + 2);
+      }
+      return pad + '  "' + k + '": ' + formatJson(val, 0).trim();
+    });
+    return pad + '{\n' + lines.join(',\n') + '\n' + pad + '}';
+  }
+  return pad + String(obj);
+}
+
+function doProviderTest() {
+  var btn = document.getElementById("btn-provider-test");
+  var res = document.getElementById("res-provider-test");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Testing ymove API provider fields (takes ~10s)...";
+  fetch("/api/admin/provider-test", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    var html = '<h4 style="margin:0 0 12px">Provider Field Comparison</h4>';
+    var r = d.results || {};
+    ['apple', 'google', 'stripe'].forEach(function(src) {
+      if (!r[src]) return;
+      var item = r[src];
+      var indivProvider = (item.individual_lookup || {}).subscriptionProvider;
+      var bulkProvider = item.bulk_lookup && typeof item.bulk_lookup === 'object' ? item.bulk_lookup.subscriptionProvider : item.bulk_lookup;
+      var match = indivProvider === bulkProvider;
+      html += '<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:10px">';
+      html += '<strong style="text-transform:capitalize">' + src + '</strong> — ' + item.email + '<br>';
+      html += 'Individual lookup provider: <strong style="color:' + (indivProvider ? '#2d6a2d' : '#c62828') + '">' + (indivProvider || 'null') + '</strong><br>';
+      html += 'Bulk lookup provider: <strong style="color:' + (bulkProvider ? '#2d6a2d' : '#c62828') + '">' + (bulkProvider || 'null') + '</strong><br>';
+      html += 'Match: ' + (match ? '✅' : '❌') + '<br>';
+      if (item.individual_lookup && item.individual_lookup.all_provider_fields) {
+        html += '<details><summary style="cursor:pointer;color:#666;font-size:.8rem">All provider fields</summary>';
+        html += '<pre style="font-size:.75rem;white-space:pre-wrap;margin:4px 0">' + JSON.stringify(item.individual_lookup.all_provider_fields, null, 2) + '</pre></details>';
+      }
+      html += '</div>';
+    });
+    if (r._bulk_sample) {
+      html += '<details><summary style="cursor:pointer;color:#666">Bulk API sample (first 3 users)</summary>';
+      html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(r._bulk_sample, null, 2) + '</pre></details>';
+    }
+    res.innerHTML = html;
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doReconAudit() {
+  var btn = document.getElementById("btn-recon-audit");
+  var res = document.getElementById("res-recon-audit");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Running reconciliation audit...";
+  fetch("/api/admin/reconciliation-audit", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    var html = '';
+    // Action items first
+    if (d.action_items && d.action_items.length) {
+      html += '<h4 style="margin:0 0 8px;color:#c62828">⚠ Action Items (' + d.action_items.length + ')</h4>';
+      d.action_items.forEach(function(a) { html += '<div style="background:#fff3e0;padding:8px;border-radius:6px;margin-bottom:6px;font-size:.82rem">' + a + '</div>'; });
+      html += '<hr style="margin:12px 0">';
+    }
+    // Summary
+    if (d.summary) {
+      html += '<h4 style="margin:0 0 8px">Summary</h4>';
+      html += '<pre style="font-size:.8rem;white-space:pre-wrap">' + JSON.stringify(d.summary, null, 2) + '</pre>';
+      html += '<hr style="margin:12px 0">';
+    }
+    // Data origins
+    if (d.data_origins) {
+      html += '<h4 style="margin:0 0 8px">Data Origins</h4><table style="font-size:.8rem;width:100%;border-collapse:collapse">';
+      html += '<tr style="background:#f5f5f5"><th style="text-align:left;padding:4px">Origin</th><th style="text-align:left;padding:4px">Status</th><th style="text-align:right;padding:4px">Count</th></tr>';
+      d.data_origins.forEach(function(r) { html += '<tr><td style="padding:4px">' + r.origin + '</td><td style="padding:4px">' + r.status + '</td><td style="text-align:right;padding:4px">' + r.count + '</td></tr>'; });
+      html += '</table><hr style="margin:12px 0">';
+    }
+    // Duplicates
+    if (d.duplicates) {
+      html += '<h4 style="margin:0 0 8px">Duplicate Active Emails: ' + d.duplicates.count + '</h4>';
+      if (d.duplicates.count > 0) {
+        var emails = d.duplicates.emails || {};
+        Object.keys(emails).slice(0, 10).forEach(function(em) {
+          html += '<details><summary style="cursor:pointer;font-size:.82rem">' + em + ' (' + emails[em].length + ' active subs)</summary>';
+          html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(emails[em], null, 2) + '</pre></details>';
+        });
+      }
+      html += '<hr style="margin:12px 0">';
+    }
+    // Batch history
+    if (d.batch_history) {
+      var bkeys = Object.keys(d.batch_history);
+      html += '<h4 style="margin:0 0 8px">Batch Operations (' + bkeys.length + ')</h4>';
+      html += '<details><summary style="cursor:pointer;font-size:.82rem">Show all batches</summary>';
+      bkeys.forEach(function(k) {
+        var b = d.batch_history[k];
+        html += '<div style="font-size:.78rem;margin:4px 0"><strong>' + k + '</strong> — ' + b.total_count + ' records</div>';
+      });
+      html += '</details><hr style="margin:12px 0">';
+    }
+    // Remaining sections as expandable JSON
+    ['id_patterns', 'source_accuracy', 'gaps', 'no_email_active', 'recent_syncs'].forEach(function(key) {
+      if (d[key]) {
+        html += '<details><summary style="cursor:pointer;font-size:.82rem">' + key.replace(/_/g, ' ') + '</summary>';
+        html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(d[key], null, 2) + '</pre></details>';
+      }
+    });
+    res.innerHTML = html;
+    btn.disabled = false;
+  }).catch(function(e) {
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  });
+}
+
+function doDataAudit() {
+  var btn = document.getElementById("btn-data-audit");
+  var res = document.getElementById("res-data-audit");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Running data audit (15+ checks)...";
+  fetch("/api/admin/data-audit", {
+    headers: {"X-Admin-Password": adminPw}
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    res.className = "tool-result ok";
+    var html = '';
+    // Summary and risk
+    if (d.summary) {
+      var color = d.summary.mrr_confidence === 'HIGH' ? '#2d6a2d' : d.summary.mrr_confidence === 'MEDIUM' ? '#e65100' : '#c62828';
+      html += '<h4 style="margin:0 0 8px">MRR Confidence: <span style="color:' + color + '">' + d.summary.mrr_confidence + '</span> (risk score: ' + d.summary.risk_score + ')</h4>';
+      if (d.summary.risk_factors && d.summary.risk_factors.length) {
+        d.summary.risk_factors.forEach(function(f) { html += '<div style="font-size:.82rem;color:#c62828;margin:2px 0">• ' + f + '</div>'; });
+      }
+      html += '<hr style="margin:12px 0">';
+    }
+    // Critical issues
+    if (d.critical_issues && d.critical_issues.length) {
+      html += '<h4 style="margin:0 0 8px;color:#c62828">Critical Issues (' + d.critical_issues.length + ')</h4>';
+      d.critical_issues.forEach(function(i) { html += '<div style="background:#ffebee;padding:8px;border-radius:6px;margin-bottom:6px;font-size:.82rem">' + i + '</div>'; });
+      html += '<hr style="margin:12px 0">';
+    }
+    // Warnings
+    if (d.warnings && d.warnings.length) {
+      html += '<h4 style="margin:0 0 8px;color:#e65100">Warnings (' + d.warnings.length + ')</h4>';
+      d.warnings.forEach(function(w) { html += '<div style="background:#fff3e0;padding:8px;border-radius:6px;margin-bottom:6px;font-size:.82rem">' + w + '</div>'; });
+      html += '<hr style="margin:12px 0">';
+    }
+    // All checks as expandable
+    if (d.checks) {
+      Object.keys(d.checks).forEach(function(key) {
+        html += '<details><summary style="cursor:pointer;font-size:.82rem">' + key.replace(/_/g, ' ') + '</summary>';
+        html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(d.checks[key], null, 2) + '</pre></details>';
+      });
+    }
+    res.innerHTML = html;
     btn.disabled = false;
   }).catch(function(e) {
     res.className = "tool-result err";
