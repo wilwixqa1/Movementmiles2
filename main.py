@@ -2819,7 +2819,9 @@ async def _run_shadow_sync(run_id: int):
             )
 
         # --- Phase 1: Verify all active Apple/Google emails against ymove ---
+        # S23: Also extract subscriptionProvider for self-healing
         verify_results = {}
+        verify_providers = {}  # email -> provider from ymove API (for self-healing)
         batch_size = 10
         delay_seconds = 1.5
         processed = 0
@@ -2844,7 +2846,13 @@ async def _run_shadow_sync(run_id: int):
                             params={"email": email}
                         )
                     if resp.status_code == 200:
-                        verify_results[email] = _ymove_parse_status(resp.json())
+                        data = resp.json()
+                        verify_results[email] = _ymove_parse_status(data)
+                        # S23: Extract provider for self-healing
+                        user_obj = data.get("user", {})
+                        prov = user_obj.get("subscriptionProvider")
+                        if prov and isinstance(prov, str) and prov.strip():
+                            verify_providers[email] = prov.strip().lower()
                     elif resp.status_code == 404:
                         verify_results[email] = "not_found"
                     else:
@@ -2860,6 +2868,24 @@ async def _run_shadow_sync(run_id: int):
                             "UPDATE ymove_sync_runs SET progress_current = $1 WHERE id = $2",
                             processed, run_id
                         )
+
+        # S23: Self-healing — update provider on any records where ymove returned a real value
+        provider_healed = 0
+        if verify_providers:
+            async with db_pool.acquire() as conn:
+                for email, prov in verify_providers.items():
+                    r = our_active_lookup.get(email)
+                    if r and r["source"] != prov and prov in ("apple", "google", "stripe", "manual"):
+                        try:
+                            await conn.execute(
+                                "UPDATE subscriptions SET source = $1, updated_at = NOW() WHERE id = $2",
+                                prov, r["id"]
+                            )
+                            provider_healed += 1
+                            print(f"[Shadow Sync] Self-healed provider: {email} {r['source']} -> {prov}")
+                        except Exception as e:
+                            print(f"[Shadow Sync] Provider heal error for {email}: {e}")
+            print(f"[Shadow Sync] Self-healed {provider_healed} provider labels")
 
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -2907,7 +2933,7 @@ async def _run_shadow_sync(run_id: int):
                         em = (u.get("email") or "").strip().lower()
                         if em:
                             provider = (u.get("subscriptionProvider") or "undetermined").lower()
-                            if provider not in ("apple", "google", "stripe", "undetermined"):
+                            if provider not in ("apple", "google", "stripe", "manual", "undetermined"):
                                 provider = "undetermined"
                             ymove_all_emails[em] = provider
 
@@ -3018,6 +3044,7 @@ async def _run_shadow_sync(run_id: int):
             "pull_all_total_pages": total_pages_est,
             "pull_all_emails_found": len(ymove_all_emails),
             "verified_count": len(verify_results),
+            "provider_healed": provider_healed,
         }
 
         async with db_pool.acquire() as conn:
@@ -3217,7 +3244,7 @@ async def ymove_import_new(request: Request):
                         user_data = data.get("user", {})
                         provider = (user_data.get("subscriptionProvider") or
                                     user_data.get("provider") or "undetermined").lower()
-                        if provider not in ("apple", "google", "stripe", "undetermined"):
+                        if provider not in ("apple", "google", "stripe", "manual", "undetermined"):
                             provider = "undetermined"
                         verified.append({"email": email, "provider": provider, "raw": user_data})
                     else:
@@ -3464,64 +3491,90 @@ async def run_daily_shadow_sync():
             else:
                 print("[Daily Sync] No changes to apply. Database is in sync.")
 
-            # S22: Auto-import cross-platform switchers (known real users who re-subscribed on different platform)
+            # S23: Alert mode — instead of silently importing, cross-ref with Stripe and report
             switcher_list = res_data.get("cross_platform_switchers", [])
-            if switcher_list:
-                switch_batch_id = f"autosync_switch_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-                switch_imported = 0
-                switch_errors = 0
-                async with db_pool.acquire() as conn:
-                    for item in switcher_list:
-                        email = item["email"]
-                        provider = item.get("provider", "undetermined")
-                        email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
-                        syn_id = f"ymove_switch_{provider}_{email_hash}"
-                        try:
-                            await conn.execute("""
-                                INSERT INTO subscriptions (
-                                    stripe_customer_id, stripe_subscription_id, email, status,
-                                    plan_interval, plan_amount, currency, source,
-                                    created_at, updated_at, import_batch
-                                ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
-                                ON CONFLICT (stripe_subscription_id) DO NOTHING
-                            """, syn_id, email, provider, switch_batch_id)
-                            switch_imported += 1
-                        except Exception as e:
-                            print(f"[Daily Sync] Switcher import error for {email}: {e}")
-                            switch_errors += 1
-                print(f"[Daily Sync] Auto-imported {switch_imported} cross-platform switchers ({switch_errors} errors, batch_id={switch_batch_id})")
-
-            # S22: Auto-import truly new subscribers (filtered for test accounts)
             truly_new_list = res_data.get("truly_new", [])
-            if truly_new_list:
-                real_new = [t for t in truly_new_list if not _is_test_email(t.get("email", ""))]
-                test_skipped = len(truly_new_list) - len(real_new)
-                if real_new:
-                    import_batch_id = f"autosync_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-                    imported = 0
-                    import_errors = 0
+            all_unknown = switcher_list + [t for t in truly_new_list if not _is_test_email(t.get("email", ""))]
+
+            if all_unknown:
+                # Cross-reference with Stripe to determine provider
+                stripe_identified = []
+                non_stripe = []
+                stripe_errors = 0
+
+                for item in all_unknown:
+                    email = item.get("email", "")
+                    if not email:
+                        continue
+                    try:
+                        customers = stripe.Customer.list(email=email, limit=1)
+                        if customers.data:
+                            # They have a Stripe customer record — check for active sub
+                            cust = customers.data[0]
+                            subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
+                            if subs.data:
+                                stripe_identified.append({
+                                    "email": email,
+                                    "stripe_customer_id": cust.id,
+                                    "stripe_sub_id": subs.data[0].id,
+                                    "note": "Active Stripe sub found — likely missed webhook"
+                                })
+                            else:
+                                non_stripe.append({"email": email, "note": "Has Stripe customer but no active sub — likely Apple/Google/Manual"})
+                        else:
+                            non_stripe.append({"email": email, "note": "No Stripe customer record — definitely Apple/Google/Manual"})
+                    except Exception as e:
+                        stripe_errors += 1
+                        non_stripe.append({"email": email, "note": f"Stripe lookup error: {str(e)[:100]}"})
+
+                # Auto-import Stripe-identified users with correct source
+                if stripe_identified:
+                    batch_id_stripe = f"autosync_stripe_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    imported_stripe = 0
                     async with db_pool.acquire() as conn:
-                        for item in real_new:
-                            email = item["email"]
-                            provider = item.get("provider", "undetermined")
-                            email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
-                            syn_id = f"ymove_new_{provider}_{email_hash}"
+                        for item in stripe_identified:
                             try:
                                 await conn.execute("""
                                     INSERT INTO subscriptions (
                                         stripe_customer_id, stripe_subscription_id, email, status,
                                         plan_interval, plan_amount, currency, source,
                                         created_at, updated_at, import_batch
-                                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                                    ) VALUES ($1, $2, $3, 'active', 'month', 1999, 'usd', 'stripe', NOW(), NOW(), $4)
                                     ON CONFLICT (stripe_subscription_id) DO NOTHING
-                                """, syn_id, email, provider, import_batch_id)
-                                imported += 1
+                                """, item["stripe_customer_id"], item["stripe_sub_id"], item["email"], batch_id_stripe)
+                                imported_stripe += 1
                             except Exception as e:
-                                print(f"[Daily Sync] Import error for {email}: {e}")
-                                import_errors += 1
-                    print(f"[Daily Sync] Auto-imported {imported} new subscribers ({test_skipped} test accounts skipped, {import_errors} errors, batch_id={import_batch_id})")
-                else:
-                    print(f"[Daily Sync] {len(truly_new_list)} truly new found but all were test accounts ({test_skipped} skipped).")
+                                print(f"[Daily Sync] Stripe cross-ref import error for {item['email']}: {e}")
+                    print(f"[Daily Sync] Auto-imported {imported_stripe} Stripe-identified users (batch={batch_id_stripe})")
+
+                # Import non-Stripe users as undetermined (we know they're Apple/Google/Manual but can't tell which)
+                if non_stripe:
+                    batch_id_undet = f"autosync_undetermined_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    imported_undet = 0
+                    async with db_pool.acquire() as conn:
+                        for item in non_stripe:
+                            email = item["email"]
+                            email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+                            syn_id = f"ymove_new_undetermined_{email_hash}"
+                            try:
+                                await conn.execute("""
+                                    INSERT INTO subscriptions (
+                                        stripe_customer_id, stripe_subscription_id, email, status,
+                                        plan_interval, plan_amount, currency, source,
+                                        created_at, updated_at, import_batch
+                                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', 'undetermined', NOW(), NOW(), $3)
+                                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                                """, syn_id, email, batch_id_undet)
+                                imported_undet += 1
+                            except Exception as e:
+                                print(f"[Daily Sync] Undetermined import error for {email}: {e}")
+                    print(f"[Daily Sync] Imported {imported_undet} undetermined users (batch={batch_id_undet})")
+
+                # Log summary for digest visibility
+                print(f"[Daily Sync] Gap report: {len(all_unknown)} users in ymove not in our DB. "
+                      f"Stripe cross-ref: {len(stripe_identified)} confirmed Stripe, {len(non_stripe)} non-Stripe (undetermined), {stripe_errors} errors.")
+            else:
+                print("[Daily Sync] No unknown users found. Webhook pipeline is healthy.")
         else:
             status = run["status"] if run else "unknown"
             error = run.get("error", "") if run else ""
@@ -3531,6 +3584,121 @@ async def run_daily_shadow_sync():
         print(f"[Daily Sync] Error: {e}")
         import traceback
         traceback.print_exc()
+
+
+# --- S23: Retroactive Provider Cleanup ---
+
+@app.post("/api/admin/provider-cleanup")
+async def provider_cleanup(request: Request):
+    """S23: Reclassify ymove_new_*/ymove_switch_* records that were auto-imported with guessed providers.
+    Step 1: Reclassify all ymove_new_*/ymove_switch_* active subs to 'undetermined'
+    Step 2: Cross-reference each with Stripe to reclaim Stripe users
+    Step 3: Report remaining undetermined for future resolution (when Tosh fixes API)
+    Body: {"preview": true/false}
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    preview = body.get("preview", True)
+    batch_id = f"s23_provider_cleanup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        # Find all active ymove_new_* and ymove_switch_* records
+        candidates = await conn.fetch("""
+            SELECT id, email, stripe_subscription_id, source, status, import_batch
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            AND (stripe_subscription_id LIKE 'ymove_new_%' OR stripe_subscription_id LIKE 'ymove_switch_%')
+            ORDER BY created_at
+        """)
+
+    if not candidates:
+        return {"status": "ok", "message": "No ymove_new_*/ymove_switch_* active records found. Nothing to clean up."}
+
+    # Cross-reference each with Stripe
+    stripe_found = []
+    non_stripe = []
+    stripe_errors = 0
+
+    for r in candidates:
+        email = (r["email"] or "").strip().lower()
+        if not email:
+            non_stripe.append({"id": r["id"], "email": "", "sub_id": r["stripe_subscription_id"],
+                               "old_source": r["source"], "new_source": "undetermined", "note": "No email to cross-ref"})
+            continue
+        try:
+            customers = stripe.Customer.list(email=email, limit=1)
+            if customers.data:
+                cust = customers.data[0]
+                subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
+                if subs.data:
+                    stripe_found.append({
+                        "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                        "old_source": r["source"], "new_source": "stripe",
+                        "stripe_customer_id": cust.id, "stripe_sub_id": subs.data[0].id,
+                        "note": "Active Stripe sub confirmed"
+                    })
+                    continue
+            non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                               "old_source": r["source"], "new_source": "undetermined",
+                               "note": "No Stripe sub — Apple/Google/Manual"})
+        except Exception as e:
+            stripe_errors += 1
+            non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                               "old_source": r["source"], "new_source": "undetermined",
+                               "note": f"Stripe lookup error: {str(e)[:100]}"})
+
+    if preview:
+        return {
+            "status": "preview",
+            "batch_id": batch_id,
+            "total_candidates": len(candidates),
+            "stripe_identified": len(stripe_found),
+            "non_stripe_undetermined": len(non_stripe),
+            "stripe_errors": stripe_errors,
+            "stripe_details": stripe_found[:20],
+            "undetermined_details": non_stripe[:20],
+            "note": "Send preview: false to apply. Stripe users get source='stripe', rest get source='undetermined'."
+        }
+
+    # Apply changes
+    updated_stripe = 0
+    updated_undet = 0
+    errors = 0
+
+    async with db_pool.acquire() as conn:
+        for item in stripe_found:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET source = 'stripe', import_batch = $1, updated_at = NOW() WHERE id = $2",
+                    batch_id, item["id"]
+                )
+                updated_stripe += 1
+            except Exception as e:
+                errors += 1
+
+        for item in non_stripe:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET source = 'undetermined', import_batch = $1, updated_at = NOW() WHERE id = $2",
+                    batch_id, item["id"]
+                )
+                updated_undet += 1
+            except Exception as e:
+                errors += 1
+
+    return {
+        "status": "applied",
+        "batch_id": batch_id,
+        "total_processed": len(candidates),
+        "updated_to_stripe": updated_stripe,
+        "updated_to_undetermined": updated_undet,
+        "errors": errors,
+        "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}"
+    }
 
 
 @app.post("/api/admin/send-test-digest")

@@ -77,6 +77,7 @@
   .tag-src-apple{background:#f0f0f0;color:#333}
   .tag-src-google{background:#e8f4e8;color:#0f9d58}
   .tag-src-undetermined{background:#fff3e0;color:#e65100}
+  .tag-src-manual{background:#e3f2fd;color:#1565c0}
 
   .empty-msg{text-align:center;padding:40px;color:var(--navy-mid);font-size:.9rem}
 
@@ -692,7 +693,7 @@
     <div class="section-toggle" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
-      <span class="toggle-hint">(7 tools)</span>
+      <span class="toggle-hint">(8 tools)</span>
     </div>
     <div class="collapsible" id="body-tools">
       <div class="tools-grid">
@@ -746,6 +747,14 @@
           <p>15+ data quality checks: duplicates, stale trials, plan amount anomalies, MRR accuracy, conversion tracking, and risk scoring.</p>
           <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-data-audit" onclick="doDataAudit()">Run Data Audit</button>
           <div class="tool-result" id="res-data-audit" style="max-height:500px;overflow-y:auto"></div>
+        </div>
+
+        <div class="tool-card">
+          <h3 style="color:#c62828">Provider Cleanup</h3>
+          <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
+          <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
+          <button class="tool-btn" style="background:#c62828;color:#fff;margin-top:6px;display:none" id="btn-cleanup-apply" onclick="doProviderCleanup(false)">Apply Cleanup</button>
+          <div class="tool-result" id="res-cleanup" style="max-height:500px;overflow-y:auto"></div>
         </div>
 
       </div>
@@ -1127,7 +1136,7 @@ function loadStats() {
     document.getElementById('s-sub-age').textContent = Math.round(subs.avg_sub_age_days || 0);
 
     // --- Revenue charts ---
-    var sourceColors = {stripe:'navy', apple:'mid', google:'green', undetermined:'orange'};
+    var sourceColors = {stripe:'navy', apple:'mid', google:'green', undetermined:'orange', manual:'mid'};
 
     // S23: Store both trend datasets for toggle
     window._mrrTrendWeekly = (subs.mrr_trend || []).map(function(r) {
@@ -2046,49 +2055,68 @@ document.getElementById('admin-pw').focus();
 
 // --- Session 17: Data Health & Verification ---
 
-function doDataAudit() {
-  var btn = document.getElementById("btn-audit");
-  var res = document.getElementById("res-audit");
-  btn.disabled = true;
+function doProviderCleanup(preview) {
+  var btnPreview = document.getElementById("btn-cleanup-preview");
+  var btnApply = document.getElementById("btn-cleanup-apply");
+  var res = document.getElementById("res-cleanup");
+
+  if (!preview && !confirm("This will reclassify ymove_new_*/ymove_switch_* records. Stripe users get source='stripe', rest get 'undetermined'. Continue?")) return;
+
+  btnPreview.disabled = true;
+  btnApply.style.display = "none";
   res.className = "tool-result loading";
-  res.textContent = "Running 15 data quality checks...";
-  fetch("/api/admin/data-audit", {
-    headers: {"X-Admin-Password": adminPw}
+  res.textContent = preview ? "Previewing cleanup (cross-referencing Stripe, may take 30-60s)..." : "Applying cleanup...";
+
+  fetch("/api/admin/provider-cleanup", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({preview: preview})
   }).then(function(r) {
-    if (!r.ok) throw new Error("Failed");
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.detail || "Failed"); });
     return r.json();
   }).then(function(d) {
-    var s = d.summary || {};
-    var color = s.mrr_confidence === "HIGH" ? "ok" : s.mrr_confidence === "MEDIUM" ? "warn" : "err";
-    var msg = "MRR Confidence: " + (s.mrr_confidence || "?") + " (risk score " + (s.risk_score || 0) + ")\n";
-    msg += "Critical issues: " + (s.total_critical_issues || 0) + " | Warnings: " + (s.total_warnings || 0) + "\n";
-    if (s.risk_factors && s.risk_factors.length > 0) {
-      msg += "Risk factors:\n" + s.risk_factors.map(function(f) { return "  - " + f; }).join("\n");
+    res.className = "tool-result ok";
+    var html = '';
+
+    if (d.status === "preview") {
+      html += '<h4 style="margin:0 0 8px">Cleanup Preview</h4>';
+      html += '<div>Total candidates: <strong>' + d.total_candidates + '</strong></div>';
+      html += '<div>Stripe identified: <strong style="color:#635bff">' + d.stripe_identified + '</strong></div>';
+      html += '<div>Non-Stripe (undetermined): <strong style="color:#e65100">' + d.non_stripe_undetermined + '</strong></div>';
+      html += '<div>Stripe errors: ' + d.stripe_errors + '</div>';
+      html += '<hr style="margin:8px 0">';
+
+      if (d.stripe_details && d.stripe_details.length > 0) {
+        html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#635bff"><strong>Stripe identified (' + d.stripe_details.length + ')</strong></summary>';
+        d.stripe_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — ' + item.old_source + ' → stripe (sub: ' + item.stripe_sub_id + ')</div>';
+        });
+        html += '</details>';
+      }
+
+      if (d.undetermined_details && d.undetermined_details.length > 0) {
+        html += '<details><summary style="cursor:pointer;font-size:.82rem;color:#e65100"><strong>Undetermined (' + d.undetermined_details.length + ')</strong></summary>';
+        d.undetermined_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — ' + item.old_source + ' → undetermined (' + item.note + ')</div>';
+        });
+        html += '</details>';
+      }
+
+      btnApply.style.display = "inline-block";
+    } else {
+      html += '<h4 style="margin:0 0 8px;color:#2d6a2d">Cleanup Applied</h4>';
+      html += '<div>Updated to Stripe: <strong>' + d.updated_to_stripe + '</strong></div>';
+      html += '<div>Updated to undetermined: <strong>' + d.updated_to_undetermined + '</strong></div>';
+      html += '<div>Errors: ' + d.errors + '</div>';
+      html += '<div style="font-size:.78rem;color:#666;margin-top:8px">Batch ID: ' + d.batch_id + '</div>';
     }
-    var checks = d.checks || {};
-    if (checks.totals) {
-      msg += "\n\nTotals: " + checks.totals.total + " subs (" + checks.totals.active + " active, " + checks.totals.trialing + " trialing, " + checks.totals.canceled + " canceled)";
-    }
-    if (checks.mrr_breakdown) {
-      msg += "\nGross MRR: " + checks.mrr_breakdown.total_mrr_display;
-    }
-    if (checks.duplicate_active_emails) {
-      msg += "\nDuplicate active emails: " + checks.duplicate_active_emails.count;
-    }
-    if (checks.stale_trialing) {
-      msg += "\nStale trialing: " + checks.stale_trialing.count;
-    }
-    if (checks.lead_attribution) {
-      msg += "\nLead attribution rate: " + checks.lead_attribution.attribution_rate + "%";
-    }
-    res.className = "tool-result " + color;
-    res.style.whiteSpace = "pre-wrap";
-    res.textContent = msg;
-    btn.disabled = false;
+
+    res.innerHTML = html;
+    btnPreview.disabled = false;
   }).catch(function(e) {
     res.className = "tool-result err";
     res.textContent = "Error: " + e.message;
-    btn.disabled = false;
+    btnPreview.disabled = false;
   });
 }
 

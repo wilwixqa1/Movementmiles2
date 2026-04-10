@@ -1,5 +1,5 @@
 # Movement & Miles — Session 24 Context Document
-## Date: April 9, 2026 | Version: 23.2.0
+## Date: April 10, 2026 | Version: 23.3.0
 
 ---
 
@@ -14,7 +14,7 @@ Movement & Miles is a fitness subscription platform. This system (Movementmiles2
 
 ---
 
-## 2. CURRENT SUBSCRIBER NUMBERS (Post-Session 24)
+## 2. CURRENT SUBSCRIBER NUMBERS (Pre-Cleanup)
 
 ### Our System:
 | Source | Active | Trialing | Total Active |
@@ -24,112 +24,149 @@ Movement & Miles is a fitness subscription platform. This system (Movementmiles2
 | Google | 196 | — | 196 |
 | **Total** | **1,725** | **156** | **1,881** |
 
+**Note:** Apple/Google counts are inflated. Some ymove_new_*/ymove_switch_* records were incorrectly defaulted to "apple". Provider Cleanup (S23) needs to be run to reclassify.
+
 ### Tosh's System (ymove):
 | Source | Count |
 |--------|-------|
 | Stripe | 1,030 |
 | Apple | 651 |
 | Google | 208 |
-| Manual | 11 |
+| Manual | 11 (only 3 have provider populated in API) |
 | **Total** | **1,870** |
 
-### Discrepancy Analysis:
-| Platform | Us | Tosh | Delta | Explanation |
-|----------|-----|------|-------|-------------|
-| Stripe | 1,022 | 1,030 | -8 | Minor counting difference (trialing methodology) |
-| Apple | 663 | 651 | +12 | BUG: Our sync defaults null provider to "apple" |
-| Google | 196 | 208 | -12 | Mirror of Apple issue — 12 subs miscategorized as Apple |
-| Manual | 0 | 11 | -11 | We don't track manual users at all |
+---
 
-**Key Insight:** The 11 Manual users in Tosh's system likely have `subscriptionProvider: null` in the ymove API. Our sync defaults null to "apple", so they end up in our Apple count.
+## 3. YMOVE API PROVIDER FIELD STATUS
+
+### Confirmed by S23 Provider Test (v2):
+- **Individual lookup** (`/member-lookup?email=X`): `subscriptionProvider` is **null for ALL users except 3 manual users**
+- **Bulk lookup** (`/member-lookup/all`): Same — null for 290/293 users, only 3 manual users have `provider: "manual"`
+- **Webhook** (`subscriptionCreated`): `subscriptionPaymentProvider` field works correctly — returns "apple", "google", or "stripe"
+- **Webhook** (`subscriptionCancelled`): Does NOT include provider field
+
+### Implication:
+The only reliable source of provider data is the webhook. The API cannot tell us provider for any non-manual user. Our subscription ID patterns are the most reliable way to determine provider for existing records.
 
 ---
 
-## 3. CRITICAL BUG: Provider Defaulting
+## 4. S23 CHANGES — PROVIDER PIPELINE OVERHAUL
 
-### The Problem:
-The ymove member-lookup API returns `subscriptionProvider: null` for ALL users. When our shadow sync pulls the bulk subscriber list, it defaults them all to "apple."
+### 4a. Provider Defaulting Bug Fix
+Changed 8 code locations from defaulting null provider to "apple" to "undetermined":
+- Shadow sync pull_all parsing (2 locations)
+- cross_platform_switchers and truly_new defaults (2 locations)
+- ymove-import-new endpoint (2 locations)
+- Downstream import consumers (2 locations)
+- Guard clauses now accept: apple, google, stripe, manual, undetermined
 
-### Why Webhooks Work But API Doesn't:
-- **Webhook payload** includes `subscriptionPaymentProvider` — correctly returns "apple", "google", or "stripe"
-- **Member-lookup API** has `subscriptionProvider` — always returns null
-- These are DIFFERENT field names
+### 4b. Self-Healing Provider (Shadow Sync)
+During the verify phase, if ymove individual lookup returns a non-null `subscriptionProvider`, we update our record's source to match. Currently only fires for the 3 manual users. Will auto-heal all records if Tosh fixes the API.
 
-### Code Locations That Need Fixing (6 total):
-1. Line ~2692 — shadow sync pull_all parsing
-2. Line ~3001 — ymove-import-new endpoint
-3. Line ~2785 — cross_platform_switchers default
-4. Line ~2787 — truly_new default
-5. Line ~2693 — Guard clause
-6. Line ~3003 — Import guard clause
+### 4c. Stripe Cross-Reference (Daily Sync)
+When shadow sync finds unknown users (not in our DB), instead of blindly importing as "undetermined":
+1. Check Stripe API for that email
+2. If active Stripe sub found, import as source="stripe" with correct stripe_sub_id
+3. If no Stripe record, import as source="undetermined" (Apple/Google/Manual)
 
-### Proposed Fix:
-Change all 6 locations to default to `"undetermined"` instead of `"apple"`.
+### 4d. Alert Mode
+Daily sync now logs gap reports: "X users in ymove not in our DB. Y confirmed Stripe, Z undetermined."
 
----
+### 4e. Retroactive Provider Cleanup Endpoint
+`POST /api/admin/provider-cleanup` with `{"preview": true/false}`:
+- Finds all active `ymove_new_*` and `ymove_switch_*` records
+- Cross-references each email against Stripe API
+- Stripe users get source="stripe", rest get source="undetermined"
+- Dashboard button available in Admin Tools
 
-## 4. UTM ATTRIBUTION
-
-### Status: Blocked — Awaiting Tosh
-- All Stripe signups have empty `meta` fields from ymove API
-- Our code is correct — data isn't there on ymove's side
-- Will planned test signup to verify; check results next session
-
----
-
-## 5. DATA CLEANUP COMPLETED
-
-### Cross-Platform Dedup:
-- 7 legacy Meg imports cancelled (batch: `s24_dedup_apple_imports`)
-- 3 genuine cross-platform kept (adrian.mccarthy, bkolp41, jaimelash1)
+### 4f. New Source Types
+- `undetermined` : provider unknown (ymove API returned null)
+- `manual` : manually added by Tosh (confirmed via API)
+- Dashboard badges and colors added for both
 
 ---
 
-## 6. YMOVE API REFERENCE
+## 5. SUBSCRIPTION ID PATTERNS (Source of Truth)
 
-### Member Lookup returns:
-`subscriptionProvider: null` (ALWAYS null for all users)
-
-### Webhook subscriptionCreated returns:
-`subscriptionPaymentProvider: "apple|google|stripe"` (CORRECT)
-
-### Webhook subscriptionCancelled:
-Does NOT include provider field
+| Prefix | True Source | Origin | Confidence |
+|--------|-----------|--------|------------|
+| `sub_*` | stripe | Direct Stripe webhook | 100% |
+| Numeric (e.g. `350003237839176`) | apple | Apple transactionId from ymove webhook | 100% |
+| `ym_google_*` | google | ymove webhook with provider=google | 100% |
+| `ymove_new_*` | unknown | Shadow sync auto-import (provider was guessed) | LOW |
+| `ymove_switch_*` | unknown | Cross-platform switch import (provider was guessed) | LOW |
+| `import_apple_*` / `meg_apple_*` | apple | Meg's spreadsheet import | Medium |
+| `import_google_*` / `meg_google_*` | google | Meg's spreadsheet import | Medium |
 
 ---
 
-## 7. SUBSCRIPTION ID PATTERNS
+## 6. DIAGNOSTIC TOOLS ADDED (S23)
 
-| Prefix | Source | Origin |
-|--------|--------|--------|
-| `sub_*` | stripe | Direct Stripe webhook |
-| `import_apple_*` | apple | Meg's spreadsheet import |
-| `ym_google_*` | google | Initial import (correct) |
-| `ymove_new_apple_*` | apple | Sync auto-import (BUG) |
-| Numeric | apple | Apple transaction from webhook (CORRECT) |
+All accessible via Admin Dashboard, Admin Tools section:
+
+| Tool | Button | What It Does |
+|------|--------|-------------|
+| Provider Test | Orange | Tests ymove API provider fields across all pages, uses verified ID patterns |
+| Reconciliation Audit | Orange | Full audit: batch history, duplicates, source mismatches, data origins, gaps |
+| Data Audit | Orange | 15+ data quality checks with MRR confidence scoring |
+| Provider Cleanup | Red | Reclassify ymove_new_*/ymove_switch_* with Stripe cross-reference |
+
+---
+
+## 7. KNOWN GAPS AND RISKS
+
+### Gap 1: Cancellation by email only (LIMIT 1)
+`_ymove_handle_cancelled` finds most recent active sub by email. If someone has both Stripe + Apple active, could cancel wrong one. Stripe self-corrects, but Apple cancel could hit Stripe record.
+
+### Gap 2: Shadow sync only verifies Apple/Google/undetermined
+Stripe drift is invisible. We rely 100% on Stripe webhooks for Stripe status.
+
+### Gap 3: No webhook retry from ymove
+If our server is down during a webhook, the data is lost. Daily sync catches the gap but cannot determine provider (until Tosh fixes API).
+
+### Gap 4: Duplicate active emails possible
+Unique constraint is on stripe_subscription_id, not email. Run reconciliation audit to check current state.
 
 ---
 
 ## 8. PROPOSED NEXT STEPS
 
-### Priority 1: Fix Provider Defaulting Bug
-Change 6 code locations to default to "undetermined" instead of "apple"
+### Immediate:
+1. **Run Reconciliation Audit** to see current state of duplicates, batch operations, data origins
+2. **Run Provider Cleanup (preview first)** to see how many records need reclassification
+3. **Apply Provider Cleanup** to fix historical data
 
-### Priority 2: Questions for Tosh
-1. Fix `subscriptionProvider` in member-lookup API
-2. Send email list for 11 Manual Active Users
-3. Where is UTM data stored? Meta field is always empty
+### Ask Tosh:
+1. **Fix `subscriptionProvider`** in member-lookup API for all users (not just manual)
+   - The field exists, it works for 3 manual users, just needs to be populated for stripe/apple/google
+   - This single fix makes our shadow sync self-healing for provider data
 
-### Priority 3: Backfill existing mismatched records once Tosh provides data
+### Future:
+- Fix Gap 1 (cancellation handler should match by source before falling back to most-recent)
+- Stripe reconciliation (compare our Stripe count against Stripe actual active subs)
+- MRR Trend chart fix (broken query from S23 TODO)
 
 ---
 
 ## 9. SESSION HISTORY
 
+### Session 23 (April 10, 2026):
+- Fixed provider defaulting bug (8 locations: "apple" to "undetermined")
+- Built and ran Provider Test v2: confirmed ymove API returns null provider for 290/293 users
+- Only 3 manual users have provider populated in API
+- Added self-healing provider logic to shadow sync verify phase
+- Replaced auto-import with Stripe cross-reference + undetermined import
+- Built retroactive Provider Cleanup endpoint with preview/apply and Stripe cross-ref
+- Added Reconciliation Audit endpoint (batch history, duplicates, data origins)
+- Added Data Audit button, Provider Test button, Reconciliation Audit button, Provider Cleanup button to dashboard
+- Added "manual" and "undetermined" as recognized source types with dashboard styling
+- Shadow sync now includes undetermined source in verification queries
+- **Code pushed, deployed. Provider Cleanup NOT YET RUN. Needs preview then apply.**
+
 ### Session 24 (April 9, 2026):
-- Investigated UTM attribution gap — ymove meta field always empty
+- Investigated UTM attribution gap, ymove meta field always empty
 - Investigated subscriber count discrepancy with Tosh
 - Cancelled 7 duplicate cross-platform records (batch: s24_dedup_apple_imports)
 - Discovered provider defaulting bug (null to "apple")
 - Confirmed webhook provides correct provider, API does not
-- **No code pushed** — only database operations via admin endpoints
+- **No code pushed**, only database operations via admin endpoints
