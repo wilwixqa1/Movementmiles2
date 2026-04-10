@@ -1,0 +1,85 @@
+<!-- Movement & Miles UTM Persistence Script (S23) -->
+<!-- Paste into Squarespace: Settings > Advanced > Code Injection > FOOTER -->
+<script>
+(function() {
+  var UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid'];
+  var STORAGE_KEY = 'mm_utm_params';
+  var YMOVE_HOSTS = ['ymove.app', 'ymove.com'];
+
+  // Step 1: Capture UTMs from current URL and store in sessionStorage
+  function captureUtms() {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var found = {};
+      var hasAny = false;
+      UTM_KEYS.forEach(function(k) {
+        var v = params.get(k);
+        if (v) { found[k] = v; hasAny = true; }
+      });
+      if (hasAny) {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(found));
+      }
+    } catch (e) {}
+  }
+
+  // Step 2: Get stored UTMs
+  function getStoredUtms() {
+    try {
+      var raw = sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+
+  // Step 3: Append UTMs to a URL string
+  function appendUtms(url, utms) {
+    try {
+      var u = new URL(url, window.location.origin);
+      Object.keys(utms).forEach(function(k) {
+        if (!u.searchParams.has(k)) {
+          u.searchParams.set(k, utms[k]);
+        }
+      });
+      return u.toString();
+    } catch (e) { return url; }
+  }
+
+  // Step 4: Find all ymove links on the page and append UTMs
+  function decorateLinks() {
+    var utms = getStoredUtms();
+    if (!utms) return;
+    var links = document.querySelectorAll('a[href]');
+    links.forEach(function(link) {
+      var href = link.getAttribute('href');
+      if (!href) return;
+      var isYmove = YMOVE_HOSTS.some(function(h) { return href.indexOf(h) !== -1; });
+      if (isYmove) {
+        link.setAttribute('href', appendUtms(href, utms));
+      }
+    });
+  }
+
+  // Run on initial load
+  captureUtms();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', decorateLinks);
+  } else {
+    decorateLinks();
+  }
+
+  // Re-run on DOM mutations (Squarespace dynamically loads content)
+  var observer = new MutationObserver(function() { decorateLinks(); });
+  observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+
+  // Re-run on click as final safety net
+  document.addEventListener('click', function(e) {
+    var link = e.target.closest && e.target.closest('a[href]');
+    if (link) {
+      var href = link.getAttribute('href');
+      if (href && YMOVE_HOSTS.some(function(h) { return href.indexOf(h) !== -1; })) {
+        var utms = getStoredUtms();
+        if (utms) link.setAttribute('href', appendUtms(href, utms));
+      }
+    }
+  }, true);
+})();
+</script>
