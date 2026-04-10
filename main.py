@@ -5937,7 +5937,7 @@ async def data_audit(request: Request):
 async def reconciliation_audit(request: Request):
     """S23: Deep audit of all batch operations, duplicates, and data integrity.
     Answers: What manual operations have been done? Are there duplicates? What are we missing?"""
-    pw = request.headers.get("X-Admin-Password", "")
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
     require_admin(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database connected")
