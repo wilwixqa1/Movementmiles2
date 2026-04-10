@@ -2069,6 +2069,7 @@ async def ymove_verify(request: Request):
       {"email": "single@ex.com"} - look up one email
       {"emails": [...]} - batch lookup with rate limiting
       {"pull_all_subscribed": true} - pull ALL active members, cross-ref our cancelled subs
+      {"provider_test": true} - S23: Compare individual vs bulk API provider fields
     """
     pw = request.headers.get("X-Admin-Password", "")
     require_admin(pw)
@@ -2080,6 +2081,90 @@ async def ymove_verify(request: Request):
         })
 
     body = await request.json()
+
+    # S23: Provider field comparison test
+    if body.get("provider_test"):
+        if not db_pool:
+            return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+        # Pick one known sub from each source
+        test_emails = {}
+        async with db_pool.acquire() as conn:
+            for src in ("apple", "google", "stripe"):
+                row = await conn.fetchrow(
+                    """SELECT email, stripe_subscription_id, source FROM subscriptions
+                       WHERE source = $1 AND status = 'active' AND email != '' AND email IS NOT NULL
+                       ORDER BY created_at DESC LIMIT 1""", src
+                )
+                if row:
+                    test_emails[src] = {"email": row["email"], "sub_id": row["stripe_subscription_id"]}
+
+        results = {}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Individual lookups
+            for src, info in test_emails.items():
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": ymove_key},
+                        params={"email": info["email"]}
+                    )
+                    raw = resp.json() if resp.status_code == 200 else {"http_status": resp.status_code}
+                    user_obj = raw.get("user", {})
+                    results[src] = {
+                        "email": info["email"],
+                        "our_sub_id": info["sub_id"],
+                        "our_source": src,
+                        "individual_lookup": {
+                            "subscriptionProvider": user_obj.get("subscriptionProvider"),
+                            "subscriptionPaymentProvider": user_obj.get("subscriptionPaymentProvider"),
+                            "provider": user_obj.get("provider"),
+                            "all_provider_fields": {k: v for k, v in user_obj.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
+                            "full_user_keys": list(user_obj.keys()),
+                        }
+                    }
+                except Exception as e:
+                    results[src] = {"email": info["email"], "error": str(e)}
+
+                await asyncio.sleep(1.5)
+
+            # Bulk lookup - grab page 1 and check the same fields
+            try:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                    headers={"X-Authorization": ymove_key},
+                    params={"status": "subscribed", "page": "1"}
+                )
+                if resp.status_code == 200:
+                    bulk_data = resp.json()
+                    bulk_users = bulk_data.get("users", [])
+                    # Find our test emails in the bulk response
+                    bulk_by_email = {(u.get("email") or "").strip().lower(): u for u in bulk_users}
+                    for src, info in test_emails.items():
+                        bulk_user = bulk_by_email.get(info["email"].lower())
+                        if bulk_user:
+                            results[src]["bulk_lookup"] = {
+                                "subscriptionProvider": bulk_user.get("subscriptionProvider"),
+                                "subscriptionPaymentProvider": bulk_user.get("subscriptionPaymentProvider"),
+                                "provider": bulk_user.get("provider"),
+                                "all_provider_fields": {k: v for k, v in bulk_user.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
+                                "full_user_keys": list(bulk_user.keys()),
+                            }
+                        else:
+                            results[src]["bulk_lookup"] = "not_found_on_page_1"
+                    # Also include first 3 raw users from bulk for inspection
+                    results["_bulk_sample"] = [{k: v for k, v in u.items() if "provider" in k.lower() or "payment" in k.lower() or "email" in k.lower() or "source" in k.lower()} for u in bulk_users[:3]]
+                else:
+                    results["_bulk_error"] = {"http_status": resp.status_code}
+            except Exception as e:
+                results["_bulk_error"] = str(e)
+
+        return {
+            "test": "provider_field_comparison",
+            "purpose": "Compare individual member-lookup vs bulk member-lookup/all provider fields",
+            "results": results,
+            "next_step": "If individual returns provider but bulk does not, we can extract provider during the verify phase of shadow sync"
+        }
 
     # Smoke test mode
     if body.get("smoke_test"):
@@ -2564,20 +2649,20 @@ async def _run_shadow_sync(run_id: int):
 
         # --- Gather our DB state ---
         async with db_pool.acquire() as conn:
-            # All our active Apple/Google subs with email
+            # All our active Apple/Google/undetermined subs with email
             our_active = await conn.fetch(
                 """SELECT id, lower(email) as email, source, stripe_subscription_id, plan_amount, plan_interval
                    FROM subscriptions
-                   WHERE status IN ('active', 'trialing') AND source IN ('apple', 'google')
+                   WHERE status IN ('active', 'trialing') AND source IN ('apple', 'google', 'undetermined')
                    AND email != '' AND email IS NOT NULL
                    ORDER BY email"""
             )
-            # All cancelled Apple/Google subs (most recent per email, for reactivation)
+            # All cancelled Apple/Google/undetermined subs (most recent per email, for reactivation)
             our_cancelled_ag = await conn.fetch(
                 """SELECT DISTINCT ON (lower(email))
                    id, lower(email) as email, source, stripe_subscription_id
                    FROM subscriptions
-                   WHERE status = 'canceled' AND source IN ('apple', 'google')
+                   WHERE status = 'canceled' AND source IN ('apple', 'google', 'undetermined')
                    AND email != '' AND email IS NOT NULL
                    ORDER BY lower(email), created_at DESC"""
             )
@@ -5758,6 +5843,244 @@ async def data_audit(request: Request):
         }
 
     return audit
+
+
+# --- Session 23: Deep Reconciliation Audit ---
+
+@app.get("/api/admin/reconciliation-audit")
+async def reconciliation_audit(request: Request):
+    """S23: Deep audit of all batch operations, duplicates, and data integrity.
+    Answers: What manual operations have been done? Are there duplicates? What are we missing?"""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    report = {"batch_history": {}, "duplicates": {}, "source_accuracy": {}, "gaps": {}, "action_items": []}
+
+    async with db_pool.acquire() as conn:
+
+        # ============================================================
+        # SECTION 1: Every batch operation ever performed
+        # ============================================================
+        batches = await conn.fetch("""
+            SELECT import_batch, status, source, COUNT(*) as cnt,
+                   MIN(created_at) as earliest, MAX(updated_at) as latest_update
+            FROM subscriptions
+            WHERE import_batch IS NOT NULL AND import_batch != ''
+            GROUP BY import_batch, status, source
+            ORDER BY latest_update DESC
+        """)
+        batch_summary = {}
+        for b in batches:
+            key = b["import_batch"]
+            if key not in batch_summary:
+                batch_summary[key] = {"records": [], "total_count": 0}
+            batch_summary[key]["records"].append({
+                "status": b["status"],
+                "source": b["source"],
+                "count": b["cnt"],
+                "earliest": str(b["earliest"]),
+                "latest_update": str(b["latest_update"])
+            })
+            batch_summary[key]["total_count"] += b["cnt"]
+        report["batch_history"] = batch_summary
+
+        # ============================================================
+        # SECTION 2: Subscription ID prefix analysis
+        # Shows exactly where every record came from
+        # ============================================================
+        id_patterns = await conn.fetch("""
+            SELECT
+                CASE
+                    WHEN stripe_subscription_id LIKE 'sub_%' THEN 'sub_* (Stripe direct)'
+                    WHEN stripe_subscription_id LIKE 'import_apple_%' THEN 'import_apple_* (Meg import)'
+                    WHEN stripe_subscription_id LIKE 'import_google_%' THEN 'import_google_* (Meg import)'
+                    WHEN stripe_subscription_id LIKE 'meg_apple_%' THEN 'meg_apple_* (Meg import v2)'
+                    WHEN stripe_subscription_id LIKE 'meg_google_%' THEN 'meg_google_* (Meg import v2)'
+                    WHEN stripe_subscription_id LIKE 'ymove_new_%' THEN 'ymove_new_* (Shadow sync auto-import)'
+                    WHEN stripe_subscription_id LIKE 'ymove_switch_%' THEN 'ymove_switch_* (Cross-platform switch)'
+                    WHEN stripe_subscription_id LIKE 'ym_google_%' THEN 'ym_google_* (ymove webhook Google)'
+                    WHEN stripe_subscription_id ~ '^[0-9]+$' THEN 'numeric (Apple transaction ID)'
+                    ELSE 'other: ' || LEFT(stripe_subscription_id, 20)
+                END as id_pattern,
+                source, status, COUNT(*) as cnt
+            FROM subscriptions
+            GROUP BY id_pattern, source, status
+            ORDER BY id_pattern, cnt DESC
+        """)
+        report["id_patterns"] = [{"pattern": r["id_pattern"], "source": r["source"], "status": r["status"], "count": r["cnt"]} for r in id_patterns]
+
+        # ============================================================
+        # SECTION 3: Duplicate active emails (detailed)
+        # ============================================================
+        dup_details = await conn.fetch("""
+            SELECT s.id, lower(s.email) as email, s.stripe_subscription_id, s.source, s.status,
+                   s.plan_interval, s.plan_amount, s.import_batch, s.created_at, s.updated_at
+            FROM subscriptions s
+            INNER JOIN (
+                SELECT lower(email) as em FROM subscriptions
+                WHERE status IN ('active', 'trialing') AND email != '' AND email IS NOT NULL
+                GROUP BY lower(email) HAVING COUNT(*) > 1
+            ) dups ON lower(s.email) = dups.em
+            WHERE s.status IN ('active', 'trialing')
+            ORDER BY lower(s.email), s.created_at
+        """)
+        dup_grouped = {}
+        for d in dup_details:
+            em = d["email"]
+            if em not in dup_grouped:
+                dup_grouped[em] = []
+            dup_grouped[em].append({
+                "id": d["id"],
+                "sub_id": d["stripe_subscription_id"],
+                "source": d["source"],
+                "status": d["status"],
+                "plan": f"{d['plan_interval']}/${d['plan_amount']}",
+                "import_batch": d["import_batch"],
+                "created": str(d["created_at"]),
+                "updated": str(d["updated_at"])
+            })
+        report["duplicates"] = {
+            "count": len(dup_grouped),
+            "emails": dup_grouped
+        }
+        if len(dup_grouped) > 0:
+            report["action_items"].append(f"CRITICAL: {len(dup_grouped)} emails have multiple active subs. Each inflates MRR. Review and cancel duplicates.")
+
+        # ============================================================
+        # SECTION 4: Source vs ID pattern mismatches
+        # (e.g., source='apple' but ID is 'ymove_new_undetermined_*')
+        # ============================================================
+        mismatches = await conn.fetch("""
+            SELECT id, email, stripe_subscription_id, source, status, import_batch
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            AND (
+                (source = 'apple' AND stripe_subscription_id LIKE 'ymove_new_google_%')
+                OR (source = 'google' AND stripe_subscription_id LIKE 'ymove_new_apple_%')
+                OR (source = 'apple' AND stripe_subscription_id LIKE 'ym_google_%')
+                OR (source = 'google' AND stripe_subscription_id LIKE '%apple%')
+                OR (source = 'stripe' AND stripe_subscription_id NOT LIKE 'sub_%')
+                OR (source NOT IN ('stripe', 'apple', 'google', 'undetermined'))
+            )
+        """)
+        report["source_accuracy"] = {
+            "mismatched_records": len(mismatches),
+            "details": [{"id": r["id"], "email": r["email"], "sub_id": r["stripe_subscription_id"],
+                         "source": r["source"], "import_batch": r["import_batch"]} for r in mismatches[:30]]
+        }
+        if len(mismatches) > 0:
+            report["action_items"].append(f"WARNING: {len(mismatches)} active subs have source/ID pattern mismatches. Provider may be wrong.")
+
+        # ============================================================
+        # SECTION 5: Records that came from shadow sync vs webhooks vs manual
+        # ============================================================
+        origin_counts = await conn.fetch("""
+            SELECT
+                CASE
+                    WHEN stripe_subscription_id LIKE 'sub_%' THEN 'stripe_webhook'
+                    WHEN stripe_subscription_id ~ '^[0-9]+$' THEN 'ymove_webhook_apple'
+                    WHEN stripe_subscription_id LIKE 'ym_google_%' THEN 'ymove_webhook_google'
+                    WHEN stripe_subscription_id LIKE 'ymove_new_%' THEN 'shadow_sync_import'
+                    WHEN stripe_subscription_id LIKE 'ymove_switch_%' THEN 'shadow_sync_switch'
+                    WHEN stripe_subscription_id LIKE 'import_%' OR stripe_subscription_id LIKE 'meg_%' THEN 'manual_import'
+                    ELSE 'unknown'
+                END as origin,
+                status,
+                COUNT(*) as cnt
+            FROM subscriptions
+            GROUP BY origin, status
+            ORDER BY origin, status
+        """)
+        report["data_origins"] = [{"origin": r["origin"], "status": r["status"], "count": r["cnt"]} for r in origin_counts]
+
+        # ============================================================
+        # SECTION 6: Undetermined source subs (the bug we just fixed)
+        # ============================================================
+        undetermined = await conn.fetch("""
+            SELECT id, email, stripe_subscription_id, status, import_batch, created_at
+            FROM subscriptions
+            WHERE source = 'undetermined'
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
+        # Also check for subs that SHOULD be undetermined (ymove_new_apple but no real apple transaction)
+        suspicious_apple = await conn.fetch("""
+            SELECT id, email, stripe_subscription_id, source, status, import_batch
+            FROM subscriptions
+            WHERE source = 'apple'
+            AND stripe_subscription_id LIKE 'ymove_new_apple_%'
+            AND status IN ('active', 'trialing')
+        """)
+        report["gaps"] = {
+            "undetermined_subs": [{"id": r["id"], "email": r["email"], "sub_id": r["stripe_subscription_id"],
+                                   "status": r["status"], "batch": r["import_batch"]} for r in undetermined],
+            "suspicious_apple_from_sync": {
+                "count": len(suspicious_apple),
+                "note": "These were imported by shadow sync with source=apple, but ymove API returns null provider. They may actually be Google or Manual users.",
+                "records": [{"id": r["id"], "email": r["email"], "sub_id": r["stripe_subscription_id"],
+                            "batch": r["import_batch"]} for r in suspicious_apple[:30]]
+            }
+        }
+        if len(suspicious_apple) > 0:
+            report["action_items"].append(f"WARNING: {len(suspicious_apple)} active subs were auto-imported as 'apple' by shadow sync but provider was actually null. These need provider correction once Tosh fixes the API.")
+
+        # ============================================================
+        # SECTION 7: Recent ymove sync run results
+        # ============================================================
+        try:
+            recent_syncs = await conn.fetch("""
+                SELECT id, phase, started_at, completed_at, our_active_count, ymove_active_count,
+                       deactivated, reactivated, new_imported, errors
+                FROM ymove_sync_runs
+                ORDER BY id DESC LIMIT 10
+            """)
+            report["recent_syncs"] = [
+                {
+                    "run_id": r["id"], "phase": r["phase"],
+                    "started": str(r["started_at"]), "completed": str(r["completed_at"]) if r["completed_at"] else None,
+                    "our_active": r["our_active_count"], "ymove_active": r["ymove_active_count"],
+                    "deactivated": r["deactivated"], "reactivated": r["reactivated"],
+                    "new_imported": r["new_imported"], "errors": r["errors"]
+                } for r in recent_syncs
+            ]
+        except Exception:
+            report["recent_syncs"] = "ymove_sync_runs table not found or empty"
+
+        # ============================================================
+        # SECTION 8: Active subs with NO email (can never be reconciled)
+        # ============================================================
+        no_email_active = await conn.fetch("""
+            SELECT id, stripe_subscription_id, source, status, plan_amount, created_at, import_batch
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            AND (email IS NULL OR email = '')
+            ORDER BY created_at DESC
+        """)
+        report["no_email_active"] = {
+            "count": len(no_email_active),
+            "records": [{"id": r["id"], "sub_id": r["stripe_subscription_id"], "source": r["source"],
+                         "plan_amount": r["plan_amount"], "batch": r["import_batch"]} for r in no_email_active[:30]]
+        }
+        if len(no_email_active) > 0:
+            report["action_items"].append(f"CRITICAL: {len(no_email_active)} active subs have NO email. Cannot reconcile against ymove, cannot detect cancellations, inflate counts silently.")
+
+        # ============================================================
+        # SUMMARY
+        # ============================================================
+        total_active = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing')")
+        report["summary"] = {
+            "total_active_subs": total_active,
+            "total_batch_operations": len(batch_summary),
+            "total_duplicate_emails": len(dup_grouped),
+            "total_source_mismatches": len(mismatches),
+            "total_no_email_active": len(no_email_active),
+            "total_suspicious_apple_sync": len(suspicious_apple),
+            "total_action_items": len(report["action_items"])
+        }
+
+    return report
 
 
 # --- Session 16: Database Health Check ---
