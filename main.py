@@ -3763,11 +3763,11 @@ async def provider_cleanup(request: Request):
             "stripe_orphans_to_reclassify": len(stripe_orphans),
             "non_stripe_to_undetermined": len(non_stripe),
             "stripe_errors": stripe_errors,
-            "duplicate_details": stripe_duplicates[:20],
-            "ag_duplicate_details": apple_google_duplicates[:20],
-            "meg_details": meg_identified[:20],
-            "orphan_details": stripe_orphans[:20],
-            "undetermined_details": non_stripe[:20],
+            "duplicate_details": stripe_duplicates,
+            "ag_duplicate_details": apple_google_duplicates,
+            "meg_details": meg_identified,
+            "orphan_details": stripe_orphans,
+            "undetermined_details": non_stripe,
             "note": "Send preview: false to apply. All duplicates get cancelled. Meg-identified get correct source. Stripe orphans get source='stripe'. Rest get source='undetermined'."
         }
 
