@@ -2061,6 +2061,31 @@ async def admin_ymove_log(request: Request):
 
 # --- Session 17: ymove API Verification ---
 
+@app.get("/api/admin/inspect-ymove-user")
+async def inspect_ymove_user(request: Request):
+    """S23: Dump the full ymove response for a single email, including meta field.
+    Usage: /api/admin/inspect-ymove-user?pw=mmadmin2026&email=user@example.com"""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    email = request.query_params.get("email", "").strip().lower()
+    if not email:
+        return JSONResponse(status_code=400, content={"error": "email query param required"})
+    if not YMOVE_API_KEY:
+        return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+            headers={"X-Authorization": YMOVE_API_KEY},
+            params={"email": email}
+        )
+        return {
+            "email": email,
+            "http_status": resp.status_code,
+            "raw_response": resp.json() if resp.status_code == 200 else resp.text
+        }
+
+
 @app.get("/api/admin/provider-test")
 async def provider_test_get(request: Request):
     """S23: GET version of provider test - hit this in your browser.
