@@ -2081,15 +2081,33 @@ function doProviderCleanup(preview) {
     if (d.status === "preview") {
       html += '<h4 style="margin:0 0 8px">Cleanup Preview</h4>';
       html += '<div>Total candidates: <strong>' + d.total_candidates + '</strong></div>';
-      html += '<div>Stripe identified: <strong style="color:#635bff">' + d.stripe_identified + '</strong></div>';
-      html += '<div>Non-Stripe (undetermined): <strong style="color:#e65100">' + d.non_stripe_undetermined + '</strong></div>';
-      html += '<div>Stripe errors: ' + d.stripe_errors + '</div>';
+      html += '<div>Stripe duplicates to cancel: <strong style="color:#c62828">' + (d.stripe_duplicates_to_cancel || 0) + '</strong></div>';
+      html += '<div>Meg-identified (Apple/Google): <strong style="color:#2d6a2d">' + (d.meg_identified || 0) + '</strong></div>';
+      html += '<div>Stripe orphans to reclassify: <strong style="color:#635bff">' + (d.stripe_orphans_to_reclassify || 0) + '</strong></div>';
+      html += '<div>Undetermined: <strong style="color:#e65100">' + (d.non_stripe_to_undetermined || 0) + '</strong></div>';
+      html += '<div>Stripe errors: ' + (d.stripe_errors || 0) + '</div>';
       html += '<hr style="margin:8px 0">';
 
-      if (d.stripe_details && d.stripe_details.length > 0) {
-        html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#635bff"><strong>Stripe identified (' + d.stripe_details.length + ')</strong></summary>';
-        d.stripe_details.forEach(function(item) {
-          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — ' + item.old_source + ' → stripe (sub: ' + item.stripe_sub_id + ')</div>';
+      if (d.duplicate_details && d.duplicate_details.length > 0) {
+        html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#c62828"><strong>Stripe duplicates to cancel (' + d.duplicate_details.length + ')</strong></summary>';
+        d.duplicate_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — cancel ' + item.sub_id + ' (real: ' + item.real_sub_id + ')</div>';
+        });
+        html += '</details>';
+      }
+
+      if (d.meg_details && d.meg_details.length > 0) {
+        html += '<details open><summary style="cursor:pointer;font-size:.82rem;color:#2d6a2d"><strong>Meg-identified (' + d.meg_details.length + ')</strong></summary>';
+        d.meg_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — ' + item.old_source + ' → ' + item.new_source + ' (' + item.note + ')</div>';
+        });
+        html += '</details>';
+      }
+
+      if (d.orphan_details && d.orphan_details.length > 0) {
+        html += '<details><summary style="cursor:pointer;font-size:.82rem;color:#635bff"><strong>Stripe orphans (' + d.orphan_details.length + ')</strong></summary>';
+        d.orphan_details.forEach(function(item) {
+          html += '<div style="font-size:.78rem;padding:4px 0;border-bottom:1px solid #eee">' + item.email + ' — ' + item.old_source + ' → stripe (' + item.stripe_sub_id + ')</div>';
         });
         html += '</details>';
       }
@@ -2105,9 +2123,11 @@ function doProviderCleanup(preview) {
       btnApply.style.display = "inline-block";
     } else {
       html += '<h4 style="margin:0 0 8px;color:#2d6a2d">Cleanup Applied</h4>';
-      html += '<div>Updated to Stripe: <strong>' + d.updated_to_stripe + '</strong></div>';
-      html += '<div>Updated to undetermined: <strong>' + d.updated_to_undetermined + '</strong></div>';
-      html += '<div>Errors: ' + d.errors + '</div>';
+      html += '<div>Cancelled duplicates: <strong>' + (d.cancelled_duplicates || 0) + '</strong></div>';
+      html += '<div>Updated from Meg imports: <strong>' + (d.updated_from_meg || 0) + '</strong></div>';
+      html += '<div>Updated to Stripe: <strong>' + (d.updated_to_stripe || 0) + '</strong></div>';
+      html += '<div>Updated to undetermined: <strong>' + (d.updated_to_undetermined || 0) + '</strong></div>';
+      html += '<div>Errors: ' + (d.errors || 0) + '</div>';
       html += '<div style="font-size:.78rem;color:#666;margin-top:8px">Batch ID: ' + d.batch_id + '</div>';
     }
 

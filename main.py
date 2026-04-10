@@ -3491,41 +3491,77 @@ async def run_daily_shadow_sync():
             else:
                 print("[Daily Sync] No changes to apply. Database is in sync.")
 
-            # S23: Alert mode — instead of silently importing, cross-ref with Stripe and report
+            # S23: Alert mode — instead of silently importing, cross-ref with Meg imports, Stripe, and report
             switcher_list = res_data.get("cross_platform_switchers", [])
             truly_new_list = res_data.get("truly_new", [])
             all_unknown = switcher_list + [t for t in truly_new_list if not _is_test_email(t.get("email", ""))]
 
             if all_unknown:
-                # Cross-reference with Stripe to determine provider
+                # Three-step waterfall: Meg import → Stripe API → undetermined
+                meg_identified = []
                 stripe_identified = []
                 non_stripe = []
                 stripe_errors = 0
 
-                for item in all_unknown:
-                    email = item.get("email", "")
-                    if not email:
-                        continue
-                    try:
-                        customers = stripe.Customer.list(email=email, limit=1)
-                        if customers.data:
-                            # They have a Stripe customer record — check for active sub
-                            cust = customers.data[0]
-                            subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
-                            if subs.data:
-                                stripe_identified.append({
-                                    "email": email,
-                                    "stripe_customer_id": cust.id,
-                                    "stripe_sub_id": subs.data[0].id,
-                                    "note": "Active Stripe sub found — likely missed webhook"
-                                })
-                            else:
-                                non_stripe.append({"email": email, "note": "Has Stripe customer but no active sub — likely Apple/Google/Manual"})
-                        else:
-                            non_stripe.append({"email": email, "note": "No Stripe customer record — definitely Apple/Google/Manual"})
-                    except Exception as e:
-                        stripe_errors += 1
-                        non_stripe.append({"email": email, "note": f"Stripe lookup error: {str(e)[:100]}"})
+                async with db_pool.acquire() as conn:
+                    for item in all_unknown:
+                        email = item.get("email", "")
+                        if not email:
+                            continue
+
+                        # Step 1: Check Meg import records for known provider
+                        meg_record = await conn.fetchrow(
+                            """SELECT source FROM subscriptions
+                               WHERE lower(email) = lower($1)
+                               AND (stripe_subscription_id LIKE 'import_apple_%%'
+                                    OR stripe_subscription_id LIKE 'import_google_%%'
+                                    OR stripe_subscription_id LIKE 'meg_apple_%%'
+                                    OR stripe_subscription_id LIKE 'meg_google_%%')
+                               ORDER BY created_at DESC LIMIT 1""", email
+                        )
+                        if meg_record and meg_record["source"] in ("apple", "google"):
+                            meg_identified.append({"email": email, "source": meg_record["source"]})
+                            continue
+
+                        # Step 2: Check Stripe
+                        try:
+                            customers = stripe.Customer.list(email=email, limit=1)
+                            if customers.data:
+                                cust = customers.data[0]
+                                subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
+                                if subs.data:
+                                    stripe_identified.append({
+                                        "email": email,
+                                        "stripe_customer_id": cust.id,
+                                        "stripe_sub_id": subs.data[0].id,
+                                    })
+                                    continue
+                            non_stripe.append({"email": email})
+                        except Exception as e:
+                            stripe_errors += 1
+                            non_stripe.append({"email": email})
+
+                # Auto-import Meg-identified users with correct source
+                if meg_identified:
+                    batch_id_meg = f"autosync_meg_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    imported_meg = 0
+                    async with db_pool.acquire() as conn:
+                        for item in meg_identified:
+                            email_hash = hashlib.md5(item["email"].encode()).hexdigest()[:16]
+                            syn_id = f"ymove_new_{item['source']}_{email_hash}"
+                            try:
+                                await conn.execute("""
+                                    INSERT INTO subscriptions (
+                                        stripe_customer_id, stripe_subscription_id, email, status,
+                                        plan_interval, plan_amount, currency, source,
+                                        created_at, updated_at, import_batch
+                                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                                """, syn_id, item["email"], item["source"], batch_id_meg)
+                                imported_meg += 1
+                            except Exception as e:
+                                print(f"[Daily Sync] Meg-identified import error for {item['email']}: {e}")
+                    print(f"[Daily Sync] Auto-imported {imported_meg} Meg-identified users (batch={batch_id_meg})")
 
                 # Auto-import Stripe-identified users with correct source
                 if stripe_identified:
@@ -3547,7 +3583,7 @@ async def run_daily_shadow_sync():
                                 print(f"[Daily Sync] Stripe cross-ref import error for {item['email']}: {e}")
                     print(f"[Daily Sync] Auto-imported {imported_stripe} Stripe-identified users (batch={batch_id_stripe})")
 
-                # Import non-Stripe users as undetermined (we know they're Apple/Google/Manual but can't tell which)
+                # Import remaining as undetermined
                 if non_stripe:
                     batch_id_undet = f"autosync_undetermined_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
                     imported_undet = 0
@@ -3570,9 +3606,10 @@ async def run_daily_shadow_sync():
                                 print(f"[Daily Sync] Undetermined import error for {email}: {e}")
                     print(f"[Daily Sync] Imported {imported_undet} undetermined users (batch={batch_id_undet})")
 
-                # Log summary for digest visibility
+                # Log summary
                 print(f"[Daily Sync] Gap report: {len(all_unknown)} users in ymove not in our DB. "
-                      f"Stripe cross-ref: {len(stripe_identified)} confirmed Stripe, {len(non_stripe)} non-Stripe (undetermined), {stripe_errors} errors.")
+                      f"Meg-identified: {len(meg_identified)}, Stripe: {len(stripe_identified)}, "
+                      f"Undetermined: {len(non_stripe)}, Stripe errors: {stripe_errors}")
             else:
                 print("[Daily Sync] No unknown users found. Webhook pipeline is healthy.")
         else:
@@ -3591,9 +3628,10 @@ async def run_daily_shadow_sync():
 @app.post("/api/admin/provider-cleanup")
 async def provider_cleanup(request: Request):
     """S23: Reclassify ymove_new_*/ymove_switch_* records that were auto-imported with guessed providers.
-    Step 1: Reclassify all ymove_new_*/ymove_switch_* active subs to 'undetermined'
-    Step 2: Cross-reference each with Stripe to reclaim Stripe users
-    Step 3: Report remaining undetermined for future resolution (when Tosh fixes API)
+    Step 1: Check if we already have a real sub_* Stripe record (cancel duplicate)
+    Step 2: Check Meg import records for known Apple/Google source
+    Step 3: Cross-reference with Stripe API
+    Step 4: Report remaining undetermined for future resolution (when Tosh fixes API)
     Body: {"preview": true/false}
     """
     pw = request.headers.get("X-Admin-Password", "")
@@ -3618,59 +3656,128 @@ async def provider_cleanup(request: Request):
     if not candidates:
         return {"status": "ok", "message": "No ymove_new_*/ymove_switch_* active records found. Nothing to clean up."}
 
-    # Cross-reference each with Stripe
-    stripe_found = []
+    stripe_duplicates = []  # Have real sub_* record already — cancel the ymove_new_* copy
+    meg_identified = []     # Meg import tells us the provider
+    stripe_orphans = []     # Stripe confirms active but we don't have a sub_* record
     non_stripe = []
     stripe_errors = 0
 
-    for r in candidates:
-        email = (r["email"] or "").strip().lower()
-        if not email:
-            non_stripe.append({"id": r["id"], "email": "", "sub_id": r["stripe_subscription_id"],
-                               "old_source": r["source"], "new_source": "undetermined", "note": "No email to cross-ref"})
-            continue
-        try:
-            customers = stripe.Customer.list(email=email, limit=1)
-            if customers.data:
-                cust = customers.data[0]
-                subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
-                if subs.data:
-                    stripe_found.append({
+    async with db_pool.acquire() as conn:
+        for r in candidates:
+            email = (r["email"] or "").strip().lower()
+            if not email:
+                non_stripe.append({"id": r["id"], "email": "", "sub_id": r["stripe_subscription_id"],
+                                   "old_source": r["source"], "new_source": "undetermined", "note": "No email to cross-ref"})
+                continue
+
+            # Step 1: do we already have a sub_* record for this email?
+            existing_stripe = await conn.fetchrow(
+                """SELECT id, stripe_subscription_id, status FROM subscriptions
+                   WHERE lower(email) = $1 AND stripe_subscription_id LIKE 'sub_%'
+                   AND status IN ('active', 'trialing')""", email
+            )
+            if existing_stripe:
+                stripe_duplicates.append({
+                    "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                    "old_source": r["source"], "action": "cancel_duplicate",
+                    "real_sub_id": existing_stripe["stripe_subscription_id"],
+                    "note": f"Duplicate — real Stripe sub exists: {existing_stripe['stripe_subscription_id']}"
+                })
+                continue
+
+            # Step 2: do we have a Meg import record for this email? (any status)
+            meg_record = await conn.fetchrow(
+                """SELECT source, stripe_subscription_id FROM subscriptions
+                   WHERE lower(email) = $1
+                   AND (stripe_subscription_id LIKE 'import_apple_%'
+                        OR stripe_subscription_id LIKE 'import_google_%'
+                        OR stripe_subscription_id LIKE 'meg_apple_%'
+                        OR stripe_subscription_id LIKE 'meg_google_%')
+                   ORDER BY created_at DESC LIMIT 1""", email
+            )
+            if meg_record:
+                meg_source = meg_record["source"]
+                if meg_source in ("apple", "google"):
+                    meg_identified.append({
                         "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
-                        "old_source": r["source"], "new_source": "stripe",
-                        "stripe_customer_id": cust.id, "stripe_sub_id": subs.data[0].id,
-                        "note": "Active Stripe sub confirmed"
+                        "old_source": r["source"], "new_source": meg_source,
+                        "meg_sub_id": meg_record["stripe_subscription_id"],
+                        "note": f"Meg import confirms source={meg_source} ({meg_record['stripe_subscription_id']})"
                     })
                     continue
-            non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
-                               "old_source": r["source"], "new_source": "undetermined",
-                               "note": "No Stripe sub — Apple/Google/Manual"})
-        except Exception as e:
-            stripe_errors += 1
-            non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
-                               "old_source": r["source"], "new_source": "undetermined",
-                               "note": f"Stripe lookup error: {str(e)[:100]}"})
+
+            # Step 3: does Stripe know this email?
+            try:
+                customers = stripe.Customer.list(email=email, limit=1)
+                if customers.data:
+                    cust = customers.data[0]
+                    subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
+                    if subs.data:
+                        stripe_orphans.append({
+                            "id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                            "old_source": r["source"], "action": "reclassify_stripe",
+                            "stripe_customer_id": cust.id, "stripe_sub_id": subs.data[0].id,
+                            "note": "Active Stripe sub confirmed but no sub_* record in our DB"
+                        })
+                        continue
+                non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                                   "old_source": r["source"], "new_source": "undetermined",
+                                   "note": "No Stripe sub, no Meg import — Apple/Google/Manual"})
+            except Exception as e:
+                stripe_errors += 1
+                non_stripe.append({"id": r["id"], "email": email, "sub_id": r["stripe_subscription_id"],
+                                   "old_source": r["source"], "new_source": "undetermined",
+                                   "note": f"Stripe lookup error: {str(e)[:100]}"})
 
     if preview:
         return {
             "status": "preview",
             "batch_id": batch_id,
             "total_candidates": len(candidates),
-            "stripe_identified": len(stripe_found),
-            "non_stripe_undetermined": len(non_stripe),
+            "stripe_duplicates_to_cancel": len(stripe_duplicates),
+            "meg_identified": len(meg_identified),
+            "stripe_orphans_to_reclassify": len(stripe_orphans),
+            "non_stripe_to_undetermined": len(non_stripe),
             "stripe_errors": stripe_errors,
-            "stripe_details": stripe_found[:20],
+            "duplicate_details": stripe_duplicates[:20],
+            "meg_details": meg_identified[:20],
+            "orphan_details": stripe_orphans[:20],
             "undetermined_details": non_stripe[:20],
-            "note": "Send preview: false to apply. Stripe users get source='stripe', rest get source='undetermined'."
+            "note": "Send preview: false to apply. Duplicates get cancelled. Meg-identified get correct source. Stripe orphans get source='stripe'. Rest get source='undetermined'."
         }
 
     # Apply changes
+    cancelled_dupes = 0
+    updated_meg = 0
     updated_stripe = 0
     updated_undet = 0
     errors = 0
 
     async with db_pool.acquire() as conn:
-        for item in stripe_found:
+        # Cancel duplicates (they have real sub_* records already)
+        for item in stripe_duplicates:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), import_batch = $1, updated_at = NOW() WHERE id = $2",
+                    batch_id, item["id"]
+                )
+                cancelled_dupes += 1
+            except Exception as e:
+                errors += 1
+
+        # Apply Meg-identified source
+        for item in meg_identified:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET source = $1, import_batch = $2, updated_at = NOW() WHERE id = $3",
+                    item["new_source"], batch_id, item["id"]
+                )
+                updated_meg += 1
+            except Exception as e:
+                errors += 1
+
+        # Reclassify Stripe orphans
+        for item in stripe_orphans:
             try:
                 await conn.execute(
                     "UPDATE subscriptions SET source = 'stripe', import_batch = $1, updated_at = NOW() WHERE id = $2",
@@ -3680,6 +3787,7 @@ async def provider_cleanup(request: Request):
             except Exception as e:
                 errors += 1
 
+        # Reclassify non-Stripe to undetermined
         for item in non_stripe:
             try:
                 await conn.execute(
@@ -3694,6 +3802,8 @@ async def provider_cleanup(request: Request):
         "status": "applied",
         "batch_id": batch_id,
         "total_processed": len(candidates),
+        "cancelled_duplicates": cancelled_dupes,
+        "updated_from_meg": updated_meg,
         "updated_to_stripe": updated_stripe,
         "updated_to_undetermined": updated_undet,
         "errors": errors,
