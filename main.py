@@ -2061,6 +2061,92 @@ async def admin_ymove_log(request: Request):
 
 # --- Session 17: ymove API Verification ---
 
+@app.get("/api/admin/provider-test")
+async def provider_test_get(request: Request):
+    """S23: GET version of provider test - hit this in your browser.
+    Compare individual vs bulk ymove API provider fields."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    ymove_key = YMOVE_API_KEY
+    if not ymove_key:
+        return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    # Pick one known sub from each source
+    test_emails = {}
+    async with db_pool.acquire() as conn:
+        for src in ("apple", "google", "stripe"):
+            row = await conn.fetchrow(
+                """SELECT email, stripe_subscription_id, source FROM subscriptions
+                   WHERE source = $1 AND status = 'active' AND email != '' AND email IS NOT NULL
+                   ORDER BY created_at DESC LIMIT 1""", src
+            )
+            if row:
+                test_emails[src] = {"email": row["email"], "sub_id": row["stripe_subscription_id"]}
+
+    results = {}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for src, info in test_emails.items():
+            try:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": ymove_key},
+                    params={"email": info["email"]}
+                )
+                raw = resp.json() if resp.status_code == 200 else {"http_status": resp.status_code}
+                user_obj = raw.get("user", {})
+                results[src] = {
+                    "email": info["email"],
+                    "our_sub_id": info["sub_id"],
+                    "our_source": src,
+                    "individual_lookup": {
+                        "subscriptionProvider": user_obj.get("subscriptionProvider"),
+                        "all_provider_fields": {k: v for k, v in user_obj.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
+                        "full_user_keys": list(user_obj.keys()),
+                    }
+                }
+            except Exception as e:
+                results[src] = {"email": info["email"], "error": str(e)}
+            await asyncio.sleep(1.5)
+
+        # Bulk lookup page 1
+        try:
+            resp = await client.get(
+                f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                headers={"X-Authorization": ymove_key},
+                params={"status": "subscribed", "page": "1"}
+            )
+            if resp.status_code == 200:
+                bulk_data = resp.json()
+                bulk_users = bulk_data.get("users", [])
+                bulk_by_email = {(u.get("email") or "").strip().lower(): u for u in bulk_users}
+                for src, info in test_emails.items():
+                    bulk_user = bulk_by_email.get(info["email"].lower())
+                    if bulk_user:
+                        results[src]["bulk_lookup"] = {
+                            "subscriptionProvider": bulk_user.get("subscriptionProvider"),
+                            "all_provider_fields": {k: v for k, v in bulk_user.items() if "provider" in k.lower() or "payment" in k.lower() or "source" in k.lower()},
+                        }
+                    else:
+                        results[src]["bulk_lookup"] = "not_found_on_page_1"
+                results["_bulk_sample"] = [
+                    {k: v for k, v in u.items() if "provider" in k.lower() or "payment" in k.lower() or "email" in k.lower()}
+                    for u in bulk_users[:3]
+                ]
+            else:
+                results["_bulk_error"] = {"http_status": resp.status_code}
+        except Exception as e:
+            results["_bulk_error"] = str(e)
+
+    return {
+        "test": "provider_field_comparison",
+        "purpose": "Compare individual member-lookup vs bulk member-lookup/all provider fields",
+        "results": results
+    }
+
+
 @app.post("/api/admin/ymove-verify")
 async def ymove_verify(request: Request):
     """Verify emails against ymove Member Lookup API (S19 rewrite).
