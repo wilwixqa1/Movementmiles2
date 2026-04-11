@@ -1758,9 +1758,16 @@ function doReconAudit() {
       html += '<h4 style="margin:0 0 8px">Duplicate Active Emails: ' + d.duplicates.count + '</h4>';
       if (d.duplicates.count > 0) {
         var emails = d.duplicates.emails || {};
-        Object.keys(emails).slice(0, 10).forEach(function(em) {
-          html += '<details><summary style="cursor:pointer;font-size:.82rem">' + em + ' (' + emails[em].length + ' active subs)</summary>';
-          html += '<pre style="font-size:.75rem;white-space:pre-wrap">' + JSON.stringify(emails[em], null, 2) + '</pre></details>';
+        Object.keys(emails).forEach(function(em) {
+          html += '<details open><summary style="cursor:pointer;font-size:.82rem"><strong>' + em + '</strong> (' + emails[em].length + ' active subs)</summary>';
+          emails[em].forEach(function(rec) {
+            html += '<div style="font-size:.75rem;padding:6px;border:1px solid #eee;margin:4px 0;border-radius:4px">';
+            html += '<div>ID: <strong>' + rec.id + '</strong> | Source: ' + rec.source + ' | Sub: <code>' + rec.sub_id + '</code></div>';
+            html += '<div>Created: ' + rec.created + ' | Batch: ' + (rec.import_batch || 'none') + '</div>';
+            html += '<button style="background:#c62828;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin-top:4px;font-size:.7rem" onclick="doDeleteDuplicate(' + rec.id + ', \'' + em + '\')">Delete this record</button>';
+            html += '</div>';
+          });
+          html += '</details>';
         });
       }
       html += '<hr style="margin:12px 0">';
@@ -2054,6 +2061,24 @@ function exportCSV() {
 document.getElementById('admin-pw').focus();
 
 // --- Session 17: Data Health & Verification ---
+
+function doDeleteDuplicate(id, email) {
+  if (!confirm("Permanently DELETE record ID " + id + " for " + email + "?\n\nThis cannot be undone. Endpoint will only proceed if a real sibling (sub_*, numeric, or ym_google_*) exists for this email.")) return;
+  fetch("/api/admin/delete-duplicate", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({id: id, confirm: true})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.status === "deleted") {
+      alert("Deleted record " + id + ".\nPreserved sibling: " + d.preserved_sibling.stripe_subscription_id);
+      doReconAudit();
+    } else if (d.status === "blocked") {
+      alert("BLOCKED: " + d.reason);
+    } else {
+      alert("Error: " + JSON.stringify(d));
+    }
+  }).catch(function(e) { alert("Error: " + e.message); });
+}
 
 function doProviderCleanup(preview) {
   var btnPreview = document.getElementById("btn-cleanup-preview");
