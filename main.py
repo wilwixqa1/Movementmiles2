@@ -3657,6 +3657,62 @@ async def run_daily_shadow_sync():
 
 # --- S23: Retroactive Provider Cleanup ---
 
+@app.post("/api/admin/cancel-duplicate")
+async def cancel_duplicate(request: Request):
+    """S23: Safely cancel a duplicate record by ID (preserves history).
+    Body: {"id": 123, "confirm": true}
+    Only cancels if a real sibling exists for the same email.
+    Tags with import_batch='s23_dedup_safe_cancel' so shadow sync won't reactivate."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    record_id = body.get("id")
+    confirm = body.get("confirm", False)
+    if not record_id or not confirm:
+        return JSONResponse(status_code=400, content={"error": "Provide {id: int, confirm: true}"})
+
+    batch_id = f"s23_provider_cleanup_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email, stripe_subscription_id, source, status FROM subscriptions WHERE id = $1",
+            record_id
+        )
+        if not target:
+            return {"status": "not_found", "id": record_id}
+
+        sibling = await conn.fetchrow(
+            """SELECT id, stripe_subscription_id, source FROM subscriptions
+               WHERE lower(email) = lower($1) AND id != $2
+               AND status IN ('active', 'trialing')
+               AND (stripe_subscription_id LIKE 'sub_%'
+                    OR stripe_subscription_id ~ '^[0-9]+$'
+                    OR stripe_subscription_id LIKE 'ym_google_%')
+               LIMIT 1""", target["email"], record_id
+        )
+        if not sibling:
+            return {"status": "blocked", "reason": "No real sibling record found for this email. Refusing to cancel.",
+                    "target": dict(target)}
+
+        await conn.execute(
+            """UPDATE subscriptions
+               SET status = 'canceled', canceled_at = NOW(),
+                   import_batch = $1, updated_at = NOW()
+               WHERE id = $2""",
+            batch_id, record_id
+        )
+        return {
+            "status": "cancelled",
+            "batch_id": batch_id,
+            "cancelled_record": dict(target),
+            "preserved_sibling": dict(sibling),
+            "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}"
+        }
+
+
 @app.post("/api/admin/delete-duplicate")
 async def delete_duplicate(request: Request):
     """S23: Hard delete a specific duplicate record by ID. Use with caution.

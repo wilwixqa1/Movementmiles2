@@ -1764,6 +1764,7 @@ function doReconAudit() {
             html += '<div style="font-size:.75rem;padding:6px;border:1px solid #eee;margin:4px 0;border-radius:4px">';
             html += '<div>ID: <strong>' + rec.id + '</strong> | Source: ' + rec.source + ' | Sub: <code>' + rec.sub_id + '</code></div>';
             html += '<div>Created: ' + rec.created + ' | Batch: ' + (rec.import_batch || 'none') + '</div>';
+            html += '<button style="background:#e65100;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin-top:4px;font-size:.7rem;margin-right:4px" onclick="doCancelDuplicate(' + rec.id + ', \'' + em + '\')">Cancel (safe)</button>';
             html += '<button style="background:#c62828;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin-top:4px;font-size:.7rem" onclick="doDeleteDuplicate(' + rec.id + ', \'' + em + '\')">Delete this record</button>';
             html += '</div>';
           });
@@ -2061,6 +2062,24 @@ function exportCSV() {
 document.getElementById('admin-pw').focus();
 
 // --- Session 17: Data Health & Verification ---
+
+function doCancelDuplicate(id, email) {
+  if (!confirm("Safely cancel record ID " + id + " for " + email + "?\n\nThis preserves history and can be reverted via batch ID. The shadow sync will not reactivate it.")) return;
+  fetch("/api/admin/cancel-duplicate", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({id: id, confirm: true})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.status === "cancelled") {
+      alert("Cancelled record " + id + ".\nBatch ID (for revert): " + d.batch_id + "\nPreserved sibling: " + d.preserved_sibling.stripe_subscription_id);
+      doReconAudit();
+    } else if (d.status === "blocked") {
+      alert("BLOCKED: " + d.reason);
+    } else {
+      alert("Error: " + JSON.stringify(d));
+    }
+  }).catch(function(e) { alert("Error: " + e.message); });
+}
 
 function doDeleteDuplicate(id, email) {
   if (!confirm("Permanently DELETE record ID " + id + " for " + email + "?\n\nThis cannot be undone. Endpoint will only proceed if a real sibling (sub_*, numeric, or ym_google_*) exists for this email.")) return;
