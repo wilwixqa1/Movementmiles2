@@ -1757,6 +1757,7 @@ function doReconAudit() {
     if (d.duplicates) {
       html += '<h4 style="margin:0 0 8px">Duplicate Active Emails: ' + d.duplicates.count + '</h4>';
       if (d.duplicates.count > 0) {
+        html += '<button style="background:#c62828;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;margin-bottom:10px;font-weight:600" onclick="doCancelAllDuplicates()">Cancel ALL duplicates (safe, batch)</button>';
         var emails = d.duplicates.emails || {};
         Object.keys(emails).forEach(function(em) {
           html += '<details open><summary style="cursor:pointer;font-size:.82rem"><strong>' + em + '</strong> (' + emails[em].length + ' active subs)</summary>';
@@ -2062,6 +2063,18 @@ function exportCSV() {
 document.getElementById('admin-pw').focus();
 
 // --- Session 17: Data Health & Verification ---
+
+function doCancelAllDuplicates() {
+  if (!confirm("Cancel ALL duplicate active subscriptions in one batch?\n\nFor each email with multiple active records, this keeps the one with a real ID pattern (sub_*, numeric, ym_google_*) and cancels the synthetic one(s). Fully reversible via batch ID.")) return;
+  fetch("/api/admin/cancel-all-duplicates", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({confirm: true})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    alert("Done.\nDuplicate emails processed: " + d.duplicate_emails_processed + "\nRecords cancelled: " + d.records_cancelled + "\nRecords kept: " + d.records_kept + "\nSkipped: " + d.skipped + "\n\nBatch ID (for revert): " + d.batch_id);
+    doReconAudit();
+  }).catch(function(e) { alert("Error: " + e.message); });
+}
 
 function doCancelDuplicate(id, email) {
   if (!confirm("Safely cancel record ID " + id + " for " + email + "?\n\nThis preserves history and can be reverted via batch ID. The shadow sync will not reactivate it.")) return;

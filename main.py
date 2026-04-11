@@ -3657,6 +3657,96 @@ async def run_daily_shadow_sync():
 
 # --- S23: Retroactive Provider Cleanup ---
 
+@app.post("/api/admin/cancel-all-duplicates")
+async def cancel_all_duplicates(request: Request):
+    """S23: Auto-find and safely cancel all duplicate active subscriptions.
+    For each email with multiple active records, keeps the one with a real ID
+    pattern (sub_*, numeric Apple, ym_google_*) and cancels the synthetic one(s)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    if not body.get("confirm"):
+        return JSONResponse(status_code=400, content={"error": "Provide {confirm: true}"})
+
+    batch_id = f"s23_provider_cleanup_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        # Get all active records for emails that have duplicates
+        rows = await conn.fetch("""
+            SELECT s.id, lower(s.email) as email, s.stripe_subscription_id, s.source, s.created_at
+            FROM subscriptions s
+            INNER JOIN (
+                SELECT lower(email) as em FROM subscriptions
+                WHERE status IN ('active', 'trialing') AND email != '' AND email IS NOT NULL
+                GROUP BY lower(email) HAVING COUNT(*) > 1
+            ) dups ON lower(s.email) = dups.em
+            WHERE s.status IN ('active', 'trialing')
+            ORDER BY s.email, s.created_at
+        """)
+
+        # Group by email
+        groups = {}
+        for r in rows:
+            groups.setdefault(r["email"], []).append(dict(r))
+
+        cancelled = []
+        kept = []
+        skipped = []
+
+        def is_real(sub_id):
+            if not sub_id:
+                return False
+            if sub_id.startswith("sub_"):
+                return True
+            if sub_id.startswith("ym_google_"):
+                return True
+            if sub_id.isdigit():
+                return True
+            return False
+
+        for email, records in groups.items():
+            real_records = [r for r in records if is_real(r["stripe_subscription_id"])]
+            synthetic_records = [r for r in records if not is_real(r["stripe_subscription_id"])]
+
+            if not real_records:
+                # No real sibling, leave alone
+                skipped.append({"email": email, "reason": "no real sibling found", "records": records})
+                continue
+
+            # Keep first real one
+            keep_record = real_records[0]
+            kept.append({"email": email, "kept_id": keep_record["id"], "kept_sub": keep_record["stripe_subscription_id"]})
+
+            # Cancel everything else (other real ones AND synthetic ones)
+            to_cancel = [r for r in records if r["id"] != keep_record["id"]]
+            for r in to_cancel:
+                try:
+                    await conn.execute(
+                        """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                           import_batch = $1, updated_at = NOW() WHERE id = $2""",
+                        batch_id, r["id"]
+                    )
+                    cancelled.append({"email": email, "cancelled_id": r["id"], "sub": r["stripe_subscription_id"], "source": r["source"]})
+                except Exception as e:
+                    skipped.append({"email": email, "id": r["id"], "error": str(e)})
+
+    return {
+        "status": "done",
+        "batch_id": batch_id,
+        "duplicate_emails_processed": len(groups),
+        "records_cancelled": len(cancelled),
+        "records_kept": len(kept),
+        "skipped": len(skipped),
+        "cancelled": cancelled,
+        "kept": kept,
+        "skipped_details": skipped,
+        "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}"
+    }
+
+
 @app.post("/api/admin/cancel-duplicate")
 async def cancel_duplicate(request: Request):
     """S23: Safely cancel a duplicate record by ID (preserves history).
