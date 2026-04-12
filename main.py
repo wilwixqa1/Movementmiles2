@@ -2952,13 +2952,17 @@ async def _run_shadow_sync(run_id: int):
                             processed, run_id
                         )
 
-        # S23: Self-healing — update provider on any records where ymove returned a real value
+        # S25: Self-healing — update provider on any records where ymove returned a real value.
+        # 'manual' EXCLUDED from allowed providers — ymove returns "manual" for users that have been
+        # manually edited in their admin tool, but those users still pay via Apple/Google/Stripe.
+        # Treating 'manual' as a provider value caused 9 records to be mislabeled this session.
+        # See S25 Phase B notes.
         provider_healed = 0
         if verify_providers:
             async with db_pool.acquire() as conn:
                 for email, prov in verify_providers.items():
                     r = our_active_lookup.get(email)
-                    if r and r["source"] != prov and prov in ("apple", "google", "stripe", "manual"):
+                    if r and r["source"] != prov and prov in ("apple", "google", "stripe"):
                         try:
                             await conn.execute(
                                 "UPDATE subscriptions SET source = $1, updated_at = NOW() WHERE id = $2",
