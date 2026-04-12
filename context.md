@@ -268,7 +268,15 @@ Note: The data-audit endpoint's `stripe_active` field (881) excludes trialing. T
 - Captures UTMs on landing, persists in 30-day cookies, rewrites all ymove.app links
 - Verified end-to-end working
 - **UTM tracking scope:** Stripe-only by design. Apple/Google subs go through app stores which strip UTMs. The business strategy is to push users toward Stripe via ymove web checkout, not app store signups.
-- **Open question for Ahmed:** are Klaviyo/Facebook campaign links pointing to movementandmiles.com (where the script runs) or directly to ymove.app (where it doesn't)?
+
+### Known UTM Tracking Constraints
+- **App Store / Google Play strip UTMs.** Any campaign link pointing directly to an app store will lose attribution at the platform layer. Only Stripe web checkout signups carry UTMs through to our system.
+- **Direct-to-ymove links bypass our capture script.** If a marketing link points to ymove.app/join/movementandmiles instead of movementandmiles.com first, the Squarespace script never runs. Whether ymove itself reads URL params into the user meta field is an open question for Tosh (asked in S24 wrap email).
+
+### Open Questions (asked in S24 wrap email, April 11)
+- **For Ahmed:** End-to-end test signup through each channel (Klaviyo, Facebook, email) to verify UTMs make it to Stripe checkout. Currently only Instagram bio link is verified end-to-end.
+- **For Ahmed:** Do any current campaigns link directly to ymove.app instead of movementandmiles.com first?
+- **For Tosh:** Does ymove read UTM params off its own checkout URL into the user meta field, or does meta only get populated from what our Squarespace script passes through via the API call?
 
 ---
 
@@ -297,10 +305,11 @@ This prevents the morning sync from re-creating duplicates that the cleanup just
 
 ## 10. PROPOSED NEXT STEPS
 
-### Immediate
-1. Investigate UTM tracking gaps with Ahmed: are Klaviyo/Facebook links pointing to movementandmiles.com or directly to ymove.app?
-2. Run UTM backfill on cancelled Stripe subs (`status_filter: "all"`) for historical churn-by-channel analysis when needed
-3. Fix data-audit `stripe_active` query to include trialing (one-line fix: `status IN ('active', 'trialing')`)
+### Immediate (Session 25)
+1. Follow up on responses from Tosh and Ahmed to S24 wrap email (see Section 8 open questions)
+2. If Ahmed identifies any direct-to-ymove campaign links, decide whether to reroute them through movementandmiles.com or ask Tosh to add URL-param capture on ymove's side
+3. Run UTM backfill on cancelled Stripe subs (`status_filter: "all"`) for historical churn-by-channel analysis when needed
+4. Fix data-audit `stripe_active` query to include trialing (one-line fix: `status IN ('active', 'trialing')`)
 
 ### Future Improvements
 - **Fix Gap 1:** Cancel handler should match by source before fallback to most-recent
