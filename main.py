@@ -7114,6 +7114,87 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Fix mislabeled manual->apple records ---
+
+@app.post("/api/admin/fix-manual-apple-labels")
+async def fix_manual_apple_labels(request: Request):
+    """S25: Targeted fix for the Bug 2 fallout from S24.
+    Records where source='manual' but stripe_subscription_id starts with 'ymove_new_apple_'
+    are misclassified — the ID prefix proves they're Apple. This relabels them.
+
+    Body: {"apply": false} for preview, {"apply": true} to commit.
+    Scope: source='manual' AND status IN ('active','trialing') AND sub_id LIKE 'ymove_new_apple_%'
+    Effect: source='manual' -> source='apple'. Nothing else changes.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply = bool(body.get("apply", False))
+
+    async with db_pool.acquire() as conn:
+        # Find candidates
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, created_at, import_batch
+            FROM subscriptions
+            WHERE source = 'manual'
+              AND status IN ('active', 'trialing')
+              AND stripe_subscription_id LIKE 'ymove_new_apple_%'
+            ORDER BY email
+        """)
+
+        candidates = [
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "current_source": r["source"],
+                "new_source": "apple",
+                "status": r["status"],
+                "sub_id": r["stripe_subscription_id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "import_batch": r["import_batch"],
+            }
+            for r in rows
+        ]
+
+        if not apply:
+            return {
+                "mode": "preview",
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+                "next_step": 'POST again with {"apply": true} to commit',
+            }
+
+        # Apply: tag with batch for reversibility
+        from datetime import datetime as _dt
+        batch_tag = f"s25_relabel_manual_to_apple_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        updated_ids = []
+        for c in candidates:
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET source = 'apple',
+                       import_batch = COALESCE(import_batch, '') || ' ' || $1
+                   WHERE id = $2 AND source = 'manual'
+                     AND stripe_subscription_id LIKE 'ymove_new_apple_%'""",
+                batch_tag, c["id"]
+            )
+            updated_ids.append(c["id"])
+
+        return {
+            "mode": "applied",
+            "batch_tag": batch_tag,
+            "updated_count": len(updated_ids),
+            "updated_ids": updated_ids,
+            "candidates": candidates,
+        }
+
+
 # --- Session 23: Deep Reconciliation Audit ---
 
 @app.get("/api/admin/reconciliation-audit")
