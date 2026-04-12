@@ -6881,6 +6881,239 @@ async def data_audit(request: Request):
     return audit
 
 
+# --- Session 25: Per-Email Diff vs ymove (READ-ONLY) ---
+
+@app.post("/api/admin/ymove-diff")
+async def ymove_diff(request: Request):
+    """S25: Read-only diff between our active+trialing subs and ymove's subscribed list.
+    No writes, no corrections. Pulls ymove fresh each call.
+    Returns 4 buckets + a preflight section to test the 'cancelled coming back' theory."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not YMOVE_API_KEY:
+        return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    CAP = 100  # max records per bucket in response
+
+    # ---------- PRE-FLIGHT: test the "cancelled coming back" theory ----------
+    preflight = {}
+    async with db_pool.acquire() as conn:
+        # Check 1: Stripe-source records by ID prefix. Real Stripe webhooks ALWAYS start with sub_.
+        # Anything else under source='stripe' is a reconciliation artifact and a prime suspect.
+        rows = await conn.fetch("""
+            SELECT
+              CASE
+                WHEN stripe_subscription_id LIKE 'sub_%' THEN 'sub_ (real Stripe webhook)'
+                WHEN stripe_subscription_id LIKE 'ymove_new_stripe_%' THEN 'ymove_new_stripe_ (synthetic)'
+                WHEN stripe_subscription_id LIKE 'ymove_switch_stripe_%' THEN 'ymove_switch_stripe_ (synthetic)'
+                WHEN stripe_subscription_id LIKE 'import_%' THEN 'import_ (Meg spreadsheet)'
+                WHEN stripe_subscription_id LIKE 'meg_%' THEN 'meg_ (Meg spreadsheet)'
+                ELSE 'OTHER: ' || COALESCE(LEFT(stripe_subscription_id, 20), 'NULL')
+              END AS prefix_bucket,
+              COUNT(*) AS n
+            FROM subscriptions
+            WHERE source = 'stripe' AND status IN ('active', 'trialing')
+            GROUP BY 1
+            ORDER BY n DESC
+        """)
+        preflight["stripe_id_prefix_breakdown"] = [{"prefix": r["prefix_bucket"], "count": r["n"]} for r in rows]
+
+        # Check 2: Active records whose email also has a cancelled S23/S24/S25 cleanup-batch record.
+        # This is the "removed but came back" pattern.
+        rows = await conn.fetch("""
+            SELECT
+              s_active.email,
+              s_active.source AS active_source,
+              s_active.stripe_subscription_id AS active_sub_id,
+              s_active.created_at AS active_created_at,
+              s_cancelled.import_batch AS cancelled_batch,
+              s_cancelled.stripe_subscription_id AS cancelled_sub_id
+            FROM subscriptions s_active
+            JOIN subscriptions s_cancelled ON LOWER(s_cancelled.email) = LOWER(s_active.email)
+            WHERE s_active.status IN ('active', 'trialing')
+              AND s_cancelled.status = 'canceled'
+              AND (
+                s_cancelled.import_batch LIKE 's23_%' OR
+                s_cancelled.import_batch LIKE 's24_%' OR
+                s_cancelled.import_batch LIKE 's25_%'
+              )
+              AND s_active.id != s_cancelled.id
+            ORDER BY s_active.email
+            LIMIT 200
+        """)
+        preflight["active_with_cancelled_cleanup_sibling"] = {
+            "count": len(rows),
+            "records": [
+                {
+                    "email": r["email"],
+                    "active_source": r["active_source"],
+                    "active_sub_id": r["active_sub_id"],
+                    "active_created_at": r["active_created_at"].isoformat() if r["active_created_at"] else None,
+                    "cancelled_batch": r["cancelled_batch"],
+                    "cancelled_sub_id": r["cancelled_sub_id"],
+                }
+                for r in rows[:CAP]
+            ],
+            "truncated": len(rows) > CAP,
+        }
+
+    # ---------- PHASE 1: Pull ymove fresh ----------
+    ymove_emails = {}  # email -> provider
+    pull_status = "starting"
+    pages_pulled = 0
+    try:
+        page = 1
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"status": "subscribed", "page": str(page)}
+                    )
+                except httpx.TimeoutException:
+                    pull_status = f"timeout_page_{page}"
+                    break
+
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("retry-after", "5"))
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                if resp.status_code != 200:
+                    pull_status = f"error_page_{page}_http_{resp.status_code}"
+                    break
+
+                data = resp.json()
+                users = data.get("users", [])
+                for u in users:
+                    em = (u.get("email") or "").strip().lower()
+                    if em:
+                        provider = (u.get("subscriptionProvider") or "undetermined").lower()
+                        if provider not in ("apple", "google", "stripe", "manual", "undetermined"):
+                            provider = "undetermined"
+                        ymove_emails[em] = provider
+
+                total_pages = data.get("totalPages", 1)
+                pages_pulled = page
+                if page >= total_pages:
+                    pull_status = "success"
+                    break
+                page += 1
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        pull_status = f"error: {str(e)[:200]}"
+
+    if pull_status != "success":
+        return JSONResponse(status_code=502, content={
+            "error": "ymove pull failed",
+            "pull_status": pull_status,
+            "pages_pulled": pages_pulled,
+            "preflight": preflight,
+        })
+
+    # ---------- PHASE 2: Pull our active+trialing ----------
+    our_subs = {}  # email -> dict
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT email, source, status, stripe_subscription_id, created_at, import_batch
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+              AND email IS NOT NULL AND email != ''
+        """)
+        for r in rows:
+            em = r["email"].strip().lower()
+            our_subs[em] = {
+                "source": r["source"],
+                "status": r["status"],
+                "sub_id": r["stripe_subscription_id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "import_batch": r["import_batch"],
+            }
+
+    # ---------- PHASE 3: Compute the 4 diff buckets ----------
+    only_in_ours = []      # active in ours, not in ymove subscribed
+    only_in_ymove = []     # in ymove subscribed, not active in ours
+    provider_mismatch = [] # in both, source != provider (excluding stripe<->stripe)
+    in_both_aligned = 0    # for sanity-check counting
+
+    our_emails_set = set(our_subs.keys())
+    ymove_emails_set = set(ymove_emails.keys())
+
+    for em in our_emails_set - ymove_emails_set:
+        rec = our_subs[em]
+        only_in_ours.append({
+            "email": em,
+            "our_source": rec["source"],
+            "our_status": rec["status"],
+            "our_sub_id": rec["sub_id"],
+            "created_at": rec["created_at"],
+            "import_batch": rec["import_batch"],
+        })
+
+    for em in ymove_emails_set - our_emails_set:
+        only_in_ymove.append({
+            "email": em,
+            "ymove_provider": ymove_emails[em],
+        })
+
+    for em in our_emails_set & ymove_emails_set:
+        rec = our_subs[em]
+        ymove_provider = ymove_emails[em]
+        our_source = rec["source"]
+        # ymove "undetermined" means their API returned null for this user — not a real mismatch
+        if ymove_provider == "undetermined":
+            in_both_aligned += 1
+            continue
+        if our_source == ymove_provider:
+            in_both_aligned += 1
+        else:
+            provider_mismatch.append({
+                "email": em,
+                "our_source": our_source,
+                "ymove_provider": ymove_provider,
+                "our_sub_id": rec["sub_id"],
+                "our_status": rec["status"],
+                "created_at": rec["created_at"],
+            })
+
+    # Sort for stable output
+    only_in_ours.sort(key=lambda x: (x["our_source"] or "", x["email"]))
+    only_in_ymove.sort(key=lambda x: (x["ymove_provider"], x["email"]))
+    provider_mismatch.sort(key=lambda x: (x["our_source"] or "", x["ymove_provider"], x["email"]))
+
+    return {
+        "preflight": preflight,
+        "summary": {
+            "our_active_trialing_total": len(our_subs),
+            "ymove_subscribed_total": len(ymove_emails),
+            "in_both_aligned": in_both_aligned,
+            "only_in_ours_count": len(only_in_ours),
+            "only_in_ymove_count": len(only_in_ymove),
+            "provider_mismatch_count": len(provider_mismatch),
+            "ymove_pages_pulled": pages_pulled,
+        },
+        "only_in_ours": {
+            "count": len(only_in_ours),
+            "records": only_in_ours[:CAP],
+            "truncated": len(only_in_ours) > CAP,
+        },
+        "only_in_ymove": {
+            "count": len(only_in_ymove),
+            "records": only_in_ymove[:CAP],
+            "truncated": len(only_in_ymove) > CAP,
+        },
+        "provider_mismatch": {
+            "count": len(provider_mismatch),
+            "records": provider_mismatch[:CAP],
+            "truncated": len(provider_mismatch) > CAP,
+        },
+    }
+
+
 # --- Session 23: Deep Reconciliation Audit ---
 
 @app.get("/api/admin/reconciliation-audit")

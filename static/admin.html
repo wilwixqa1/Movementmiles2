@@ -750,6 +750,13 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#e65100">ymove Diff (S25)</h3>
+          <p>Read-only per-email diff vs ymove. No corrections. Shows only_in_ours, only_in_ymove, provider mismatches, plus a preflight checking for the "cancelled records coming back" pattern. Takes ~30s.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-ymove-diff" onclick="doYmoveDiff()">Run ymove Diff</button>
+          <div class="tool-result" id="res-ymove-diff" style="max-height:600px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2110,6 +2117,54 @@ function doDeleteDuplicate(id, email) {
       alert("Error: " + JSON.stringify(d));
     }
   }).catch(function(e) { alert("Error: " + e.message); });
+}
+
+function doYmoveDiff() {
+  var btn = document.getElementById("btn-ymove-diff");
+  var res = document.getElementById("res-ymove-diff");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Pulling ymove + computing diff (~30-45s)...";
+  fetch("/api/admin/ymove-diff", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: "{}"
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btn.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    // Summary
+    var s = d.summary || {};
+    html += '<h4 style="margin:0 0 6px">Summary</h4>';
+    html += '<div style="font-size:.82rem;margin-bottom:10px">';
+    html += 'Ours (active+trialing): <b>' + s.our_active_trialing_total + '</b><br>';
+    html += 'ymove (subscribed): <b>' + s.ymove_subscribed_total + '</b><br>';
+    html += 'In both, aligned: <b>' + s.in_both_aligned + '</b><br>';
+    html += 'Only in ours: <b style="color:#c62828">' + s.only_in_ours_count + '</b><br>';
+    html += 'Only in ymove: <b style="color:#c62828">' + s.only_in_ymove_count + '</b><br>';
+    html += 'Provider mismatch: <b style="color:#e65100">' + s.provider_mismatch_count + '</b><br>';
+    html += 'ymove pages pulled: ' + s.ymove_pages_pulled;
+    html += '</div>';
+    // Preflight (the cancelled-coming-back theory test)
+    html += '<h4 style="margin:10px 0 4px">Preflight: Stripe ID prefix breakdown</h4>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto">' + JSON.stringify(d.preflight.stripe_id_prefix_breakdown, null, 2) + '</pre>';
+    html += '<h4 style="margin:10px 0 4px">Preflight: Active records with cancelled cleanup-batch sibling (' + d.preflight.active_with_cancelled_cleanup_sibling.count + ')</h4>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:300px">' + JSON.stringify(d.preflight.active_with_cancelled_cleanup_sibling.records, null, 2) + '</pre>';
+    // Three diff buckets
+    ["only_in_ours", "only_in_ymove", "provider_mismatch"].forEach(function(k) {
+      var b = d[k];
+      html += '<h4 style="margin:10px 0 4px">' + k + ' (' + b.count + (b.truncated ? ', TRUNCATED to 100' : '') + ')</h4>';
+      html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:400px">' + JSON.stringify(b.records, null, 2) + '</pre>';
+    });
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
 }
 
 function doProviderCleanup(preview) {
