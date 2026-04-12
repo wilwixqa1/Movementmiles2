@@ -7118,6 +7118,132 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Investigate 2 new only_in_ymove + false-cancelled Stripe scan ---
+
+S25_NEW_YMOVE_EMAILS = [
+    "isabella.marovich-tadic@menzies.edu.au",
+    "jessica.mullen@yahoo.com",
+]
+
+@app.post("/api/admin/investigate-stripe-gaps-s25")
+async def investigate_stripe_gaps_s25(request: Request):
+    """S25: Two-part read-only diagnostic.
+    Part 1: For the 2 specific only_in_ymove emails, dump all DB records (any status).
+    Part 2: Find cancelled Stripe records where ymove still considers the user subscribed.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not YMOVE_API_KEY or not db_pool:
+        return JSONResponse(status_code=500, content={"error": "Missing config"})
+
+    # Part 1: dump all records for the 2 specific emails
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, plan_amount,
+                   created_at, canceled_at, import_batch
+            FROM subscriptions
+            WHERE LOWER(email) = ANY($1::text[])
+            ORDER BY email, created_at DESC
+        """, [e.lower() for e in S25_NEW_YMOVE_EMAILS])
+    part1 = [
+        {
+            "id": r["id"], "email": r["email"], "source": r["source"], "status": r["status"],
+            "sub_id": r["stripe_subscription_id"], "plan_amount": r["plan_amount"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "canceled_at": r["canceled_at"].isoformat() if r["canceled_at"] else None,
+            "import_batch": r["import_batch"],
+        } for r in rows
+    ]
+
+    # Part 2: pull ymove subscribed list, then find cancelled Stripe records that ymove says are active
+    ymove_emails = set()
+    pull_status = "starting"
+    pages_pulled = 0
+    try:
+        page = 1
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"status": "subscribed", "page": str(page)}
+                    )
+                except httpx.TimeoutException:
+                    pull_status = f"timeout_page_{page}"; break
+                if resp.status_code == 429:
+                    await asyncio.sleep(float(resp.headers.get("retry-after", "5"))); continue
+                if resp.status_code != 200:
+                    pull_status = f"error_page_{page}_http_{resp.status_code}"; break
+                data = resp.json()
+                for u in data.get("users", []):
+                    em = (u.get("email") or "").strip().lower()
+                    if em:
+                        ymove_emails.add(em)
+                total_pages = data.get("totalPages", 1)
+                pages_pulled = page
+                if page >= total_pages:
+                    pull_status = "success"; break
+                page += 1
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        pull_status = f"error: {str(e)[:200]}"
+
+    if pull_status != "success":
+        return JSONResponse(status_code=502, content={
+            "error": "ymove pull failed", "pull_status": pull_status,
+            "pages_pulled": pages_pulled, "part1": part1,
+        })
+
+    # Get our cancelled Stripe records + active emails (to filter normal churn-and-rejoin)
+    async with db_pool.acquire() as conn:
+        cancelled_stripe = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, plan_amount,
+                   created_at, canceled_at, import_batch
+            FROM subscriptions
+            WHERE status = 'canceled' AND source = 'stripe'
+              AND email IS NOT NULL AND email != ''
+              AND stripe_subscription_id LIKE 'sub_%'
+            ORDER BY email, canceled_at DESC NULLS LAST
+        """)
+        active_emails_rows = await conn.fetch("""
+            SELECT LOWER(email) AS email FROM subscriptions
+            WHERE status IN ('active', 'trialing') AND email IS NOT NULL AND email != ''
+        """)
+    our_active_emails = {r["email"] for r in active_emails_rows}
+
+    false_cancel_stripe = []
+    seen = set()
+    for r in cancelled_stripe:
+        em = r["email"].strip().lower()
+        if em in seen: continue
+        if em not in ymove_emails: continue
+        if em in our_active_emails: continue
+        seen.add(em)
+        false_cancel_stripe.append({
+            "id": r["id"], "email": r["email"], "sub_id": r["stripe_subscription_id"],
+            "plan_amount": r["plan_amount"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "canceled_at": r["canceled_at"].isoformat() if r["canceled_at"] else None,
+            "import_batch": r["import_batch"],
+        })
+
+    return {
+        "part1_specific_emails": {
+            "queried": S25_NEW_YMOVE_EMAILS,
+            "found_records": part1,
+            "found_count": len(part1),
+        },
+        "part2_false_cancelled_stripe": {
+            "count": len(false_cancel_stripe),
+            "records": false_cancel_stripe[:100],
+            "truncated": len(false_cancel_stripe) > 100,
+        },
+        "ymove_subscribed_total": len(ymove_emails),
+        "our_cancelled_stripe_total": len(cancelled_stripe),
+    }
+
+
 # --- Session 25: Verify 8 historical Stripe records against live Stripe API ---
 
 S25_HISTORICAL_STRIPE_EMAILS = [
