@@ -7114,6 +7114,86 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Verify 8 historical Stripe records against live Stripe API ---
+
+S25_HISTORICAL_STRIPE_EMAILS = [
+    "abbey.e.baier@gmail.com",
+    "ahfouch@gmail.com",
+    "alessandraclelia.volpato@gmail.com",
+    "amets30@yahoo.com",
+    "andreedesrochers@gmail.com",
+    "cassyroop@gmail.com",
+    "chloe.levray@gmail.com",
+    "hstrandness@gmail.com",
+]
+
+@app.post("/api/admin/verify-historical-stripe-s25")
+async def verify_historical_stripe_s25(request: Request):
+    """S25 Step 5: Read-only. Hits Stripe API for each of the 8 historical Stripe records
+    that ymove has no record of. Returns Stripe's authoritative status per record.
+    No writes."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, plan_amount,
+                   created_at, current_period_end
+            FROM subscriptions
+            WHERE LOWER(email) = ANY($1::text[])
+              AND status IN ('active', 'trialing')
+              AND source = 'stripe'
+            ORDER BY email
+        """, [e.lower() for e in S25_HISTORICAL_STRIPE_EMAILS])
+
+    results = []
+    for r in rows:
+        sub_id = r["stripe_subscription_id"]
+        record = {
+            "id": r["id"],
+            "email": r["email"],
+            "our_status": r["status"],
+            "our_sub_id": sub_id,
+            "plan_amount": r["plan_amount"],
+            "our_created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "our_current_period_end": r["current_period_end"].isoformat() if r["current_period_end"] else None,
+        }
+        if not sub_id or not sub_id.startswith("sub_"):
+            record["stripe_check"] = "skipped_not_sub_prefix"
+            results.append(record)
+            continue
+        try:
+            real_sub = stripe.Subscription.retrieve(sub_id)
+            record["stripe_status"] = real_sub.status
+            record["stripe_current_period_end"] = real_sub.current_period_end
+            record["stripe_cancel_at_period_end"] = real_sub.cancel_at_period_end
+            record["stripe_canceled_at"] = real_sub.canceled_at
+            record["agreement"] = "MATCH" if real_sub.status == r["status"] else "MISMATCH"
+        except stripe.error.InvalidRequestError as e:
+            record["stripe_check"] = "not_found_in_stripe"
+            record["stripe_error"] = str(e)[:200]
+        except Exception as e:
+            record["stripe_check"] = "error"
+            record["stripe_error"] = str(e)[:200]
+        results.append(record)
+
+    summary = {
+        "checked": len(results),
+        "expected": len(S25_HISTORICAL_STRIPE_EMAILS),
+        "by_stripe_status": {},
+        "by_agreement": {},
+    }
+    for r in results:
+        s = r.get("stripe_status", r.get("stripe_check", "unknown"))
+        summary["by_stripe_status"][s] = summary["by_stripe_status"].get(s, 0) + 1
+        a = r.get("agreement", "n/a")
+        summary["by_agreement"][a] = summary["by_agreement"].get(a, 0) + 1
+
+    return {"summary": summary, "results": results}
+
+
 # --- Session 25: Reactivate kelsey (id=11315) ---
 
 @app.post("/api/admin/reactivate-kelsey-s25")

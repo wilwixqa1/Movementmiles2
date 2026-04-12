@@ -796,6 +796,13 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#e65100">Verify historical Stripe (S25)</h3>
+          <p>Read-only. Hits Stripe API for the 8 historical Stripe records that ymove has no record of. Returns Stripe's authoritative status per record. ~30s.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-verify-hist" onclick="doVerifyHistoricalStripe()">Run Verify</button>
+          <div class="tool-result" id="res-verify-hist" style="max-height:600px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2241,6 +2248,35 @@ function doFixLabels(apply) {
   }).catch(function(e) {
     btnPrev.disabled = false;
     btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doVerifyHistoricalStripe() {
+  var btn = document.getElementById("btn-verify-hist");
+  var res = document.getElementById("res-verify-hist");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Calling Stripe API for 8 records (~30s)...";
+  fetch("/api/admin/verify-historical-stripe-s25", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: "{}"
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btn.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    html += '<h4 style="margin:0 0 6px">Checked ' + d.summary.checked + ' / ' + d.summary.expected + ' records</h4>';
+    html += '<div style="font-size:.82rem;margin-bottom:6px">By Stripe status: ' + JSON.stringify(d.summary.by_stripe_status) + '</div>';
+    html += '<div style="font-size:.82rem;margin-bottom:6px">By agreement: ' + JSON.stringify(d.summary.by_agreement) + '</div>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:500px">' + JSON.stringify(d.results, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false;
     res.className = "tool-result err";
     res.textContent = "Error: " + e.message;
   });
