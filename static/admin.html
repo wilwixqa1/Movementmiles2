@@ -765,6 +765,14 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#c62828">Fix manual->import labels (S25)</h3>
+          <p>Second pass: records where source='manual' but sub_id starts with 'import_apple_', 'meg_apple_', 'import_google_', or 'meg_google_'. Catches Jaclyn and any siblings.</p>
+          <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-fix-import-preview" onclick="doFixImportLabels(false)">Preview</button>
+          <button class="tool-btn" style="background:#c62828;color:#fff;margin-top:6px;display:none" id="btn-fix-import-apply" onclick="doFixImportLabels(true)">Apply</button>
+          <div class="tool-result" id="res-fix-import" style="max-height:500px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2200,6 +2208,45 @@ function doFixLabels(apply) {
       if (d.candidate_count > 0) {
         btnApply.style.display = "inline-block";
       }
+    } else {
+      html += '<h4 style="margin:0 0 6px;color:#2d6a2d">Applied: ' + d.updated_count + ' record(s) updated</h4>';
+      html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">Batch: ' + d.batch_tag + '</div>';
+      btnApply.style.display = "none";
+    }
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:400px">' + JSON.stringify(d.candidates, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doFixImportLabels(apply) {
+  var btnPrev = document.getElementById("btn-fix-import-preview");
+  var btnApply = document.getElementById("btn-fix-import-apply");
+  var res = document.getElementById("res-fix-import");
+  btnPrev.disabled = true;
+  btnApply.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = apply ? "Applying..." : "Loading preview...";
+  fetch("/api/admin/fix-manual-import-labels", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({apply: apply})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    if (d.mode === "preview") {
+      html += '<h4 style="margin:0 0 6px">Preview: ' + d.candidate_count + ' record(s)</h4>';
+      html += '<div style="font-size:.82rem;margin-bottom:6px">By target: ' + JSON.stringify(d.by_new_source) + '</div>';
+      if (d.candidate_count > 0) btnApply.style.display = "inline-block";
     } else {
       html += '<h4 style="margin:0 0 6px;color:#2d6a2d">Applied: ' + d.updated_count + ' record(s) updated</h4>';
       html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">Batch: ' + d.batch_tag + '</div>';

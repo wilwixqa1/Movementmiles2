@@ -7114,6 +7114,99 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Fix mislabeled manual->apple/google records (broad pass) ---
+
+@app.post("/api/admin/fix-manual-import-labels")
+async def fix_manual_import_labels(request: Request):
+    """S25 Step 2: Targeted fix for manual-labeled records whose ID prefix proves
+    they came from Meg's Apple/Google imports. Sub_id prefix determines new source.
+
+    Body: {"apply": false} for preview, {"apply": true} to commit.
+    Scope: source='manual' AND status IN ('active','trialing')
+           AND sub_id LIKE 'import_apple_%' OR 'meg_apple_%' OR 'import_google_%' OR 'meg_google_%'
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply = bool(body.get("apply", False))
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, created_at, import_batch
+            FROM subscriptions
+            WHERE source = 'manual'
+              AND status IN ('active', 'trialing')
+              AND (
+                stripe_subscription_id LIKE 'import_apple_%' OR
+                stripe_subscription_id LIKE 'meg_apple_%' OR
+                stripe_subscription_id LIKE 'import_google_%' OR
+                stripe_subscription_id LIKE 'meg_google_%'
+              )
+            ORDER BY email
+        """)
+
+        candidates = []
+        for r in rows:
+            sub_id = r["stripe_subscription_id"] or ""
+            if "apple" in sub_id:
+                new_source = "apple"
+            elif "google" in sub_id:
+                new_source = "google"
+            else:
+                new_source = "?"  # shouldn't hit, but defensive
+            candidates.append({
+                "id": r["id"],
+                "email": r["email"],
+                "current_source": r["source"],
+                "new_source": new_source,
+                "status": r["status"],
+                "sub_id": sub_id,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "import_batch": r["import_batch"],
+            })
+
+        if not apply:
+            by_target = {}
+            for c in candidates:
+                by_target[c["new_source"]] = by_target.get(c["new_source"], 0) + 1
+            return {
+                "mode": "preview",
+                "candidate_count": len(candidates),
+                "by_new_source": by_target,
+                "candidates": candidates,
+                "next_step": 'POST again with {"apply": true} to commit',
+            }
+
+        from datetime import datetime as _dt
+        batch_tag = f"s25_relabel_manual_to_import_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        updated = 0
+        for c in candidates:
+            if c["new_source"] not in ("apple", "google"):
+                continue
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET source = $1,
+                       import_batch = COALESCE(import_batch, '') || ' ' || $2
+                   WHERE id = $3 AND source = 'manual'""",
+                c["new_source"], batch_tag, c["id"]
+            )
+            updated += 1
+
+        return {
+            "mode": "applied",
+            "batch_tag": batch_tag,
+            "updated_count": updated,
+            "candidates": candidates,
+        }
+
+
 # --- Session 25: Fix mislabeled manual->apple records ---
 
 @app.post("/api/admin/fix-manual-apple-labels")
