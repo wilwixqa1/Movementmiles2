@@ -3931,10 +3931,14 @@ async def backfill_utms(request: Request):
     Scope: Stripe-only. Apple/Google subs go through app stores which strip UTMs,
     so they are not relevant for ad attribution.
 
-    Body: {preview: true|false, limit: int (optional)}
+    Body: {preview: true|false, limit: int (optional), status_filter: "active"|"all"}
       preview=true (default): count + sample, no writes
       preview=false: actually call ymove and write UTMs
       limit: cap rows processed (useful for staged runs)
+      status_filter:
+        "active" (default): only active+trialing Stripe subs (~1k records, ~4 min)
+        "all": every Stripe sub including cancelled (~6k records, ~25 min)
+               useful for future historical analysis of churn by channel
 
     Idempotent: WHERE filter excludes rows that already have utm_source set,
     and _store_utm_on_subscription uses COALESCE so it cannot blank existing data.
@@ -3952,17 +3956,24 @@ async def backfill_utms(request: Request):
         body = {}
     preview = body.get("preview", True)
     limit = body.get("limit")
+    status_filter = body.get("status_filter", "active")
+    if status_filter not in ("active", "all"):
+        return JSONResponse(status_code=400, content={
+            "error": "status_filter must be 'active' or 'all'"
+        })
     batch_id = f"s24_utm_backfill_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
     async with db_pool.acquire() as conn:
         # Stripe subs only, no UTMs yet, must have email to look up
-        query = """
-            SELECT id, stripe_subscription_id, email, created_at
+        status_clause = "AND status IN ('active', 'trialing')" if status_filter == "active" else ""
+        query = f"""
+            SELECT id, stripe_subscription_id, email, status, created_at
             FROM subscriptions
             WHERE stripe_subscription_id LIKE 'sub_%'
               AND email IS NOT NULL
               AND email != ''
               AND (utm_source IS NULL OR utm_source = '')
+              {status_clause}
             ORDER BY created_at DESC
         """
         if limit and isinstance(limit, int) and limit > 0:
@@ -3977,11 +3988,13 @@ async def backfill_utms(request: Request):
                 "batch_id": batch_id,
                 "candidates": candidate_count,
                 "limit_applied": limit,
+                "status_filter": status_filter,
                 "sample": [
                     {
                         "id": r["id"],
                         "stripe_subscription_id": r["stripe_subscription_id"],
                         "email": r["email"],
+                        "status": r["status"],
                         "created_at": str(r["created_at"]),
                     }
                     for r in rows[:5]
