@@ -773,6 +773,14 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#c62828">Cancel test/junk Stripe (S25)</h3>
+          <p>Soft-cancel 5 specific test/junk Stripe records identified in the ymove diff. Hardcoded allowlist. Reversible via batch tag.</p>
+          <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cancel-test-preview" onclick="doCancelTestStripe(false)">Preview</button>
+          <button class="tool-btn" style="background:#c62828;color:#fff;margin-top:6px;display:none" id="btn-cancel-test-apply" onclick="doCancelTestStripe(true)">Apply</button>
+          <div class="tool-result" id="res-cancel-test" style="max-height:500px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2211,6 +2219,46 @@ function doFixLabels(apply) {
     } else {
       html += '<h4 style="margin:0 0 6px;color:#2d6a2d">Applied: ' + d.updated_count + ' record(s) updated</h4>';
       html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">Batch: ' + d.batch_tag + '</div>';
+      btnApply.style.display = "none";
+    }
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:400px">' + JSON.stringify(d.candidates, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doCancelTestStripe(apply) {
+  var btnPrev = document.getElementById("btn-cancel-test-preview");
+  var btnApply = document.getElementById("btn-cancel-test-apply");
+  var res = document.getElementById("res-cancel-test");
+  btnPrev.disabled = true;
+  btnApply.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = apply ? "Cancelling..." : "Loading preview...";
+  fetch("/api/admin/cancel-test-stripe-s25", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({apply: apply})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    if (d.mode === "preview") {
+      html += '<h4 style="margin:0 0 6px">Preview: ' + d.candidate_count + ' / ' + d.expected_count + ' record(s) found</h4>';
+      html += '<div style="font-size:.82rem;margin-bottom:6px">MRR to remove: $' + d.mrr_to_remove + '/mo</div>';
+      if (d.candidate_count > 0) btnApply.style.display = "inline-block";
+    } else {
+      html += '<h4 style="margin:0 0 6px;color:#2d6a2d">Cancelled: ' + d.cancelled_count + ' record(s)</h4>';
+      html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">Batch: ' + d.batch_tag + '</div>';
+      html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">MRR removed: $' + d.mrr_removed + '/mo</div>';
       btnApply.style.display = "none";
     }
     html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:400px">' + JSON.stringify(d.candidates, null, 2) + '</pre>';

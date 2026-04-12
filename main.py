@@ -7114,6 +7114,96 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Cancel test/junk Stripe records ---
+
+S25_TEST_CANCEL_EMAILS = [
+    "sfdasafsaffas@ymove.app",
+    "sfdfdssfdfsdfsdasfad@ymove.app",
+    "utm_sourceemail@ymove.app",
+    "markus.zwigart@gmx.dr",
+    "tosh.koevoets@gmail.com",
+]
+
+@app.post("/api/admin/cancel-test-stripe-s25")
+async def cancel_test_stripe_s25(request: Request):
+    """S25 Step 3: Soft-cancel 5 specific test/junk Stripe records identified in the ymove diff.
+    Hardcoded allowlist — endpoint cannot cancel anything else.
+    Body: {"apply": false} for preview, {"apply": true} to commit.
+    Reversible via batch tag.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply = bool(body.get("apply", False))
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, plan_amount, created_at
+            FROM subscriptions
+            WHERE LOWER(email) = ANY($1::text[])
+              AND status IN ('active', 'trialing')
+              AND source = 'stripe'
+            ORDER BY email
+        """, [e.lower() for e in S25_TEST_CANCEL_EMAILS])
+
+        candidates = [
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "source": r["source"],
+                "status": r["status"],
+                "sub_id": r["stripe_subscription_id"],
+                "plan_amount": float(r["plan_amount"]) if r["plan_amount"] is not None else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+
+        total_mrr_removed = sum(c["plan_amount"] or 0 for c in candidates if c["status"] == "active")
+
+        if not apply:
+            return {
+                "mode": "preview",
+                "candidate_count": len(candidates),
+                "expected_count": len(S25_TEST_CANCEL_EMAILS),
+                "mrr_to_remove": round(total_mrr_removed, 2),
+                "candidates": candidates,
+                "next_step": 'POST again with {"apply": true} to commit',
+            }
+
+        from datetime import datetime as _dt
+        batch_tag = f"s25_test_cancel_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        cancelled_ids = []
+        for c in candidates:
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET status = 'canceled',
+                       canceled_at = NOW(),
+                       updated_at = NOW(),
+                       import_batch = COALESCE(import_batch, '') || ' ' || $1
+                   WHERE id = $2 AND status IN ('active', 'trialing')""",
+                batch_tag, c["id"]
+            )
+            cancelled_ids.append(c["id"])
+
+        return {
+            "mode": "applied",
+            "batch_tag": batch_tag,
+            "cancelled_count": len(cancelled_ids),
+            "cancelled_ids": cancelled_ids,
+            "mrr_removed": round(total_mrr_removed, 2),
+            "candidates": candidates,
+            "reversal_hint": f"To revert: UPDATE subscriptions SET status = 'active', canceled_at = NULL WHERE import_batch LIKE '%{batch_tag}%'",
+        }
+
+
 # --- Session 25: Fix mislabeled manual->apple/google records (broad pass) ---
 
 @app.post("/api/admin/fix-manual-import-labels")
