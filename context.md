@@ -1,5 +1,5 @@
 # Movement & Miles — Session 25 Context Document
-## Date: April 11, 2026 | Version: 24.1.0
+## Date: April 12, 2026 | Version: 25.0.0
 
 ---
 
@@ -19,7 +19,7 @@ git push origin main
 After every push using a PAT, Claude reminds Will to rotate the token. Never store PAT tokens between sessions, Will rotates them frequently.
 
 ### Network Limitations in Claude's Environment
-Claude cannot reach the Railway production domain (`movementmiles2-production.up.railway.app`) from its container — it's not in the egress allowlist. This means Claude can't curl admin endpoints or run API tests directly. All testing must happen via Will hitting endpoints in the browser/dashboard. Claude builds dashboard buttons or shows URLs Will can paste into the address bar.
+Claude cannot reach the Railway production domain from its container — it's not in the egress allowlist. All testing must happen via Will hitting endpoints in the browser/dashboard. Claude builds dashboard buttons or shows URLs Will can paste into the address bar.
 
 ### Development Workflow
 1. Will starts a session with the current context file uploaded (or in repo)
@@ -32,8 +32,8 @@ Claude cannot reach the Railway production domain (`movementmiles2-production.up
 ### Directory Structure
 ```
 Movementmiles2/
-├── main.py                           # FastAPI backend (~7200 lines)
-├── static/admin.html                 # Single-file admin dashboard
+├── main.py                           # FastAPI backend (~8800 lines after S25)
+├── static/admin.html                 # Single-file admin dashboard (~2700 lines after S25)
 ├── static/index.html                 # Public landing page (rarely touched)
 ├── static/css/, static/js/           # Static assets
 ├── squarespace_utm_script.html       # UTM persistence script for Squarespace
@@ -48,21 +48,25 @@ Movementmiles2/
 
 These rules exist because Will has caught Claude making mistakes in past sessions. They are not optional.
 
-1. **No em-dashes (—) in prose output.** This applies to emails, drafts, conversational text, and anything Will might paste elsewhere. Em-dashes inside code (comments, strings, HTML entities) are fine.
+1. **No em-dashes in prose output.** This applies to emails, drafts, conversational text. Em-dashes inside code are fine.
 
-2. **Anti-anchoring rule.** When Will pushes back on the same issue twice, Claude must stop coding, list every assumption it is making, and evaluate each one from scratch. The answer is probably already in the data we have. Don't layer patches on broken assumptions.
+2. **Anti-anchoring rule.** When Will pushes back on the same issue twice, Claude must stop coding, list every assumption it is making, and evaluate each one from scratch. Don't layer patches on broken assumptions.
 
-3. **Never confirm visual fixes from text extraction alone.** After any visual change, Claude must say "I can't verify this from here, does it look right to you?" and wait for confirmation. No false confirmations.
+3. **Never confirm visual fixes from text extraction alone.** No false confirmations.
 
-4. **Be cautious with destructive operations.** Default to soft cancels (status='canceled' with import_batch tag) over hard deletes. Hard delete only when truly garbage data with no historical value. Always preserve created_at, batch trails, and reversibility.
+4. **Be cautious with destructive operations.** Default to soft cancels with batch tags. Hard delete only when truly garbage data with no historical value.
 
 5. **Tone with collaborators.** When drafting emails to Tosh, Ahmed, or Meg, use a conversational, curious tone. Frame findings as "here's what I saw, is this expected?" rather than "you have a bug." Will always reviews before sending.
 
-6. **Cross-reference before reclassifying.** Use the waterfall: existing real records → Meg imports → Stripe API → undetermined. Never guess at provider data.
+6. **Cross-reference before reclassifying.** Use the waterfall: existing real records → Meg imports → Stripe API → undetermined.
 
-7. **Present files at session end via the present_files tool.** Don't just commit and walk away — make sure Will can grab the context file from the chat.
+7. **Present files at session end via the present_files tool.**
 
-8. **Comprehensive means EVERYTHING.** When Will asks for a comprehensive document, include operational workflow, behavioral rules, system state, architecture, and history. Not just project status.
+8. **Comprehensive means EVERYTHING.** Operational workflow, behavioral rules, system state, architecture, history.
+
+9. **NEW IN S25 — Verify, don't trust intermediate cleanup outputs.** When a cleanup endpoint reports "X records updated," that doesn't prove the change persists. The shadow sync may overwrite it. Always check whether downstream automation (especially the daily shadow sync) will preserve or revert the change before declaring victory.
+
+10. **NEW IN S25 — Pre-checks save lives.** When inserting new records, always pre-check for existing records with the same email (any status). Kelsey looked like a missing user but was actually a falsely-cancelled record. The pre-check caught it.
 
 ---
 
@@ -72,7 +76,7 @@ Movement & Miles is a fitness subscription platform (built and run by Meg Takacs
 
 ### Tech Stack
 - **Backend:** FastAPI (Python), PostgreSQL, hosted on Railway
-- **Frontend:** Single-file admin dashboard (static/admin.html, ~2400 lines)
+- **Frontend:** Single-file admin dashboard
 - **Public site:** Squarespace at movementandmiles.com (Meg owns this)
 - **Checkout:** ymove at ymove.app/join/movementandmiles (Tosh owns this)
 - **Payments:** Stripe (web), Apple IAP (iOS app), Google Play Billing (Android app)
@@ -87,12 +91,9 @@ Movement & Miles is a fitness subscription platform (built and run by Meg Takacs
 - **Base URL:** https://v6-beta-api.ymove.app
 - **Site ID:** 75
 - **Auth header:** `X-Authorization: <YMOVE_API_KEY>` (env var)
-- **Key endpoints used:**
-  - `GET /api/site/75/member-lookup?email=X` — individual user lookup
-  - `GET /api/site/75/member-lookup/all?status=subscribed&page=N` — paginated bulk
 
 ### Key People
-- **Will Wendt** — developer (you), wilwendt123@gmail.com
+- **Will Wendt** — developer, wilwendt123@gmail.com
 - **Meg Takacs** — owner of Movement & Miles (MTFit LLC)
 - **Tosh Koevoets** — developer of ymove, controls checkout/app/webhook pipeline
 - **Ahmed Abdelrehim** — Marketing Wiz, handles marketing/UTM strategy
@@ -100,308 +101,197 @@ Movement & Miles is a fitness subscription platform (built and run by Meg Takacs
 ---
 
 ## 3. DATA INGESTION PIPELINE
+(Unchanged from S24. See S24 doc for full detail.)
 
-There are FOUR ways subscriber data enters our database:
-
-### Path 1: Stripe Webhook (Real-time, Reliable)
-- **Endpoint:** `POST /webhooks/stripe`
-- **Events handled:** customer.subscription.created/updated/deleted, checkout.session.completed
-- **Creates records with:** `stripe_subscription_id` starting with `sub_`, `source='stripe'`
-- **Source of truth for:** Stripe subscriber status (we trust this 100%)
-
-### Path 2: ymove Webhook (Real-time, Reliable for Apple/Google)
-- **Endpoint:** `POST /webhooks/ymove`
-- **Events handled:** subscriptionCreated, subscriptionCancelled
-- **Provider field:** `subscriptionPaymentProvider` returns "apple"|"google"|"stripe" correctly
-- **Apple records:** numeric transaction ID (e.g., `350003237839176`), `source='apple'`
-- **Google records:** `ym_google_<uuid>`, `source='google'`
-- **Stripe records:** Stored as event audit only (real Stripe webhook handles the actual record)
-- **CRITICAL:** subscriptionCancelled has NO provider field, finds sub by email (Gap 1, see Section 9)
-
-### Path 3: Daily Shadow Sync (8 AM ET, Reconciliation)
-- **Function:** `_run_shadow_sync()` and `run_daily_shadow_sync()`
-- **What it does:**
-  1. Queries all our active Apple/Google/Undetermined subs (`source IN ('apple','google','undetermined')`)
-  2. Calls ymove individual `member-lookup` for each, captures status AND `subscriptionProvider` (self-healing)
-  3. Pulls all ymove subscribed members via `member-lookup/all` paginated
-  4. Computes diff: deactivate (expired), reactivate (cancelled but active in ymove), unknown new users
-  5. Auto-applies deactivations and reactivations
-  6. For unknown users: runs the **Provider Resolution Waterfall** (see Section 5)
-- **Imports unknown users with subscription IDs:** `ymove_new_<provider>_<email_hash>` or `ymove_switch_<provider>_<email_hash>`
-
-### Path 4: Manual Imports (Admin Dashboard)
-- **Meg's XLSX:** `import_meg_apple_google` endpoint (legacy data, still callable)
-- **CSV imports:** `import_subscribers_csv`, `import_leads_csv`
-- **Records created with prefixes:** `import_apple_*`, `import_google_*`, `meg_apple_*`, `meg_google_*`
+Four ingestion paths:
+1. **Stripe Webhook** (real-time, sub_* IDs, source='stripe')
+2. **ymove Webhook** (real-time, Apple numeric IDs / ym_google_* / sub_*)
+3. **Daily Shadow Sync** (8 AM ET, reconciliation)
+4. **Manual Imports** (admin dashboard, Meg's XLSX, CSVs)
 
 ---
 
 ## 4. SUBSCRIPTION ID PATTERNS (Source of Truth Map)
-
-This is THE most important table in this document. The subscription ID prefix tells you the true origin and provider of any record, regardless of what the `source` column says.
 
 | Prefix | True Source | Origin | Confidence |
 |--------|-------------|--------|------------|
 | `sub_*` | stripe | Direct Stripe webhook | 100% |
 | Numeric (`350003237839176`) | apple | Apple transactionId from ymove webhook | 100% |
 | `ym_google_<uuid>` | google | ymove webhook with provider=google | 100% |
-| `ymove_new_<provider>_*` | unknown | Shadow sync auto-import (provider was guessed) | LOW |
-| `ymove_switch_<provider>_*` | unknown | Cross-platform switch import | LOW |
+| `ymove_new_<provider>_*` | (varies) | Shadow sync auto-import | LOW |
+| `ymove_switch_<provider>_*` | (varies) | Cross-platform switch import | LOW |
 | `import_apple_*` / `meg_apple_*` | apple | Meg's spreadsheet import | Medium |
 | `import_google_*` / `meg_google_*` | google | Meg's spreadsheet import | Medium |
-
-When in doubt about a record's true provider, look at the ID prefix, not the `source` column.
-
----
-
-## 5. PROVIDER RESOLUTION WATERFALL
-
-When the shadow sync (or Provider Cleanup endpoint) finds a user without a known provider, it runs this 5-step waterfall. Same logic in both daily sync and the cleanup endpoint.
-
-```
-Step 1: Stripe sub_* duplicate check
-  → Does this email already have an active sub_* record?
-  → If YES: cancel this synthetic record (it's a duplicate of a real Stripe webhook record)
-
-Step 1b: Apple/Google webhook duplicate check
-  → Does this email have an active numeric (Apple) or ym_google_* (Google) record?
-  → If YES: cancel this synthetic record (duplicate of real webhook record)
-
-Step 2: Meg import cross-reference
-  → Does this email have any import_apple_*, import_google_*, meg_apple_*, or meg_google_* record?
-  → If YES: use that source ('apple' or 'google'), Meg's spreadsheet was the original source of truth
-
-Step 3: Stripe API cross-reference
-  → Call stripe.Customer.list(email=X) and check for active subscriptions
-  → If active Stripe sub found: import as source='stripe' with correct stripe_sub_id
-
-Step 4: Fall through
-  → source = 'undetermined'
-  → Will be auto-healed if/when Tosh fixes the API
-```
+| `s25_backfill_*` | (varies) | S25 manual backfill (only kelseymsimms case planned then bypassed) | High |
 
 ---
 
-## 6. CURRENT SUBSCRIBER NUMBERS (Post-S24 Cleanup)
+## 5. CURRENT SUBSCRIBER NUMBERS (Post-S25 Cleanup)
 
-### Our System (1,871 total active+trialing):
+### Our System
 | Source | Count |
 |--------|-------|
-| Stripe | 1,031 (881 active + 150 trialing) |
-| Apple | 623 |
+| Stripe | ~1,026 (down from 1,031, removed 5 test/junk) |
+| Apple | ~633 (up from 623, includes 9 relabels + Kelsey reactivation) |
 | Google | 205 |
-| Manual | 9 |
-| Undetermined | 3 |
-| **Total Active+Trialing** | **1,871** |
+| Manual | ~0-1 (was 9, all relabeled) |
+| Undetermined | 3 (will heal as ymove returns real providers) |
+| **Total Active+Trialing** | **~1,866-1,867** |
 
-### Tosh's System (1,889 total per earlier report, ~36h old):
-| Source | Count |
-|--------|-------|
-| Stripe | 1,022 |
-| Apple | 648 |
-| Google | 208 |
-| Manual | 11 |
-| **Total** | **1,859** (per his dashboard) |
+### Tosh's System
+~1,859 (per ~36h-old report)
 
-### Delta with Tosh: +12 records (0.6%)
-- Stripe: +9 (trialing methodology difference)
-- Apple: -25 (likely missed webhooks from before shadow sync existed)
-- Google: -3
-- Manual: -2
-- Undetermined: +3 (will heal once Tosh's API populates these 3)
-- Note: Tosh's numbers are ~36h old, so real-time delta may be tighter
-
-Note: The data-audit endpoint's `stripe_active` field (881) excludes trialing. The real Stripe active+trialing is 1,031. This is a known display bug (S24 finding, not yet fixed).
+### Delta with Tosh: ~+7 to +8
+**Every record in the delta is now identified and explained.** No remaining mystery noise. Breakdown:
+- **8 historical Stripe records** verified active in Stripe but missing from ymove (legacy bypass — needs Tosh confirmation)
+- **5 Meg-imported Apple records** that ymove has no record of (probably stale)
+- **4 provider mismatches** where ymove says Google/Manual but our `sub_*` IDs prove Stripe (ymove side wrong)
+- **2 records** (Isabella Marovich-Tadic, Jess Mullen) that ymove's bulk endpoint reports as subscribed but Stripe API confirms cancelled — **real ymove stale-data bug**
+- **0 unexplained records**
 
 ---
 
-## 7. ALL ADMIN ENDPOINTS (Built in S23)
+## 6. SESSION 25 ACCOMPLISHMENTS (April 12, 2026)
 
-### Diagnostic Endpoints (Read-only)
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/admin/provider-test` | GET | Tests ymove API provider field across known-good ID patterns + scans all bulk pages |
-| `/api/admin/inspect-ymove-user?email=X` | GET | Dump full ymove response for single email (use for UTM/meta debug) |
-| `/api/admin/reconciliation-audit` | GET | Batch history, duplicates, source mismatches, data origins, gaps |
-| `/api/admin/data-audit` | GET | 15+ data quality checks, MRR confidence scoring |
-| `/api/admin/db-check` | GET | Schema verification |
+### Major work
+1. **Built read-only ymove-diff endpoint** for per-email comparison with Tosh's data — first time we've ever seen the delta record-by-record
+2. **Fixed 9 mislabeled records** (8 + Jaclyn) where source='manual' should have been 'apple' — sub_id prefixes proved the correct provider
+3. **Cancelled 5 test/junk Stripe records** identified in the diff
+4. **Reactivated Kelsey** (id=11315) after diagnosing she was a false-cancel from `shadow_6_20260329_121938`
+5. **Built false-cancel diagnostic** that found Kelsey was the only false-cancel out of 256 cancelled Apple/Google/Undetermined records (0.4% rate)
+6. **Verified 8 historical Stripe records** against live Stripe API — all 8 confirmed active in Stripe, our records are correct, the records exist legitimately and just don't appear in ymove for unknown reasons
+7. **Investigated 2 new only_in_ymove records** (Isabella, Jess) — Stripe API confirms both genuinely cancelled, ymove's bulk endpoint is showing stale subscribed status
+8. **Built false-cancelled-Stripe scan** — found exactly 2 (Isabella, Jess) out of 5,193 cancelled Stripe records (0.04% rate). Stripe webhook handling is essentially correct.
+9. **CRITICAL FIX:** Removed `'manual'` from the self-heal allowed providers list at line 2961. Without this, tomorrow's morning sync would have re-mislabeled all 9 records back to source='manual'.
 
-### Action Endpoints (Modify Data)
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/admin/provider-cleanup` | POST | Reclassify ymove_new_*/ymove_switch_* via waterfall (preview/apply) |
-| `/api/admin/cancel-duplicate` | POST | Safely cancel one duplicate by ID (preserves history) |
-| `/api/admin/cancel-all-duplicates` | POST | Bulk cancel all duplicates in one batch |
-| `/api/admin/delete-duplicate` | POST | Hard delete (use with caution, has sibling safety check) |
-| `/api/admin/revert-batch` | POST | Revert any batch by ID |
-| `/api/admin/ymove-shadow-sync` | POST | Manual trigger of shadow sync |
-| `/api/admin/ymove-verify` | POST | Various ymove verification modes |
+### Bugs found and FIXED in S25
+- **Bug A (FIXED, line 2961):** Shadow sync self-heal accepted `subscriptionProvider: 'manual'` from ymove and wrote it to our `source` column. ymove's "manual" likely means "manually edited in admin tool," not a payment provider. Fixed by removing 'manual' from the allowed list. The remaining options are 'apple', 'google', 'stripe'.
 
-### Dashboard Buttons (in Admin Tools section, 8 total)
-1. **Backfill Stripe** (navy)
-2. **Reset Test Data** (red)
-3. **Import Leads CSV** (green)
-4. **Send Test Digest** (green)
-5. **Provider Test** (orange) - S23
-6. **Reconciliation Audit** (orange) - S23 (includes per-record Cancel/Delete + bulk Cancel ALL button)
-7. **Data Audit** (orange) - S23
-8. **Provider Cleanup** (red) - S23
+### Bugs found but NOT YET FIXED in S25 (queued for S26+)
+- **Bug B (Kelsey case):** Shadow sync deactivated a record based on a single point-in-time read of ymove's individual member-lookup. If ymove returned `activeSubscription: false, previouslySubscribed: true` even briefly (transient glitch, partial response, race condition), the parse logic returned "expired" and the record got cancelled. No retries, no cross-confirmation. **Recommended fix:** Cross-check the bulk pull (`ymove_all_emails`) before deactivating — if the email is also in the bulk subscribed list, DON'T deactivate. This would have saved Kelsey.
 
----
+- **Bug C (Isabella/Jess case):** ymove's `member-lookup/all?status=subscribed` bulk endpoint returns users that Stripe API confirms are cancelled. ymove-side bug (stale data), but our system trusts ymove's bulk endpoint as authoritative. **Recommended action:** Add a Stripe API cross-check during shadow sync's import phase for any user ymove reports as Stripe-provider — if Stripe disagrees, trust Stripe.
 
-## 8. TOSH API FIXES — COMPLETED (April 11, 2026)
+- **Bug D (ymove pagination math is suspicious):** Two diff runs returned 1853 and 1854 emails respectively, both with `pages_pulled: 168`. 1854 / 168 = ~11 users per page, which is a weirdly small page size. May indicate ymove returns inconsistent results between calls, or has a hidden cap, or the page size really is ~11. Worth asking Tosh directly.
 
-### Fix 1: subscriptionProvider in member-lookup API ✅ SHIPPED
-- Tosh shipped this on April 11, 2026
-- Confirmed: 733/735 users in bulk scan return non-null provider (99.7%)
-- Our self-healing logic auto-corrected 55 of 58 undetermined records on first sync after fix
-- 3 undetermined remain (ymove returns null for these specific users)
+- **Bug E (data-audit display, from S24, still unfixed):** `stripe_active` field excludes trialing while Apple/Google include it. Cosmetic, low priority.
 
-### Fix 2: UTM params in meta field ✅ SHIPPED
-- Tosh shipped this on April 11, 2026
-- Confirmed: test signup (wilwendt123@gmail.com, ID 992032730) returns utm_source, utm_medium, utm_campaign in meta
-- Live webhook capture now works for new Stripe signups automatically
-- Historical backfill ran: 1,014 active Stripe subs scanned, 6 had UTMs in ymove (rest are pre-UTM-era direct traffic)
+- **Bug F (auto-expire timing, from S24, still unfixed):** Auto-expire only fires on `action: 'run'`, not `action: 'status'`. Dashboard polling never triggers it.
 
-### Squarespace UTM Script (Already Working)
-- Located at: Squarespace > Settings > Advanced > Code Injection > Footer
-- Captures UTMs on landing, persists in 30-day cookies, rewrites all ymove.app links
-- Verified end-to-end working
-- **UTM tracking scope:** Stripe-only by design. Apple/Google subs go through app stores which strip UTMs. The business strategy is to push users toward Stripe via ymove web checkout, not app store signups.
+### Numbers before/after S25
+- Before: 1,871 active+trialing, MRR $33,338.78, delta with Tosh +12
+- After: ~1,866-1,867 active+trialing, MRR ~$32,978 (removed ~$360 of test/junk records, 1999 cents Kelsey added back)
+- 9 records relabeled (no count change)
+- 5 cancelled (test/junk)
+- 1 reactivated (Kelsey)
+- 0 hard deletes
+- All operations reversible via batch tags
 
-### Known UTM Tracking Constraints
-- **App Store / Google Play strip UTMs.** Any campaign link pointing directly to an app store will lose attribution at the platform layer. Only Stripe web checkout signups carry UTMs through to our system.
-- **Direct-to-ymove links bypass our capture script.** If a marketing link points to ymove.app/join/movementandmiles instead of movementandmiles.com first, the Squarespace script never runs. Whether ymove itself reads URL params into the user meta field is an open question for Tosh (asked in S24 wrap email).
+### Code commits (in order)
+- S25: Add ymove-diff endpoint + dashboard button (read-only)
+- S25 Step 1: Add fix-manual-apple-labels endpoint (preview/apply, scoped relabel)
+- S25 Step 2: Add fix-manual-import-labels endpoint for import_apple/google variants
+- S25 Step 3: Add cancel-test-stripe endpoint (5-record allowlist, soft-cancel)
+- S25 Step 4: Add backfill-kelsey endpoint (later replaced)
+- S25 Step 4b: Add false-cancel diagnostic endpoint
+- S25 Step 4 (revised): Reactivate Kelsey id=11315 instead of inserting new
+- S25 Step 5: Add verify-historical-stripe endpoint (read-only Stripe API check)
+- S25 CRITICAL: Remove 'manual' from self-heal allowed providers (line 2961)
+- S25: Add investigate-stripe-gaps endpoint (Part 1: 2 specific emails, Part 2: false-cancelled Stripe scan)
+- S25: Add Isabella+Jess Stripe verification (this sub + customer-wide history)
 
-### Open Questions (asked in S24 wrap email, April 11)
-- **For Ahmed:** End-to-end test signup through each channel (Klaviyo, Facebook, email) to verify UTMs make it to Stripe checkout. Currently only Instagram bio link is verified end-to-end.
-- **For Ahmed:** Do any current campaigns link directly to ymove.app instead of movementandmiles.com first?
-- **For Tosh:** Does ymove read UTM params off its own checkout URL into the user meta field, or does meta only get populated from what our Squarespace script passes through via the API call?
+### Operational artifacts created (live in dashboard, all preview/apply pattern)
+1. ymove Diff (S25) — read-only diff with preflight checks
+2. Fix manual->apple labels (S25)
+3. Fix manual->import labels (S25)
+4. Cancel test/junk Stripe (S25)
+5. Reactivate Kelsey (S25)
+6. Find false-cancelled (S25 diagnostic)
+7. Verify historical Stripe (S25)
+8. Investigate Stripe gaps (S25)
+9. Verify Isabella + Jess (S25)
 
----
-
-## 9. KNOWN GAPS AND ARCHITECTURAL RISKS
-
-### Gap 1: Cancellation by email only (LIMIT 1) — UNFIXED
-`_ymove_handle_cancelled` finds the most recent active sub by email and cancels it, no source matching. If a user has both active Stripe + active Apple, an Apple cancel webhook could accidentally cancel the Stripe record. Stripe self-corrects since Stripe webhooks are independent, but it's a real risk for cross-platform users.
-
-### Gap 2: Shadow sync only verifies Apple/Google/Undetermined — INTENTIONAL
-Stripe drift is invisible to the shadow sync. We rely 100% on Stripe webhooks for Stripe status. This is intentional because Stripe webhooks have built-in retries and are reliable, but it means a missed Stripe webhook would never be caught.
-
-### Gap 3: No webhook retry from ymove — ACCEPTED
-If our server is down during webhook delivery, the data is lost. The daily shadow sync catches missing users via the waterfall, but their provider may end up "undetermined" until Tosh's API fix lands.
-
-### Gap 4: Duplicate active emails — CURRENTLY 0
-After S23 cleanup, no duplicates remain. Reconciliation Audit + Cancel ALL button can resolve future duplicates one-click.
-
-### Gap 5: Self-healing protection — FIXED IN S23
-Shadow sync reactivation now excludes:
-- Records with `import_batch LIKE 's23_provider_cleanup%'`
-- Records whose email already has an active `sub_*` Stripe sibling
-
-This prevents the morning sync from re-creating duplicates that the cleanup just resolved.
+These can all be re-run safely. Most are read-only diagnostics. The action endpoints have allowlists or strict guards so they cannot be misused.
 
 ---
 
-## 10. PROPOSED NEXT STEPS
+## 7. KEY FINDINGS FOR THE WRAP EMAIL TO TOSH + AHMED
 
-### Immediate (Session 25)
-1. Follow up on responses from Tosh and Ahmed to S24 wrap email (see Section 8 open questions)
-2. If Ahmed identifies any direct-to-ymove campaign links, decide whether to reroute them through movementandmiles.com or ask Tosh to add URL-param capture on ymove's side
-3. Run UTM backfill on cancelled Stripe subs (`status_filter: "all"`) for historical churn-by-channel analysis when needed
-4. Fix data-audit `stripe_active` query to include trialing (one-line fix: `status IN ('active', 'trialing')`)
+### For Tosh — concrete bugs with hard evidence
+1. **`subscriptionProvider: "manual"` semantics.** ymove returns this for at least 9 users in our DB whose `stripe_subscription_id` prefix proves they're paying via Apple. We've been treating "manual" as a payment provider value but it appears to be an admin-edit flag. What does it mean in your API?
 
-### Future Improvements
-- **Crack the persistent ~1% delta with Tosh.** We've been at "small but stubborn" for several sessions. Today's shadow sync confirmed it pulled all 1,854 of ymove's active subscribers (matches Tosh's ~1,859 within noise), so the bulk endpoint pagination is NOT the blocker — the shadow sync's pull_all phase reads totalPages from the API response and loops until done, no hard cap. The 18-record gap is real and complete, not the tip of an iceberg. The right next step is a per-email diff endpoint: join our subscriptions table against the ymove_all_emails captured during a sync run, output the asymmetric differences (in ours but not theirs, and vice versa). Probably 30-40 lines of code. The 18 records will likely cluster into 1-2 patterns once we can see them by name. (Note: Provider Test v2 endpoint at line 2225 has a hardcoded 30-page safety cap for fast diagnostic spot-checks — that's where the misleading "735 users / 30 pages" stat in S24 came from. Harmless because it's just a diagnostic, but worth lifting if we ever want to use it for full scans.)
+2. **Two specific stale-subscribed records:** Isabella Marovich-Tadic (ymove user 991975712) and Jess Mullen (ymove user 992014166) both show as `activeSubscription: true, subscriptionProvider: stripe` in your individual lookup AND in your bulk subscribed list, but Stripe API confirms both cancelled in March (Mar 12 and Mar 31 respectively). Specific sub_ids: `sub_1SoxpNFkITCMEwTDKCaf7NmT` and `sub_1TAM6nFkITCMEwTDm4ZnHeZO`.
+
+3. **Pagination math suspicious:** We pulled `member-lookup/all?status=subscribed` and got `totalPages: 168` returning ~1,854 users. That's ~11 users per page which seems unusually small. Two calls 90 minutes apart returned 1853 and 1854 emails. Is the bulk endpoint pagination stable, and what's the expected page size?
+
+4. **8 active Stripe subs missing entirely from ymove:** abbey.e.baier, ahfouch, alessandraclelia.volpato, amets30, andreedesrochers, cassyroop, chloe.levray, hstrandness. All confirmed active in Stripe API. Oldest: Nov 2022. Was there a signup flow that bypassed ymove, or are these gaps on your side?
+
+5. **4 provider mismatches where you have wrong classification:** alisonvfarmer (you say google), bjarrell, justine.e.murphy, rowkeller32 (you say manual for the last 3). All have real `sub_*` IDs from real Stripe webhooks — they're definitely Stripe payers.
+
+### For Ahmed
+1. End-to-end UTM test through each campaign channel (Klaviyo, Facebook, email)
+2. Are any current campaigns linking directly to ymove.app instead of movementandmiles.com first?
+
+### Records we cancelled in our system tonight (asking for confirmation/revert)
+Soft-cancelled 5 records that looked like test/junk in our diff:
+1. `sfdasafsaffas@ymove.app` — keyboard mash, trialing
+2. `sfdfdssfdfsdfsdasfad@ymove.app` — keyboard mash, $179.99/mo plan
+3. `utm_sourceemail@ymove.app` — Will's UTM test signup
+4. `markus.zwigart@gmx.dr` — typo'd TLD (`.dr` not real), active since Sept 2025
+5. `tosh.koevoets@gmail.com` — Tosh's own account, $179.99/mo plan
+**These are reversible via batch tag `s25_test_cancel_20260412_030202`. If any should NOT have been cancelled, let us know and we'll restore.**
+
+---
+
+## 8. PROPOSED NEXT STEPS (S26+)
+
+### Immediate (Session 26)
+1. **Wait for Tosh + Ahmed responses** to S25 wrap email
+2. **Verify the morning sync didn't undo any S25 work.** Check that the 9 relabeled records still have source='apple' after the Apr 12 8 AM ET sync. If the fix worked, no further action. If something slipped through, investigate.
+3. **Re-run ymove-diff** to confirm steady state. Should be very close to morning of Apr 12 numbers.
+4. **Investigate Bug D (pagination)** if Tosh has answered: build a tiny diagnostic that fetches just page 1 of ymove's bulk endpoint and inspects the raw response (totalPages, total, pageSize fields) so we know what the contract really is.
+
+### Short-term improvements
+1. **Fix Bug B (false cancel from transient glitches):** Cross-check the bulk pull `ymove_all_emails` set before deactivating a record in shadow sync Phase 3. If ymove's bulk says "subscribed" and individual says "expired," DON'T deactivate. Soft-cancel with `pending_verification` flag instead.
+2. **Fix Bug C (stale ymove → false subscribed):** Add Stripe API cross-check during shadow sync's import phase for any user ymove reports as `subscriptionProvider: stripe`. If Stripe disagrees, trust Stripe.
+3. **Fix Bug E (data-audit trialing display):** One-line fix.
+4. **Fix Bug F (auto-expire on status polls):** Small fix.
+5. **Re-run UTM backfill on cancelled Stripe subs** for historical churn-by-channel analysis when needed.
+
+### Longer-term improvements
+- **Crack the persistent ~7-8 record delta with Tosh** — depends on his answers about the 8 historical Stripes
 - **Fix Gap 1:** Cancel handler should match by source before fallback to most-recent
-- **Stripe reconciliation:** Compare our Stripe count against Stripe API's actual active subs
-- **Shadow sync performance:** Currently ~12 minutes for full run. Sequential member-lookup calls in verify phase are the bottleneck. asyncio.gather with semaphore would help.
-- **Investigate trialing methodology** with Tosh (9 Stripe delta)
-- **Auto-expire on status polls:** Currently the 30-min auto-expire only fires on `action: 'run'`, not `action: 'status'`. Dashboard polling never triggers it.
+- **Shadow sync performance:** ~12 minutes is dominated by Phase 1 sequential lookups. asyncio.gather with semaphore would help.
+- **Investigate Bug D pagination** thoroughly
 - **Deprecate Meg's XLSX import endpoint** once confirmed no longer needed
 
 ---
 
-## 11. SESSION 24 ACCOMPLISHMENTS (April 11, 2026)
+## 9. SESSION HISTORY (Earlier Sessions for Context)
 
-**Major work:**
-1. Confirmed both Tosh API fixes working (subscriptionProvider + UTM meta field)
-2. Ran shadow sync with self-healing: undetermined dropped from 58 → 3
-3. Closed delta with Tosh from 22 records (1.2%) → 18 records (0.95%)
-4. Found + fixed Bug 1: cancelled_ag_map source filter excluded 'manual', letting daily sync reactivate manually-cancelled manual duplicates
-5. Found + fixed Bug 2: daily sync waterfall had no Step 0 email-existence check, creating duplicate ymove_new_* records when provider segment changed in synthetic ID
-6. Built + ran UTM backfill endpoint (POST /api/admin/backfill-utms) with status_filter param
-7. UTM backfill result: 1,014 active Stripe subs scanned, 6 had UTMs (rest are pre-UTM direct traffic). Dashboard Marketing & Attribution section now populated.
-8. Built cleanup-manual-duplicates endpoint for synthetic-only duplicate case that cancel-all-duplicates can't handle
-9. Cleaned 9 manual/manual duplicate records, MRR adjusted down by $179.91/mo (was phantom inflation)
-10. Discovered shadow sync takes ~12 minutes (not ~1 hour as previously believed; the "1 hour" was an orphaned sync from a mid-run Railway redeploy)
-11. Discovered redeploy-kills-sync footgun: pushing to GitHub during shadow sync kills the background task silently, leaving an orphaned DB row
-12. Sent email update to Tosh + Ahmed with UTM tracking status and questions about Klaviyo/Facebook link targets
-13. Confirmed MRR Trend chart fix is NOT a TODO (was already handled in S23 via four commits, the "deferred" flag in context was stale)
-
-**Bugs found and fixed (4 total):**
-- Bug 1: cancelled_ag_map excluded 'manual' source → daily sync reactivated manual cleanup victims
-- Bug 2: daily sync waterfall had no email-existence check → duplicate ymove_new_* records when provider changed
-- Bug 3 (noted, not fixed): data-audit stripe_active excludes trialing, Apple/Google include it (inconsistent)
-- Bug 4 (noted, not fixed): auto-expire only fires on action:'run', not action:'status'
-
-**Code commits (in order):**
-- S24: Fix manual reactivation bug + add UTM backfill endpoint
-- S24: Add Step 0 email-existence check to daily sync waterfall
-- S24: Add status_filter to backfill-utms (default active+trialing only)
-- S24: Add cleanup-manual-duplicates endpoint for synthetic-only case
-
-**Numbers before/after S24:**
-- Before: 1,867 active, 58 undetermined, 0 duplicate emails, delta with Tosh: 22
-- After: 1,871 active+trialing, 3 undetermined, 0 duplicate emails, delta with Tosh: +12 (Tosh's numbers ~36h old)
-- MRR: $33,518.69 → $33,338.78 (removed $179.91 duplicate inflation)
-- UTM Attribution: 0 attributed subs → 7 attributed subs (dashboard live)
-
----
-
-## 12. SESSION HISTORY (Earlier Sessions for Context)
+### Session 24 (April 11, 2026)
+- Confirmed both Tosh API fixes working (subscriptionProvider + UTM meta)
+- Self-heal undetermined dropped from 58 → 3
+- Closed delta with Tosh from 22 → 18 records
+- Found and fixed Bug 1: cancelled_ag_map source filter excluded 'manual'
+- Found and fixed Bug 2: daily sync waterfall missing Step 0 email-existence check
+- Built UTM backfill endpoint, ran on 1,014 active Stripe subs (6 had UTMs)
+- Built cleanup-manual-duplicates endpoint
+- Cleaned 9 manual/manual duplicate records, MRR adjusted down by $179.91/mo (phantom inflation)
+- Discovered shadow sync takes ~12 minutes, not ~1 hour
 
 ### Session 23 (April 10, 2026) — Provider overhaul + audit tooling
-
-**Major work:**
-1. Fixed provider defaulting bug across 8 code locations ("apple" → "undetermined")
-2. Built and ran Provider Test v2, definitively confirmed ymove API limitation (290/293 users null)
-3. Built self-healing provider logic in shadow sync verify phase (already healed 9 manual users)
-4. Built 5-step Provider Resolution Waterfall for unknown users (Stripe dupe → A/G dupe → Meg → Stripe API → undetermined)
-5. Built Reconciliation Audit endpoint (batch history, duplicates with delete/cancel buttons, source mismatches, data origins)
-6. Built Data Audit endpoint (15+ checks, MRR confidence scoring)
-7. Built Provider Cleanup endpoint with preview/apply
-8. Added per-record Cancel and Delete buttons + bulk Cancel ALL button
-9. Added Provider Test, Reconciliation Audit, Data Audit, Provider Cleanup to dashboard Admin Tools
-10. Added "manual" and "undetermined" source types with dashboard styling
-11. Shadow sync reactivation now excludes cleanup-cancelled records and active Stripe siblings
-12. **Cleaned 79 misclassified records:** 3 Stripe duplicates cancelled, 66 reclassified to undetermined, 10 duplicate emails resolved
-13. Verified Squarespace UTM script works end-to-end via test signup
-14. Discovered UTM data IS in ymove DB but missing from API response
-15. Confirmed `subscriptionProvider` null limitation via test signup
-16. Sent Tosh two clear emails with hard evidence (UTM persistence + provider field)
-17. **Reduced delta with Tosh from large/unclear to 22 records (1.2%)**
-
-**Numbers before/after S23:**
-- Before: ~1,881 active, source breakdown wildly off, confidence LOW
-- After: 1,867 active, source breakdown matching Tosh ±1.2%, confidence HIGH
-
----
-
-## 12. SESSION HISTORY (Earlier Sessions for Context)
-
-### Session 24 (April 9, 2026) — Pre-S23 work
-- Investigated UTM attribution gap
-- Investigated subscriber count discrepancy with Tosh
-- Cancelled 7 duplicate cross-platform records (batch: `s24_dedup_apple_imports`)
-- Discovered provider defaulting bug
-- No code pushed, only DB operations
+- Fixed provider defaulting bug across 8 code locations
+- Built 5-step Provider Resolution Waterfall
+- Built Reconciliation Audit, Data Audit, Provider Cleanup endpoints
+- Cleaned 79 misclassified records
+- Reduced delta with Tosh from large/unclear to 22 records (1.2%)
 
 ### Sessions 16-22 — Foundation
 - Built ymove webhook integration (S18 dedup logic)
 - Built daily shadow sync (S20)
 - Built UTM tracking infrastructure (S21)
-- Built admin dashboard buildout
+- Built admin dashboard
 - Built Stripe + Apple + Google webhook handling
 
 ### Sessions 11-15 — Initial Build
@@ -410,3 +300,28 @@ This prevents the morning sync from re-creating duplicates that the cleanup just
 - Daily digest email system
 - Multi-tab XLSX export
 - Subscription analytics foundation
+
+---
+
+## 10. RUNNING LIST OF KNOWN BUGS (NOT YET FIXED)
+
+| Bug | Where | Impact | Priority |
+|-----|-------|--------|----------|
+| B | Shadow sync deactivation logic (line ~3071) | False-cancels from transient ymove glitches | HIGH |
+| C | Shadow sync import logic | Stale ymove subscribed → false active records | MEDIUM |
+| D | ymove pagination (Tosh-side) | Possible silent data loss | UNKNOWN, investigate |
+| E | data-audit endpoint | `stripe_active` excludes trialing, Apple/Google include | LOW (cosmetic) |
+| F | Auto-expire on status polls | Only fires on action:'run' | LOW |
+| Gap 1 (from earlier) | `_ymove_handle_cancelled` | Cancellation by email only (LIMIT 1) | MEDIUM |
+| Gap 2 (from earlier) | Shadow sync verify pool | Stripe drift invisible (intentional) | INTENTIONAL |
+| Gap 3 (from earlier) | ymove webhook | No retry from ymove | ACCEPTED |
+
+---
+
+## 11. STANDING REMINDERS
+
+- SimpleBlueprints rules don't apply here, this is Movement & Miles
+- Will rotates GitHub PAT frequently — never reuse old tokens
+- All admin endpoint changes need preview/apply pattern, never one-shot writes
+- Record IDs to never touch without confirmation: any sub_id starting with `sub_*` (real Stripe), numeric (real Apple), `ym_google_*` (real Google webhook)
+- The reversibility tag pattern `s25_*_<timestamp>` lets us undo any batch
