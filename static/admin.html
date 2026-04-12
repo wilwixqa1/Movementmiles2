@@ -781,6 +781,14 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#2d6a2d">Backfill Kelsey (S25)</h3>
+          <p>Insert kelseymsimms@gmail.com — Apple sub ymove has but we don't. Verified live against ymove. Hardcoded single record.</p>
+          <button class="tool-btn" style="background:#2d6a2d;color:#fff" id="btn-kelsey-preview" onclick="doKelseyBackfill(false)">Preview</button>
+          <button class="tool-btn" style="background:#2d6a2d;color:#fff;margin-top:6px;display:none" id="btn-kelsey-apply" onclick="doKelseyBackfill(true)">Apply</button>
+          <div class="tool-result" id="res-kelsey" style="max-height:400px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2222,6 +2230,48 @@ function doFixLabels(apply) {
       btnApply.style.display = "none";
     }
     html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:400px">' + JSON.stringify(d.candidates, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doKelseyBackfill(apply) {
+  var btnPrev = document.getElementById("btn-kelsey-preview");
+  var btnApply = document.getElementById("btn-kelsey-apply");
+  var res = document.getElementById("res-kelsey");
+  btnPrev.disabled = true;
+  btnApply.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = apply ? "Inserting..." : "Loading preview...";
+  fetch("/api/admin/backfill-kelsey-s25", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: JSON.stringify({apply: apply})
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btnPrev.disabled = false;
+    btnApply.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    if (d.mode === "blocked") {
+      html += '<h4 style="margin:0 0 6px;color:#c62828">BLOCKED: ' + d.reason + '</h4>';
+      html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem">' + JSON.stringify(d.existing_records, null, 2) + '</pre>';
+    } else if (d.mode === "preview") {
+      html += '<h4 style="margin:0 0 6px">Preview: 1 record to insert</h4>';
+      btnApply.style.display = "inline-block";
+      html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem">' + JSON.stringify(d.to_insert, null, 2) + '</pre>';
+    } else {
+      html += '<h4 style="margin:0 0 6px;color:#2d6a2d">Inserted: id=' + d.inserted_id + '</h4>';
+      html += '<div style="font-size:.78rem;color:#555;margin-bottom:6px">Batch: ' + d.batch_tag + '</div>';
+      btnApply.style.display = "none";
+      html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem">' + JSON.stringify(d.record, null, 2) + '</pre>';
+    }
     res.innerHTML = html;
   }).catch(function(e) {
     btnPrev.disabled = false;

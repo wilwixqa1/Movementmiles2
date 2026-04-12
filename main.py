@@ -7114,6 +7114,82 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Backfill missing Apple sub (kelseymsimms) ---
+
+@app.post("/api/admin/backfill-kelsey-s25")
+async def backfill_kelsey_s25(request: Request):
+    """S25 Step 4: Insert kelseymsimms@gmail.com — Apple sub ymove has but we don't.
+    Hardcoded single record. Verified live against ymove inspect-user before building.
+    Body: {"apply": false} for preview, {"apply": true} to commit.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply = bool(body.get("apply", False))
+
+    record = {
+        "email": "kelseymsimms@gmail.com",
+        "source": "apple",
+        "status": "active",
+        "stripe_subscription_id": "s25_backfill_kelseymsimms_apple",
+        "plan_amount": 1999,  # $19.99/mo monthly
+        "created_at": "2024-07-04T21:10:43+00:00",
+        "first_name": "Kelsey",
+        "last_name": "Simms",
+        "ymove_user_id": 991697970,
+    }
+
+    async with db_pool.acquire() as conn:
+        # Safety: confirm she's not already in the DB (in any status)
+        existing = await conn.fetch(
+            "SELECT id, status, source, stripe_subscription_id FROM subscriptions WHERE LOWER(email) = $1",
+            record["email"].lower()
+        )
+
+        if existing:
+            return {
+                "mode": "blocked",
+                "reason": "Email already exists in DB",
+                "existing_records": [dict(r) for r in existing],
+            }
+
+        if not apply:
+            return {
+                "mode": "preview",
+                "to_insert": record,
+                "next_step": 'POST again with {"apply": true} to commit',
+            }
+
+        from datetime import datetime as _dt
+        batch_tag = f"s25_kelsey_backfill_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        new_id = await conn.fetchval(
+            """INSERT INTO subscriptions
+               (email, source, status, stripe_subscription_id, plan_amount, plan_interval,
+                created_at, updated_at, import_batch, first_name, last_name)
+               VALUES ($1, $2, $3, $4, $5, 'month', $6::timestamptz, NOW(), $7, $8, $9)
+               RETURNING id""",
+            record["email"], record["source"], record["status"],
+            record["stripe_subscription_id"], record["plan_amount"],
+            record["created_at"], batch_tag,
+            record["first_name"], record["last_name"]
+        )
+
+        return {
+            "mode": "applied",
+            "batch_tag": batch_tag,
+            "inserted_id": new_id,
+            "record": record,
+            "reversal_hint": f"To revert: DELETE FROM subscriptions WHERE id = {new_id}",
+        }
+
+
 # --- Session 25: Cancel test/junk Stripe records ---
 
 S25_TEST_CANCEL_EMAILS = [
