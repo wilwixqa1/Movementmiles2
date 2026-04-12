@@ -7118,6 +7118,73 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Verify Isabella + Jess against Stripe API ---
+
+@app.post("/api/admin/verify-isabella-jess-s25")
+async def verify_isabella_jess_s25(request: Request):
+    """S25: Read-only Stripe API check for the 2 only_in_ymove records.
+    Both have cancelled Stripe records in our DB. We need to know if Stripe agrees.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    EMAILS = ["isabella.marovich-tadic@menzies.edu.au", "jessica.mullen@yahoo.com"]
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, stripe_customer_id,
+                   plan_amount, created_at, canceled_at
+            FROM subscriptions
+            WHERE LOWER(email) = ANY($1::text[])
+              AND source = 'stripe'
+            ORDER BY email, created_at DESC
+        """, [e.lower() for e in EMAILS])
+
+    results = []
+    for r in rows:
+        sub_id = r["stripe_subscription_id"]
+        record = {
+            "id": r["id"],
+            "email": r["email"],
+            "our_status": r["status"],
+            "our_sub_id": sub_id,
+            "stripe_customer_id": r["stripe_customer_id"],
+            "our_canceled_at": r["canceled_at"].isoformat() if r["canceled_at"] else None,
+        }
+        # Check this specific sub_id
+        try:
+            sub = stripe.Subscription.retrieve(sub_id)
+            record["this_sub_status"] = sub.status
+            record["this_sub_canceled_at"] = sub.canceled_at
+        except Exception as e:
+            record["this_sub_error"] = str(e)[:200]
+
+        # Also check if customer has ANY other active sub (the resubscribe theory)
+        try:
+            customers = stripe.Customer.list(email=r["email"], limit=10)
+            all_subs = []
+            for cust in customers.data:
+                cust_subs = stripe.Subscription.list(customer=cust.id, status="all", limit=20)
+                for s in cust_subs.data:
+                    all_subs.append({
+                        "sub_id": s.id,
+                        "status": s.status,
+                        "created": s.created,
+                        "current_period_end": s.current_period_end,
+                        "customer_id": cust.id,
+                    })
+            record["all_stripe_subs_for_email"] = all_subs
+            record["any_currently_active"] = any(s["status"] in ("active", "trialing") for s in all_subs)
+        except Exception as e:
+            record["customer_lookup_error"] = str(e)[:200]
+
+        results.append(record)
+
+    return {"results": results, "count": len(results)}
+
+
 # --- Session 25: Investigate 2 new only_in_ymove + false-cancelled Stripe scan ---
 
 S25_NEW_YMOVE_EMAILS = [

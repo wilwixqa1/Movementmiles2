@@ -810,6 +810,13 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#e65100">Verify Isabella + Jess (S25)</h3>
+          <p>Read-only Stripe API check. Looks up the cancelled sub AND any other Stripe subs for the same email. Tells us if there's a new active sub we don't know about.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-verify-ij" onclick="doVerifyIsabellaJess()">Run Check</button>
+          <div class="tool-result" id="res-verify-ij" style="max-height:600px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2255,6 +2262,32 @@ function doFixLabels(apply) {
   }).catch(function(e) {
     btnPrev.disabled = false;
     btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doVerifyIsabellaJess() {
+  var btn = document.getElementById("btn-verify-ij");
+  var res = document.getElementById("res-verify-ij");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Hitting Stripe API for 2 emails...";
+  fetch("/api/admin/verify-isabella-jess-s25", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: "{}"
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btn.disabled = false;
+    res.className = "tool-result ok";
+    var html = '<h4 style="margin:0 0 6px">Stripe API results (' + d.count + ' records checked)</h4>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:600px">' + JSON.stringify(d.results, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false;
     res.className = "tool-result err";
     res.textContent = "Error: " + e.message;
   });
