@@ -2869,9 +2869,10 @@ async def _run_shadow_sync(run_id: int):
                 """SELECT DISTINCT ON (lower(s.email))
                    s.id, lower(s.email) as email, s.source, s.stripe_subscription_id
                    FROM subscriptions s
-                   WHERE s.status = 'canceled' AND s.source IN ('apple', 'google', 'undetermined')
+                   WHERE s.status = 'canceled' AND s.source IN ('apple', 'google', 'undetermined', 'manual')
                    AND s.email != '' AND s.email IS NOT NULL
                    AND (s.import_batch IS NULL OR s.import_batch NOT LIKE 's23_provider_cleanup%%')
+                   AND (s.import_batch IS NULL OR s.import_batch NOT LIKE 's24_%%')
                    AND NOT EXISTS (
                        SELECT 1 FROM subscriptions s2
                        WHERE lower(s2.email) = lower(s.email)
@@ -3897,6 +3898,142 @@ async def delete_duplicate(request: Request):
             "status": "deleted",
             "deleted_record": dict(target),
             "preserved_sibling": dict(sibling)
+        }
+
+
+@app.post("/api/admin/backfill-utms")
+async def backfill_utms(request: Request):
+    """S24: Backfill UTM attribution on existing Stripe subscriptions.
+
+    Tosh shipped the meta-field passthrough on 2026-04-11, which means
+    subscriptionProvider is populated AND member-lookup now returns UTM params
+    in the meta field. New Stripe webhooks already capture UTMs via the existing
+    pipeline in _ymove_handle_created. This endpoint backfills the ~1000 Stripe
+    subs that were created before the fix.
+
+    Scope: Stripe-only. Apple/Google subs go through app stores which strip UTMs,
+    so they are not relevant for ad attribution.
+
+    Body: {preview: true|false, limit: int (optional)}
+      preview=true (default): count + sample, no writes
+      preview=false: actually call ymove and write UTMs
+      limit: cap rows processed (useful for staged runs)
+
+    Idempotent: WHERE filter excludes rows that already have utm_source set,
+    and _store_utm_on_subscription uses COALESCE so it cannot blank existing data.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = body.get("preview", True)
+    limit = body.get("limit")
+    batch_id = f"s24_utm_backfill_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        # Stripe subs only, no UTMs yet, must have email to look up
+        query = """
+            SELECT id, stripe_subscription_id, email, created_at
+            FROM subscriptions
+            WHERE stripe_subscription_id LIKE 'sub_%'
+              AND email IS NOT NULL
+              AND email != ''
+              AND (utm_source IS NULL OR utm_source = '')
+            ORDER BY created_at DESC
+        """
+        if limit and isinstance(limit, int) and limit > 0:
+            query += f" LIMIT {int(limit)}"
+
+        rows = await conn.fetch(query)
+        candidate_count = len(rows)
+
+        if preview:
+            return {
+                "status": "preview",
+                "batch_id": batch_id,
+                "candidates": candidate_count,
+                "limit_applied": limit,
+                "sample": [
+                    {
+                        "id": r["id"],
+                        "stripe_subscription_id": r["stripe_subscription_id"],
+                        "email": r["email"],
+                        "created_at": str(r["created_at"]),
+                    }
+                    for r in rows[:5]
+                ],
+                "note": "Set preview: false to apply. Estimated runtime: ~"
+                        + str(round(candidate_count * 0.25)) + "s at 4 lookups/sec.",
+            }
+
+        # APPLY mode
+        processed = 0
+        found_with_utm = 0
+        found_no_utm = 0
+        not_found = 0
+        errors = 0
+        attached_samples = []
+
+        for r in rows:
+            sub_id = r["stripe_subscription_id"]
+            email = r["email"]
+            try:
+                utm_result = await _ymove_lookup_utm(email)
+                processed += 1
+                if not utm_result.get("found"):
+                    not_found += 1
+                    continue
+                if utm_result.get("utm"):
+                    await _store_utm_on_subscription(conn, sub_id, utm_result)
+                    found_with_utm += 1
+                    if len(attached_samples) < 10:
+                        attached_samples.append({
+                            "stripe_subscription_id": sub_id,
+                            "email": email,
+                            "utm": utm_result["utm"],
+                        })
+                else:
+                    found_no_utm += 1
+            except Exception as e:
+                errors += 1
+                print(f"[s24-backfill-utms] Error on {sub_id} ({email}): {e}")
+
+            # Be polite to ymove API: ~4 req/sec
+            await asyncio.sleep(0.05)
+
+        # Tag the batch on rows we successfully attached UTMs to
+        if found_with_utm > 0:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET import_batch = COALESCE(import_batch, '') || $1,
+                           updated_at = NOW()
+                       WHERE stripe_subscription_id LIKE 'sub_%'
+                         AND utm_source IS NOT NULL
+                         AND utm_source != ''
+                         AND updated_at > NOW() - INTERVAL '5 minutes'""",
+                    f" {batch_id}"
+                )
+            except Exception as e:
+                print(f"[s24-backfill-utms] Batch tag error: {e}")
+
+        return {
+            "status": "applied",
+            "batch_id": batch_id,
+            "candidates": candidate_count,
+            "processed": processed,
+            "found_with_utm": found_with_utm,
+            "found_no_utm": found_no_utm,
+            "not_found": not_found,
+            "errors": errors,
+            "attached_samples": attached_samples,
         }
 
 
