@@ -3918,6 +3918,154 @@ async def delete_duplicate(request: Request):
         }
 
 
+@app.post("/api/admin/cleanup-manual-duplicates")
+async def cleanup_manual_duplicates(request: Request):
+    """S24: Clean up manual/manual duplicates where neither record is a 'real sibling'.
+
+    The existing cancel-all-duplicates endpoint refuses to operate when both
+    records are synthetic (ymove_new_*, import_*, meg_*) because there's no
+    real Stripe sub_*, Apple numeric, or ym_google_* to anchor on. That's
+    intentional safety, but it leaves a gap for the specific case where both
+    duplicates are correctly classified manual records that just happen to
+    have different synthetic IDs (e.g. ymove_new_apple_X and ymove_new_undetermined_X
+    for the same email hash, created by separate sync runs before the Step 0 fix).
+
+    This endpoint handles that exact case with strict guards:
+      - Both records must have status IN ('active', 'trialing')
+      - Both records must have source = 'manual'
+      - Both records must have a synthetic ID (not sub_*, not numeric, not ym_google_*)
+      - Email must be the same
+
+    Action: keep the OLDER record (preserves history), cancel the newer one
+    with batch tag s24_manual_dedup_<timestamp>. Future shadow syncs will
+    skip these via the s24_% reactivation guard added in this same session.
+
+    Body: {preview: true|false}
+      preview=true (default): show planned actions, no writes
+      preview=false: apply
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = body.get("preview", True)
+    batch_id = f"s24_manual_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    def is_synthetic(sub_id: str) -> bool:
+        if not sub_id:
+            return True
+        if sub_id.startswith("sub_"):
+            return False
+        if sub_id.startswith("ym_google_"):
+            return False
+        if sub_id.isdigit():
+            return False
+        return True
+
+    async with db_pool.acquire() as conn:
+        # Find emails with multiple active manual records
+        groups = await conn.fetch("""
+            SELECT lower(email) as email, COUNT(*) as cnt
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+              AND source = 'manual'
+              AND email IS NOT NULL AND email != ''
+            GROUP BY lower(email)
+            HAVING COUNT(*) > 1
+        """)
+
+        plan = []
+        for g in groups:
+            email = g["email"]
+            records = await conn.fetch("""
+                SELECT id, email, stripe_subscription_id, source, status, created_at
+                FROM subscriptions
+                WHERE lower(email) = $1
+                  AND status IN ('active', 'trialing')
+                  AND source = 'manual'
+                ORDER BY created_at ASC
+            """, email)
+            records = [dict(r) for r in records]
+
+            # Strict guard: every record in the group must be synthetic
+            if not all(is_synthetic(r["stripe_subscription_id"]) for r in records):
+                plan.append({
+                    "email": email,
+                    "action": "skip",
+                    "reason": "at least one record is a real sibling, refusing to touch",
+                    "records": [
+                        {**r, "created_at": str(r["created_at"])} for r in records
+                    ],
+                })
+                continue
+
+            keeper = records[0]   # oldest by created_at ASC
+            cancellees = records[1:]
+            plan.append({
+                "email": email,
+                "action": "cancel_newer",
+                "keep": {
+                    "id": keeper["id"],
+                    "stripe_subscription_id": keeper["stripe_subscription_id"],
+                    "created_at": str(keeper["created_at"]),
+                },
+                "cancel": [
+                    {
+                        "id": c["id"],
+                        "stripe_subscription_id": c["stripe_subscription_id"],
+                        "created_at": str(c["created_at"]),
+                    }
+                    for c in cancellees
+                ],
+            })
+
+        if preview:
+            return {
+                "status": "preview",
+                "batch_id": batch_id,
+                "groups_found": len(groups),
+                "actionable": sum(1 for p in plan if p["action"] == "cancel_newer"),
+                "skipped": sum(1 for p in plan if p["action"] == "skip"),
+                "plan": plan,
+                "note": "Set preview: false to apply.",
+            }
+
+        # APPLY mode
+        cancelled_ids = []
+        errors = []
+        for p in plan:
+            if p["action"] != "cancel_newer":
+                continue
+            for c in p["cancel"]:
+                try:
+                    await conn.execute(
+                        """UPDATE subscriptions
+                           SET status = 'canceled',
+                               canceled_at = NOW(),
+                               import_batch = $1,
+                               updated_at = NOW()
+                           WHERE id = $2""",
+                        batch_id, c["id"]
+                    )
+                    cancelled_ids.append(c["id"])
+                except Exception as e:
+                    errors.append({"id": c["id"], "error": str(e)})
+
+        return {
+            "status": "applied",
+            "batch_id": batch_id,
+            "cancelled_count": len(cancelled_ids),
+            "cancelled_ids": cancelled_ids,
+            "errors": errors,
+            "revert": f"POST /api/admin/revert-batch with batch_id={batch_id}",
+        }
+
+
 @app.post("/api/admin/backfill-utms")
 async def backfill_utms(request: Request):
     """S24: Backfill UTM attribution on existing Stripe subscriptions.
