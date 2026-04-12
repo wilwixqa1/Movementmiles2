@@ -2061,6 +2061,56 @@ async def admin_ymove_log(request: Request):
 
 # --- Session 17: ymove API Verification ---
 
+@app.get("/api/admin/inspect-email")
+async def inspect_email(request: Request):
+    """S23 debug: dump all subscription records for an email + show why categorized as it was."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    email = request.query_params.get("email", "").strip().lower()
+    if not email:
+        return JSONResponse(status_code=400, content={"error": "email required"})
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch(
+            """SELECT id, email, stripe_subscription_id, source, status, plan_amount,
+                      created_at, canceled_at, updated_at, import_batch
+               FROM subscriptions WHERE lower(email) = $1 ORDER BY created_at""",
+            email
+        )
+        in_our_active = await conn.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM subscriptions
+               WHERE lower(email) = $1 AND status IN ('active','trialing')
+               AND source IN ('apple','google','undetermined')
+               AND email != '' AND email IS NOT NULL)""", email
+        )
+        in_active_stripe = await conn.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM subscriptions
+               WHERE lower(email) = $1 AND status IN ('active','trialing') AND source = 'stripe')""", email
+        )
+        in_all_known = await conn.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM subscriptions
+               WHERE lower(email) = $1 AND email != '' AND email IS NOT NULL)""", email
+        )
+    return {
+        "email": email,
+        "record_count": len(records),
+        "records": [dict(r) for r in records],
+        "shadow_sync_categorization": {
+            "would_be_in_our_active_set": in_our_active,
+            "would_be_in_active_stripe_emails": in_active_stripe,
+            "would_be_in_all_known_emails": in_all_known,
+            "expected_branch": (
+                "unchanged (in our_active_set)" if in_our_active
+                else "active_stripe_in_ymove (in active_stripe_emails)" if in_active_stripe
+                else "cross_platform_switcher (in all_known_emails)" if in_all_known
+                else "truly_new"
+            )
+        }
+    }
+
+
 @app.get("/api/admin/inspect-ymove-user")
 async def inspect_ymove_user(request: Request):
     """S23: Dump the full ymove response for a single email, including meta field.
