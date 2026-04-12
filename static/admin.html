@@ -789,6 +789,13 @@
         </div>
 
         <div class="tool-card">
+          <h3 style="color:#e65100">Find false-cancelled (S25 diagnostic)</h3>
+          <p>Read-only. Pulls ymove + checks our cancelled Apple/Google/Undetermined records. Returns emails that we have cancelled but ymove says are currently active. Takes ~5min.</p>
+          <button class="tool-btn" style="background:#e65100;color:#fff" id="btn-find-false" onclick="doFindFalseCancelled()">Run Diagnostic</button>
+          <div class="tool-result" id="res-find-false" style="max-height:600px;overflow:auto"></div>
+        </div>
+
+        <div class="tool-card">
           <h3 style="color:#c62828">Provider Cleanup</h3>
           <p>Reclassify all ymove_new_*/ymove_switch_* records. Cross-references with Stripe to identify Stripe users, marks the rest as "undetermined". Preview first, then apply.</p>
           <button class="tool-btn" style="background:#c62828;color:#fff" id="btn-cleanup-preview" onclick="doProviderCleanup(true)">Preview Cleanup</button>
@@ -2234,6 +2241,42 @@ function doFixLabels(apply) {
   }).catch(function(e) {
     btnPrev.disabled = false;
     btnApply.disabled = false;
+    res.className = "tool-result err";
+    res.textContent = "Error: " + e.message;
+  });
+}
+
+function doFindFalseCancelled() {
+  var btn = document.getElementById("btn-find-false");
+  var res = document.getElementById("res-find-false");
+  btn.disabled = true;
+  res.className = "tool-result loading";
+  res.textContent = "Pulling ymove + scanning cancelled records (~5min)...";
+  fetch("/api/admin/find-false-cancelled-s25", {
+    method: "POST",
+    headers: {"X-Admin-Password": adminPw, "Content-Type": "application/json"},
+    body: "{}"
+  }).then(function(r) {
+    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || d.detail || "Failed"); });
+    return r.json();
+  }).then(function(d) {
+    btn.disabled = false;
+    res.className = "tool-result ok";
+    var html = '';
+    var s = d.summary;
+    html += '<h4 style="margin:0 0 6px;color:#c62828">False-cancels found: ' + s.false_cancel_count + '</h4>';
+    html += '<div style="font-size:.82rem;margin-bottom:6px">';
+    html += 'ymove subscribed total: ' + s.ymove_subscribed_total + '<br>';
+    html += 'Our cancelled A/G/U total: ' + s.our_cancelled_ag_total + '<br>';
+    html += 'By source: ' + JSON.stringify(s.by_source) + '<br>';
+    html += '</div>';
+    html += '<h4 style="margin:10px 0 4px">By import_batch (pattern detection)</h4>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:200px">' + JSON.stringify(s.by_import_batch, null, 2) + '</pre>';
+    html += '<h4 style="margin:10px 0 4px">False-cancel records' + (d.truncated ? ' (TRUNCATED to 200)' : '') + '</h4>';
+    html += '<pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:.75rem;white-space:pre-wrap;overflow:auto;max-height:500px">' + JSON.stringify(d.false_cancels, null, 2) + '</pre>';
+    res.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false;
     res.className = "tool-result err";
     res.textContent = "Error: " + e.message;
   });

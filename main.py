@@ -7114,6 +7114,131 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Diagnostic — find false-cancelled records ---
+
+@app.post("/api/admin/find-false-cancelled-s25")
+async def find_false_cancelled_s25(request: Request):
+    """S25 Step 4b: Read-only diagnostic.
+    Finds records where status='canceled' AND source IN ('apple','google','undetermined')
+    BUT the email is currently active in ymove's subscribed list, AND we don't already
+    have a separate active record for that email (which would be normal churn-and-rejoin).
+    These are 'false cancels' — likely victims of Gap 1, Bug 2, or S23/S24 cleanup overreach.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not YMOVE_API_KEY:
+        return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    # Phase 1: pull ymove subscribed list fresh
+    ymove_emails = {}
+    pull_status = "starting"
+    pages_pulled = 0
+    try:
+        page = 1
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"status": "subscribed", "page": str(page)}
+                    )
+                except httpx.TimeoutException:
+                    pull_status = f"timeout_page_{page}"
+                    break
+                if resp.status_code == 429:
+                    await asyncio.sleep(float(resp.headers.get("retry-after", "5")))
+                    continue
+                if resp.status_code != 200:
+                    pull_status = f"error_page_{page}_http_{resp.status_code}"
+                    break
+                data = resp.json()
+                for u in data.get("users", []):
+                    em = (u.get("email") or "").strip().lower()
+                    if em:
+                        provider = (u.get("subscriptionProvider") or "undetermined").lower()
+                        ymove_emails[em] = provider
+                total_pages = data.get("totalPages", 1)
+                pages_pulled = page
+                if page >= total_pages:
+                    pull_status = "success"
+                    break
+                page += 1
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        pull_status = f"error: {str(e)[:200]}"
+
+    if pull_status != "success":
+        return JSONResponse(status_code=502, content={
+            "error": "ymove pull failed",
+            "pull_status": pull_status,
+            "pages_pulled": pages_pulled,
+        })
+
+    # Phase 2: pull our cancelled Apple/Google/Undetermined records
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id, plan_amount,
+                   created_at, canceled_at, import_batch
+            FROM subscriptions
+            WHERE status = 'canceled'
+              AND source IN ('apple', 'google', 'undetermined')
+              AND email IS NOT NULL AND email != ''
+            ORDER BY email, canceled_at DESC NULLS LAST
+        """)
+        active_emails_rows = await conn.fetch("""
+            SELECT LOWER(email) AS email FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+              AND email IS NOT NULL AND email != ''
+        """)
+    our_active_emails = {r["email"] for r in active_emails_rows}
+
+    false_cancels = []
+    seen_emails = set()
+    for r in rows:
+        em = r["email"].strip().lower()
+        if em in seen_emails:
+            continue
+        if em not in ymove_emails:
+            continue
+        if em in our_active_emails:
+            continue
+        seen_emails.add(em)
+        false_cancels.append({
+            "id": r["id"],
+            "email": r["email"],
+            "our_source": r["source"],
+            "our_sub_id": r["stripe_subscription_id"],
+            "plan_amount": r["plan_amount"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "canceled_at": r["canceled_at"].isoformat() if r["canceled_at"] else None,
+            "import_batch": r["import_batch"],
+            "ymove_provider": ymove_emails[em],
+        })
+
+    by_batch = {}
+    by_source = {}
+    for fc in false_cancels:
+        b = fc["import_batch"] or "(none)"
+        by_batch[b] = by_batch.get(b, 0) + 1
+        by_source[fc["our_source"]] = by_source.get(fc["our_source"], 0) + 1
+
+    return {
+        "summary": {
+            "false_cancel_count": len(false_cancels),
+            "ymove_subscribed_total": len(ymove_emails),
+            "our_cancelled_ag_total": len(rows),
+            "by_source": by_source,
+            "by_import_batch": by_batch,
+        },
+        "false_cancels": false_cancels[:200],
+        "truncated": len(false_cancels) > 200,
+    }
+
+
 # --- Session 25: Backfill missing Apple sub (kelseymsimms) ---
 
 @app.post("/api/admin/backfill-kelsey-s25")
