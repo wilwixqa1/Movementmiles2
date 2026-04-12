@@ -3592,6 +3592,23 @@ async def run_daily_shadow_sync():
                         if not email:
                             continue
 
+                        # S24 Step 0: Skip if email already has ANY active record.
+                        # Bug fix: previous waterfall only checked Meg/Stripe ID patterns,
+                        # not "is there already an active record for this email at all?"
+                        # Result: emails with existing ymove_new_apple_* records would get
+                        # a NEW ymove_new_undetermined_* record inserted alongside, because
+                        # the synthetic IDs differ in the provider segment so ON CONFLICT misses.
+                        # 9 manual duplicates created on 2026-04-11 traced to this gap.
+                        existing_active = await conn.fetchval(
+                            """SELECT id FROM subscriptions
+                               WHERE lower(email) = lower($1)
+                               AND status IN ('active', 'trialing')
+                               LIMIT 1""", email
+                        )
+                        if existing_active:
+                            print(f"[Daily Sync] Step 0 skip: {email} already has active record (id={existing_active})")
+                            continue
+
                         # Step 1: Check Meg import records for known provider
                         meg_record = await conn.fetchrow(
                             """SELECT source FROM subscriptions
