@@ -1,5 +1,5 @@
-# Movement & Miles — Session 24 Context Document
-## Date: April 10, 2026 | Version: 23.4.0
+# Movement & Miles — Session 25 Context Document
+## Date: April 11, 2026 | Version: 24.1.0
 
 ---
 
@@ -182,34 +182,36 @@ Step 4: Fall through
 
 ---
 
-## 6. CURRENT SUBSCRIBER NUMBERS (Post-S23 Cleanup)
+## 6. CURRENT SUBSCRIBER NUMBERS (Post-S24 Cleanup)
 
-### Our System (1,867 total active):
+### Our System (1,871 total active+trialing):
 | Source | Count |
 |--------|-------|
-| Stripe | 1,018 |
-| Apple | 587 |
-| Google | 195 |
-| Manual | 9 (auto-healed by self-healing logic) |
-| Undetermined | 58 |
-| **Total Active** | **1,867** (1,716 active + 151 trialing) |
+| Stripe | 1,031 (881 active + 150 trialing) |
+| Apple | 623 |
+| Google | 205 |
+| Manual | 9 |
+| Undetermined | 3 |
+| **Total Active+Trialing** | **1,871** |
 
-### Tosh's System (1,889 total):
+### Tosh's System (1,889 total per earlier report, ~36h old):
 | Source | Count |
 |--------|-------|
 | Stripe | 1,022 |
 | Apple | 648 |
 | Google | 208 |
 | Manual | 11 |
-| **Total** | **1,889** |
+| **Total** | **1,859** (per his dashboard) |
 
-### Delta with Tosh: -22 records (1.2%)
-- Stripe: -4 (within trialing methodology noise)
-- Apple: -61 (most are likely in our 58 undetermined bucket)
-- Google: -13
+### Delta with Tosh: +12 records (0.6%)
+- Stripe: +9 (trialing methodology difference)
+- Apple: -25 (likely missed webhooks from before shadow sync existed)
+- Google: -3
 - Manual: -2
+- Undetermined: +3 (will heal once Tosh's API populates these 3)
+- Note: Tosh's numbers are ~36h old, so real-time delta may be tighter
 
-The 58 undetermined records would distribute across Apple/Google/Manual once Tosh fixes the API.
+Note: The data-audit endpoint's `stripe_active` field (881) excludes trialing. The real Stripe active+trialing is 1,031. This is a known display bug (S24 finding, not yet fixed).
 
 ---
 
@@ -247,27 +249,26 @@ The 58 undetermined records would distribute across Apple/Google/Manual once Tos
 
 ---
 
-## 8. PENDING TOSH FIXES (Both Confirmed via Test Signup)
+## 8. TOSH API FIXES — COMPLETED (April 11, 2026)
 
-### Fix 1: Populate `subscriptionProvider` in member-lookup API
-- **Test:** `wilwendt123@gmail.com`, ymove user ID 992032730
-- **Current state:** Returns null for nearly all stripe/apple/google users
-- **Webhook field works correctly:** `subscriptionPaymentProvider`
-- **Impact when fixed:** Self-healing logic auto-corrects all 58 undetermined records on next daily sync
-- **Status:** Email sent April 10, awaiting Tosh
+### Fix 1: subscriptionProvider in member-lookup API ✅ SHIPPED
+- Tosh shipped this on April 11, 2026
+- Confirmed: 733/735 users in bulk scan return non-null provider (99.7%)
+- Our self-healing logic auto-corrected 55 of 58 undetermined records on first sync after fix
+- 3 undetermined remain (ymove returns null for these specific users)
 
-### Fix 2: Pass UTM params from `meta` field through API
-- **Test:** Same user 992032730, signed up with `utm_source=test_will&utm_medium=debug&utm_campaign=s23_test`
-- **Tosh confirmed:** UTMs ARE saved in his database
-- **Current state:** member-lookup `meta` field only returns `{"createdAt": "..."}`, UTMs missing
-- **Impact when fixed:** UTM Attribution dashboard populates naturally for new signups
-- **Status:** Tosh acknowledged, running an update on his side
+### Fix 2: UTM params in meta field ✅ SHIPPED
+- Tosh shipped this on April 11, 2026
+- Confirmed: test signup (wilwendt123@gmail.com, ID 992032730) returns utm_source, utm_medium, utm_campaign in meta
+- Live webhook capture now works for new Stripe signups automatically
+- Historical backfill ran: 1,014 active Stripe subs scanned, 6 had UTMs in ymove (rest are pre-UTM-era direct traffic)
 
 ### Squarespace UTM Script (Already Working)
 - Located at: Squarespace > Settings > Advanced > Code Injection > Footer
 - Captures UTMs on landing, persists in 30-day cookies, rewrites all ymove.app links
-- Verified end-to-end working — UTMs reach ymove checkout URL correctly
-- The bug was on Tosh's API side, not our script
+- Verified end-to-end working
+- **UTM tracking scope:** Stripe-only by design. Apple/Google subs go through app stores which strip UTMs. The business strategy is to push users toward Stripe via ymove web checkout, not app store signups.
+- **Open question for Ahmed:** are Klaviyo/Facebook campaign links pointing to movementandmiles.com (where the script runs) or directly to ymove.app (where it doesn't)?
 
 ---
 
@@ -296,23 +297,61 @@ This prevents the morning sync from re-creating duplicates that the cleanup just
 
 ## 10. PROPOSED NEXT STEPS
 
-### Immediate (when Tosh ships fixes)
-1. Manually trigger shadow sync via dashboard
-2. Verify the 58 undetermined records get auto-healed into apple/google/manual
-3. Check UTM Attribution dashboard for new attributed signups
-4. Run Reconciliation Audit to confirm clean state
-5. Compare totals to Tosh, should be within 5 records
+### Immediate
+1. Investigate UTM tracking gaps with Ahmed: are Klaviyo/Facebook links pointing to movementandmiles.com or directly to ymove.app?
+2. Run UTM backfill on cancelled Stripe subs (`status_filter: "all"`) for historical churn-by-channel analysis when needed
+3. Fix data-audit `stripe_active` query to include trialing (one-line fix: `status IN ('active', 'trialing')`)
 
 ### Future Improvements
 - **Fix Gap 1:** Cancel handler should match by source before fallback to most-recent
 - **Stripe reconciliation:** Compare our Stripe count against Stripe API's actual active subs
-- **MRR Trend chart fix** (broken query, deferred from earlier S23)
-- **Investigate trialing methodology** with Tosh (4 Stripe delta)
-- **Deprecate Meg's XLSX import endpoint** once we confirm we'll never use it again
+- **Shadow sync performance:** Currently ~12 minutes for full run. Sequential member-lookup calls in verify phase are the bottleneck. asyncio.gather with semaphore would help.
+- **Investigate trialing methodology** with Tosh (9 Stripe delta)
+- **Auto-expire on status polls:** Currently the 30-min auto-expire only fires on `action: 'run'`, not `action: 'status'`. Dashboard polling never triggers it.
+- **Deprecate Meg's XLSX import endpoint** once confirmed no longer needed
 
 ---
 
-## 11. SESSION 23 ACCOMPLISHMENTS (April 10, 2026)
+## 11. SESSION 24 ACCOMPLISHMENTS (April 11, 2026)
+
+**Major work:**
+1. Confirmed both Tosh API fixes working (subscriptionProvider + UTM meta field)
+2. Ran shadow sync with self-healing: undetermined dropped from 58 → 3
+3. Closed delta with Tosh from 22 records (1.2%) → 18 records (0.95%)
+4. Found + fixed Bug 1: cancelled_ag_map source filter excluded 'manual', letting daily sync reactivate manually-cancelled manual duplicates
+5. Found + fixed Bug 2: daily sync waterfall had no Step 0 email-existence check, creating duplicate ymove_new_* records when provider segment changed in synthetic ID
+6. Built + ran UTM backfill endpoint (POST /api/admin/backfill-utms) with status_filter param
+7. UTM backfill result: 1,014 active Stripe subs scanned, 6 had UTMs (rest are pre-UTM direct traffic). Dashboard Marketing & Attribution section now populated.
+8. Built cleanup-manual-duplicates endpoint for synthetic-only duplicate case that cancel-all-duplicates can't handle
+9. Cleaned 9 manual/manual duplicate records, MRR adjusted down by $179.91/mo (was phantom inflation)
+10. Discovered shadow sync takes ~12 minutes (not ~1 hour as previously believed; the "1 hour" was an orphaned sync from a mid-run Railway redeploy)
+11. Discovered redeploy-kills-sync footgun: pushing to GitHub during shadow sync kills the background task silently, leaving an orphaned DB row
+12. Sent email update to Tosh + Ahmed with UTM tracking status and questions about Klaviyo/Facebook link targets
+13. Confirmed MRR Trend chart fix is NOT a TODO (was already handled in S23 via four commits, the "deferred" flag in context was stale)
+
+**Bugs found and fixed (4 total):**
+- Bug 1: cancelled_ag_map excluded 'manual' source → daily sync reactivated manual cleanup victims
+- Bug 2: daily sync waterfall had no email-existence check → duplicate ymove_new_* records when provider changed
+- Bug 3 (noted, not fixed): data-audit stripe_active excludes trialing, Apple/Google include it (inconsistent)
+- Bug 4 (noted, not fixed): auto-expire only fires on action:'run', not action:'status'
+
+**Code commits (in order):**
+- S24: Fix manual reactivation bug + add UTM backfill endpoint
+- S24: Add Step 0 email-existence check to daily sync waterfall
+- S24: Add status_filter to backfill-utms (default active+trialing only)
+- S24: Add cleanup-manual-duplicates endpoint for synthetic-only case
+
+**Numbers before/after S24:**
+- Before: 1,867 active, 58 undetermined, 0 duplicate emails, delta with Tosh: 22
+- After: 1,871 active+trialing, 3 undetermined, 0 duplicate emails, delta with Tosh: +12 (Tosh's numbers ~36h old)
+- MRR: $33,518.69 → $33,338.78 (removed $179.91 duplicate inflation)
+- UTM Attribution: 0 attributed subs → 7 attributed subs (dashboard live)
+
+---
+
+## 12. SESSION HISTORY (Earlier Sessions for Context)
+
+### Session 23 (April 10, 2026) — Provider overhaul + audit tooling
 
 **Major work:**
 1. Fixed provider defaulting bug across 8 code locations ("apple" → "undetermined")
