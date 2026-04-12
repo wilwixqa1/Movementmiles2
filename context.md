@@ -312,6 +312,7 @@ This prevents the morning sync from re-creating duplicates that the cleanup just
 4. Fix data-audit `stripe_active` query to include trialing (one-line fix: `status IN ('active', 'trialing')`)
 
 ### Future Improvements
+- **Crack the persistent ~1% delta with Tosh.** We've been at "small but stubborn" for several sessions. Aggregate count comparisons can't isolate which records actually differ. The right approach: get a per-email side-by-side join (every active email in both systems, with source on each side) to identify exactly which records are missing on which side. Likely blocked on either getting a CSV export from Tosh or fixing our bulk endpoint pagination so it actually returns all active subscribers (it currently caps somewhere around 735 in scans). Once we have the diff, the gap stops being a mystery and becomes a list of names to investigate — probably resolves to one or two patterns (a date window of missed webhooks, a provider mismatch class, etc).
 - **Fix Gap 1:** Cancel handler should match by source before fallback to most-recent
 - **Stripe reconciliation:** Compare our Stripe count against Stripe API's actual active subs
 - **Shadow sync performance:** Currently ~12 minutes for full run. Sequential member-lookup calls in verify phase are the bottleneck. asyncio.gather with semaphore would help.
