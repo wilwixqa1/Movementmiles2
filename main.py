@@ -7114,6 +7114,97 @@ async def ymove_diff(request: Request):
     }
 
 
+# --- Session 25: Reactivate kelsey (id=11315) ---
+
+@app.post("/api/admin/reactivate-kelsey-s25")
+async def reactivate_kelsey_s25(request: Request):
+    """S25 Step 4 (revised): Reactivate the existing cancelled Apple record for kelseymsimms.
+    Hardcoded id=11315, with defensive checks that the record matches what we expect.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "No database connected"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply = bool(body.get("apply", False))
+
+    EXPECTED_ID = 11315
+    EXPECTED_EMAIL = "kelseymsimms@gmail.com"
+    EXPECTED_SOURCE = "apple"
+    EXPECTED_STATUS_BEFORE = "canceled"
+    EXPECTED_BATCH_PREFIX = "shadow_6_"
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, source, status, stripe_subscription_id, plan_amount, import_batch, canceled_at FROM subscriptions WHERE id = $1",
+            EXPECTED_ID
+        )
+        if not row:
+            return JSONResponse(status_code=404, content={"error": f"id={EXPECTED_ID} not found"})
+
+        # Defensive checks
+        checks = {
+            "email_matches": row["email"].lower() == EXPECTED_EMAIL,
+            "source_matches": row["source"] == EXPECTED_SOURCE,
+            "status_matches": row["status"] == EXPECTED_STATUS_BEFORE,
+            "batch_matches": (row["import_batch"] or "").startswith(EXPECTED_BATCH_PREFIX),
+        }
+        all_passed = all(checks.values())
+
+        record = {
+            "id": row["id"],
+            "email": row["email"],
+            "source": row["source"],
+            "status": row["status"],
+            "sub_id": row["stripe_subscription_id"],
+            "plan_amount": row["plan_amount"],
+            "import_batch": row["import_batch"],
+            "canceled_at": row["canceled_at"].isoformat() if row["canceled_at"] else None,
+        }
+
+        if not all_passed:
+            return {
+                "mode": "blocked",
+                "reason": "Defensive check failed — record does not match expected state",
+                "checks": checks,
+                "record": record,
+            }
+
+        if not apply:
+            return {
+                "mode": "preview",
+                "checks": checks,
+                "record": record,
+                "action": "Will set status='active', canceled_at=NULL, append S25 batch tag",
+                "next_step": 'POST again with {"apply": true} to commit',
+            }
+
+        from datetime import datetime as _dt
+        batch_tag = f"s25_kelsey_reactivate_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        await conn.execute(
+            """UPDATE subscriptions
+               SET status = 'active',
+                   canceled_at = NULL,
+                   reactivated_at = NOW(),
+                   updated_at = NOW(),
+                   import_batch = COALESCE(import_batch, '') || ' ' || $1
+               WHERE id = $2 AND status = 'canceled'""",
+            batch_tag, EXPECTED_ID
+        )
+
+        return {
+            "mode": "applied",
+            "batch_tag": batch_tag,
+            "id": EXPECTED_ID,
+            "record_before": record,
+            "reversal_hint": f"To revert: UPDATE subscriptions SET status='canceled', canceled_at=NOW() WHERE id={EXPECTED_ID}",
+        }
+
+
 # --- Session 25: Diagnostic — find false-cancelled records ---
 
 @app.post("/api/admin/find-false-cancelled-s25")
