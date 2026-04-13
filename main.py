@@ -3173,6 +3173,10 @@ async def _run_shadow_sync(run_id: int):
         unchanged = 0
         not_found = []
         verify_errors = 0
+        # S26 Bug B fix: records where individual lookup said 'expired' but bulk pull
+        # says 'subscribed'. Possible transient ymove glitch (the Kelsey case).
+        # Do NOT deactivate these — flag for review instead.
+        conflicting_expired_vs_bulk = []
 
         # Categorize our active subs based on ymove verification
         for email, ymove_status in verify_results.items():
@@ -3181,13 +3185,27 @@ async def _run_shadow_sync(run_id: int):
             elif ymove_status == "expired":
                 r = our_active_lookup.get(email)
                 if r:
-                    to_deactivate.append({
-                        "email": email,
-                        "sub_id": r["stripe_subscription_id"],
-                        "source": r["source"],
-                        "plan_amount": r["plan_amount"],
-                        "db_id": r["id"],
-                    })
+                    # S26 Bug B: cross-check the bulk pull. Only deactivate if bulk also agrees.
+                    # If bulk pull failed or returned 0 results, fall through to old behavior
+                    # (otherwise a single bulk failure would freeze all deactivations).
+                    bulk_pull_usable = (pull_all_status == "success" and len(ymove_all_emails) > 0)
+                    if bulk_pull_usable and email in ymove_all_emails:
+                        # Conflict: individual says expired, bulk says subscribed. Defer.
+                        conflicting_expired_vs_bulk.append({
+                            "email": email,
+                            "sub_id": r["stripe_subscription_id"],
+                            "source": r["source"],
+                            "db_id": r["id"],
+                            "bulk_provider": ymove_all_emails.get(email),
+                        })
+                    else:
+                        to_deactivate.append({
+                            "email": email,
+                            "sub_id": r["stripe_subscription_id"],
+                            "source": r["source"],
+                            "plan_amount": r["plan_amount"],
+                            "db_id": r["id"],
+                        })
             elif ymove_status == "not_found":
                 r = our_active_lookup.get(email)
                 if r:
@@ -3238,6 +3256,7 @@ async def _run_shadow_sync(run_id: int):
             "pull_all_emails_found": len(ymove_all_emails),
             "verified_count": len(verify_results),
             "provider_healed": provider_healed,
+            "s26_conflicting_expired_vs_bulk": conflicting_expired_vs_bulk,
         }
 
         async with db_pool.acquire() as conn:
