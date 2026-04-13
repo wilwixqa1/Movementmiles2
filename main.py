@@ -9056,6 +9056,185 @@ async def apple_metrics(request: Request):
     }
 
 
+# --- S26 Phase 4: Daily expiry sweep ---
+# Marks pending-cancel records as truly canceled when their pending_cancel_at <= now().
+# Run manually first via the endpoint; once verified, can be wired into shadow sync auto-run.
+
+async def s26_expire_pending_cancels(conn) -> dict:
+    """Find all cancel_state='pending' records whose pending_cancel_at has passed
+    and mark them fully canceled. Returns count + sample for logging."""
+    now_utc = datetime.now(timezone.utc)
+    rows = await conn.fetch(
+        """SELECT id, email, stripe_subscription_id, source, pending_cancel_at
+           FROM subscriptions
+           WHERE cancel_state = 'pending'
+             AND pending_cancel_at IS NOT NULL
+             AND pending_cancel_at <= $1
+             AND status IN ('active', 'trialing')""",
+        now_utc
+    )
+    expired = []
+    for r in rows:
+        try:
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET status = 'canceled',
+                       canceled_at = COALESCE(canceled_at, NOW()),
+                       cancel_state = 'expired',
+                       updated_at = NOW()
+                   WHERE id = $1""",
+                r["id"]
+            )
+            expired.append({
+                "id": r["id"],
+                "email": r["email"],
+                "sub_id": r["stripe_subscription_id"],
+                "source": r["source"],
+                "pending_cancel_at": r["pending_cancel_at"].isoformat() if r["pending_cancel_at"] else None,
+            })
+        except Exception as e:
+            print(f"[S26 Sweep] Error expiring id={r['id']}: {e}")
+    return {"expired_count": len(expired), "expired_sample": expired[:25]}
+
+
+@app.post("/api/admin/s26-expire-sweep")
+async def s26_expire_sweep_endpoint(request: Request):
+    """Manual trigger for the period-end expiry sweep."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    async with db_pool.acquire() as conn:
+        result = await s26_expire_pending_cancels(conn)
+    return {"status": "ok", **result}
+
+
+# --- S26 Phase 5: Backfill mis-cancelled Stripe records ---
+# Reactivates Stripe records that were canceled under old click-time semantics
+# but whose current_period_end is still in the future. Sets cancel_state='pending'.
+# Preview/apply pattern: pass preview=false to actually apply changes.
+
+@app.post("/api/admin/s26-backfill-pending")
+async def s26_backfill_pending(request: Request):
+    """Reactivate mis-cancelled Stripe records as cancel_state='pending' if still in grace.
+    Pass JSON {"preview": false, "days": 60} to apply. Default is preview-only."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = body.get("preview", True)
+    days = max(1, min(int(body.get("days", 60)), 365))
+
+    batch_id = f"s26_backfill_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, stripe_subscription_id, canceled_at
+               FROM subscriptions
+               WHERE status = 'canceled'
+                 AND source = 'stripe'
+                 AND stripe_subscription_id LIKE 'sub_%'
+                 AND canceled_at IS NOT NULL
+                 AND canceled_at > NOW() - ($1 || ' days')::INTERVAL
+               ORDER BY canceled_at DESC""",
+            str(days)
+        )
+
+    import stripe as _s26_stripe
+    _s26_stripe.api_key = STRIPE_SECRET_KEY
+    to_reactivate = []
+    skipped_expired = []
+    skipped_dispute = []
+    not_found = []
+    errors = []
+
+    for r in rows:
+        sub_id = r["stripe_subscription_id"]
+        try:
+            real = _s26_stripe.Subscription.retrieve(sub_id)
+            pe = real.get("current_period_end")
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            cancellation = real.get("cancellation_details") or {}
+            reason = cancellation.get("reason") or ""
+
+            # Skip if cancelled for payment failure / dispute / fraud
+            if reason in ("payment_failed", "payment_disputed"):
+                skipped_dispute.append({"id": r["id"], "email": r["email"], "reason": reason})
+                continue
+
+            if pe and pe > now_ts:
+                to_reactivate.append({
+                    "id": r["id"],
+                    "email": r["email"],
+                    "sub_id": sub_id,
+                    "period_end": datetime.fromtimestamp(pe, tz=timezone.utc).isoformat(),
+                    "reason": reason or None,
+                })
+            else:
+                skipped_expired.append({"id": r["id"], "email": r["email"], "period_end_ts": pe})
+        except _s26_stripe.error.InvalidRequestError:
+            not_found.append({"id": r["id"], "email": r["email"], "sub_id": sub_id})
+        except Exception as e:
+            errors.append({"id": r["id"], "email": r["email"], "error": str(e)})
+
+    if preview:
+        return {
+            "status": "preview",
+            "batch_id": batch_id,
+            "scanned_days": days,
+            "candidates_total": len(rows),
+            "would_reactivate": len(to_reactivate),
+            "skipped_truly_expired": len(skipped_expired),
+            "skipped_dispute_or_failure": len(skipped_dispute),
+            "not_found_in_stripe": len(not_found),
+            "errors": len(errors),
+            "reactivate_sample": to_reactivate[:50],
+            "skipped_dispute_sample": skipped_dispute[:10],
+            "not_found_sample": not_found[:10],
+            "errors_sample": errors[:10],
+            "note": "Send {\"preview\": false} to apply.",
+        }
+
+    # APPLY
+    reactivated = 0
+    apply_errors = 0
+    async with db_pool.acquire() as conn:
+        for item in to_reactivate:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET status = 'active',
+                           canceled_at = NULL,
+                           reactivated_at = NOW(),
+                           cancel_state = 'pending',
+                           pending_cancel_at = $1,
+                           cancel_requested_at = COALESCE(cancel_requested_at, canceled_at, NOW()),
+                           import_batch = $2,
+                           updated_at = NOW()
+                       WHERE id = $3 AND status = 'canceled'""",
+                    datetime.fromisoformat(item["period_end"]), batch_id, item["id"]
+                )
+                reactivated += 1
+            except Exception as e:
+                print(f"[S26 Backfill] Error id={item['id']}: {e}")
+                apply_errors += 1
+
+    return {
+        "status": "applied",
+        "batch_id": batch_id,
+        "reactivated": reactivated,
+        "errors": apply_errors,
+        "note": f"Reversible via batch_id={batch_id}",
+    }
+
+
 # --- S26 Phase 1: Period-end cancellation diagnostic (read-only) ---
 # Lists Stripe-source records that are currently marked 'canceled' in our DB
 # but whose Stripe current_period_end is still in the future. These are records
