@@ -9282,6 +9282,53 @@ async def s26_backfill_pending(request: Request):
     }
 
 
+# --- S26: Lookup records by import_batch (read-only) ---
+
+@app.get("/api/admin/s26-batch-lookup")
+async def s26_batch_lookup(request: Request, batch: str = ""):
+    """READ-ONLY. Returns id, email, plan_amount, plan_interval, status,
+    cancel_state for all records with the given import_batch (exact match
+    or substring)."""
+    pw = request.query_params.get("pw") or request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not batch:
+        raise HTTPException(status_code=400, detail="Pass ?batch=...")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, stripe_subscription_id, source, status, cancel_state,
+                      plan_amount, plan_interval, pending_cancel_at, import_batch
+               FROM subscriptions
+               WHERE import_batch LIKE '%' || $1 || '%'
+               ORDER BY id""",
+            batch
+        )
+    # Compute normalized MRR contribution
+    total_mrr_cents = 0
+    records = []
+    for r in rows:
+        d = dict(r)
+        if r["plan_interval"] == "month":
+            contrib = r["plan_amount"] or 0
+        elif r["plan_interval"] == "year":
+            contrib = (r["plan_amount"] or 0) // 12
+        else:
+            contrib = 0
+        if r["status"] in ("active", "trialing"):
+            total_mrr_cents += contrib
+        d["mrr_contribution_cents"] = contrib
+        d["pending_cancel_at"] = r["pending_cancel_at"].isoformat() if r["pending_cancel_at"] else None
+        records.append(d)
+    return {
+        "status": "ok",
+        "count": len(records),
+        "total_mrr_cents_added": total_mrr_cents,
+        "total_mrr_display": f"${total_mrr_cents/100:,.2f}/mo",
+        "records": records,
+    }
+
+
 # --- S26: Fuzzy email-match diagnostic for historical Stripe records ---
 # Tosh's S25 response showed that some "missing from ymove" Stripe records are
 # actually present in ymove under a slightly different email (e.g. amets30 vs
