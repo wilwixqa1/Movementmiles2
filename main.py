@@ -9254,6 +9254,67 @@ async def s26_backfill_pending(request: Request):
     }
 
 
+# --- S26 one-off: Markus reactivation + email typo fix ---
+# Markus is a real ymove user (markus.zwigart@gmx.de) who entered a typo in Stripe
+# checkout (markus.zwigart@gmx.dr). S25 cancelled him as junk. This endpoint
+# reactivates AND fixes the email so future shadow syncs match correctly.
+# Hardcoded id + emails for safety.
+
+@app.post("/api/admin/s26-fix-markus")
+async def s26_fix_markus(request: Request):
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    target_id = 1662
+    expected_old_email = "markus.zwigart@gmx.dr"
+    new_email = "markus.zwigart@gmx.de"
+    batch_id = f"s26_markus_fix_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, status, stripe_subscription_id FROM subscriptions WHERE id = $1",
+            target_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"id {target_id} not found")
+        if (row["email"] or "").lower() != expected_old_email.lower():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Safety check failed: expected email {expected_old_email}, found {row['email']}"
+            )
+        # Check no other active sub already exists for the new email
+        dup = await conn.fetchrow(
+            "SELECT id FROM subscriptions WHERE lower(email) = lower($1) AND status IN ('active', 'trialing') LIMIT 1",
+            new_email
+        )
+        if dup:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An active sub already exists for {new_email} (id {dup['id']}). Manual review needed."
+            )
+        await conn.execute(
+            """UPDATE subscriptions
+               SET status = 'active',
+                   email = $1,
+                   canceled_at = NULL,
+                   reactivated_at = NOW(),
+                   import_batch = $2,
+                   updated_at = NOW()
+               WHERE id = $3""",
+            new_email, batch_id, target_id
+        )
+    return {
+        "status": "ok",
+        "batch_id": batch_id,
+        "id": target_id,
+        "old_email": expected_old_email,
+        "new_email": new_email,
+        "note": f"Reversible via batch_id={batch_id}",
+    }
+
+
 # --- S26 Phase 1: Period-end cancellation diagnostic (read-only) ---
 # Lists Stripe-source records that are currently marked 'canceled' in our DB
 # but whose Stripe current_period_end is still in the future. These are records
