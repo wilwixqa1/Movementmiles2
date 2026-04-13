@@ -816,6 +816,65 @@ async def stripe_webhook(request: Request):
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
 
+            # S26 Phase 2: Period-end cancellation semantics
+            # Stripe model: cancel click sets cancel_at_period_end=true, status stays active.
+            # subscription.deleted only fires when the period actually ends (or immediate cancel).
+            # We mirror that: track cancel intent in cancel_state='pending', only mark canceled when expired.
+            try:
+                cape = sub.get("cancel_at_period_end", False)
+                period_end_ts = sub.get("current_period_end")
+                now_utc_ts = int(datetime.now(timezone.utc).timestamp())
+
+                if event_type == "customer.subscription.deleted":
+                    # If period_end is still in the future, this is a click-cancel. Hold in pending.
+                    if period_end_ts and period_end_ts > now_utc_ts:
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET status = CASE WHEN status = 'canceled' THEN 'active' ELSE status END,
+                                   canceled_at = NULL,
+                                   cancel_state = 'pending',
+                                   pending_cancel_at = $1,
+                                   cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+                                   updated_at = NOW()
+                               WHERE stripe_subscription_id = $2""",
+                            datetime.fromtimestamp(period_end_ts, tz=timezone.utc), sub_id
+                        )
+                        print(f"[S26] Stripe cancel held in grace until {period_end_ts}: {sub_id}")
+                    else:
+                        # Period truly expired (or no period_end) — full cancel.
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET cancel_state = 'expired', updated_at = NOW()
+                               WHERE stripe_subscription_id = $1""",
+                            sub_id
+                        )
+                elif event_type == "customer.subscription.updated":
+                    if cape and status in ("active", "trialing"):
+                        # User clicked cancel; sub still active until period_end.
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET cancel_state = 'pending',
+                                   pending_cancel_at = $1,
+                                   cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+                                   updated_at = NOW()
+                               WHERE stripe_subscription_id = $2""",
+                            datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None, sub_id
+                        )
+                    elif (not cape) and status in ("active", "trialing"):
+                        # Uncancel: user reversed their cancellation while still in grace.
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET cancel_state = NULL,
+                                   pending_cancel_at = NULL,
+                                   cancel_requested_at = NULL,
+                                   updated_at = NOW()
+                               WHERE stripe_subscription_id = $1
+                                 AND cancel_state = 'pending'""",
+                            sub_id
+                        )
+            except Exception as e:
+                print(f"[S26] Period-end cancel handler error: {e}")
+
             # Session 11: Assign readable_id if not yet set
             try:
                 existing = await conn.fetchrow(
@@ -1415,10 +1474,40 @@ async def _ymove_handle_cancelled(conn, event_data: dict, email: str, ymove_user
             email
         )
         if active_sub:
-            await conn.execute(
-                "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
-                active_sub["id"]
-            )
+            # S26 Phase 3: For Stripe records, check period_end before cancelling.
+            # Apple/Google use ymove's period-end semantics already — trust ymove for those.
+            src = (active_sub.get("source") or "").lower()
+            sub_id_check = active_sub.get("stripe_subscription_id") or ""
+            handled_pending = False
+
+            if src == "stripe" and sub_id_check.startswith("sub_") and STRIPE_SECRET_KEY:
+                try:
+                    import stripe as _s26_stripe
+                    _s26_stripe.api_key = STRIPE_SECRET_KEY
+                    _real = _s26_stripe.Subscription.retrieve(sub_id_check)
+                    _pe = _real.get("current_period_end")
+                    _now_ts = int(datetime.now(timezone.utc).timestamp())
+                    if _pe and _pe > _now_ts:
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET cancel_state = 'pending',
+                                   pending_cancel_at = $1,
+                                   cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+                                   updated_at = NOW()
+                               WHERE id = $2""",
+                            datetime.fromtimestamp(_pe, tz=timezone.utc), active_sub["id"]
+                        )
+                        handled_pending = True
+                        print(f"[S26 ymove] Held Stripe cancel in grace for {email}")
+                except Exception as _e:
+                    print(f"[S26 ymove] Period-end check error for {sub_id_check}: {_e}")
+
+            if not handled_pending:
+                await conn.execute(
+                    """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                       cancel_state = 'expired', updated_at = NOW() WHERE id = $1""",
+                    active_sub["id"]
+                )
             print(f"[ymove] Cancelled {active_sub['source']} sub {active_sub['stripe_subscription_id']} for {email}")
         else:
             print(f"[ymove] No active sub found for {email} to cancel")
@@ -3210,13 +3299,48 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
     async with db_pool.acquire() as conn:
         for item in to_deactivate:
             try:
-                result = await conn.execute(
-                    """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
-                       updated_at = NOW(), import_batch = $1
-                       WHERE id = $2 AND status IN ('active', 'trialing')""",
-                    batch_id, item["db_id"]
-                )
-                if result and result.endswith("1"):
+                # S26 Phase 3: For Stripe-source records, check Stripe API for period_end
+                # before cancelling. If still in grace period, set pending state instead.
+                # For Apple/Google, trust ymove (it already uses period-end semantics).
+                src = (item.get("source") or "").lower()
+                sub_id_check = item.get("stripe_subscription_id") or ""
+                handled_as_pending = False
+
+                if src == "stripe" and sub_id_check.startswith("sub_") and STRIPE_SECRET_KEY:
+                    try:
+                        import stripe as _s26_stripe
+                        _s26_stripe.api_key = STRIPE_SECRET_KEY
+                        _real = _s26_stripe.Subscription.retrieve(sub_id_check)
+                        _pe = _real.get("current_period_end")
+                        _now_ts = int(datetime.now(timezone.utc).timestamp())
+                        if _pe and _pe > _now_ts:
+                            await conn.execute(
+                                """UPDATE subscriptions
+                                   SET cancel_state = 'pending',
+                                       pending_cancel_at = $1,
+                                       cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+                                       import_batch = $2,
+                                       updated_at = NOW()
+                                   WHERE id = $3 AND status IN ('active', 'trialing')""",
+                                datetime.fromtimestamp(_pe, tz=timezone.utc), batch_id, item["db_id"]
+                            )
+                            handled_as_pending = True
+                            print(f"[S26 ShadowSync] Held Stripe cancel in grace: {item.get('email')}")
+                    except Exception as _e:
+                        print(f"[S26 ShadowSync] Period-end check error for {sub_id_check}: {_e}")
+                        # Fall through to normal cancel on error
+
+                if not handled_as_pending:
+                    result = await conn.execute(
+                        """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                           cancel_state = 'expired',
+                           updated_at = NOW(), import_batch = $1
+                           WHERE id = $2 AND status IN ('active', 'trialing')""",
+                        batch_id, item["db_id"]
+                    )
+                    if result and result.endswith("1"):
+                        deactivated += 1
+                else:
                     deactivated += 1
             except Exception as e:
                 print(f"[Shadow Sync Apply] Deactivate error {item.get('email')}: {e}")
