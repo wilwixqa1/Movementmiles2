@@ -242,6 +242,14 @@ async def startup():
             # Block 3c: reactivated_at column + backfill (S23)
             async with db_pool.acquire() as conn:
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS reactivated_at TIMESTAMPTZ")
+                # S26: Period-end cancellation semantics
+                # cancel_state: NULL = not cancelled, 'pending' = cancel requested but still in paid period,
+                #               'expired' = period ended, fully cancelled
+                # pending_cancel_at: when paid period ends (status stays active until then)
+                # cancel_requested_at: when user actually clicked cancel (for analytics)
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_cancel_at TIMESTAMPTZ")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_state TEXT")
                 # Backfill: tag subs reactivated by ymove verification batches
                 backfilled = await conn.execute(
                     """UPDATE subscriptions SET reactivated_at = updated_at
@@ -8923,6 +8931,94 @@ async def apple_metrics(request: Request):
         "days_with_data": len(daily_data),
     }
 
+
+# --- S26 Phase 1: Period-end cancellation diagnostic (read-only) ---
+# Lists Stripe-source records that are currently marked 'canceled' in our DB
+# but whose Stripe current_period_end is still in the future. These are records
+# that Phase 4 (backfill) will reactivate as cancel_state='pending'.
+
+@app.get("/api/admin/s26-pending-cancel-diagnostic")
+async def s26_pending_cancel_diagnostic(request: Request, days: int = 60):
+    """READ-ONLY: scan recently-cancelled Stripe records and check Stripe API
+    for current_period_end. Records with period_end > now() were mis-cancelled
+    under the old click-time semantics and should be in pending state.
+    """
+    pw = request.query_params.get("pw") or request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    cutoff_days = max(1, min(days, 365))
+    candidates = []
+    in_grace = []
+    truly_expired = []
+    not_found = []
+    errors = []
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, stripe_subscription_id, source, status,
+                      canceled_at, created_at
+               FROM subscriptions
+               WHERE status = 'canceled'
+                 AND source = 'stripe'
+                 AND stripe_subscription_id LIKE 'sub_%'
+                 AND canceled_at IS NOT NULL
+                 AND canceled_at > NOW() - ($1 || ' days')::INTERVAL
+               ORDER BY canceled_at DESC""",
+            str(cutoff_days)
+        )
+
+    candidates = [dict(r) for r in rows]
+
+    import stripe as stripe_lib
+    stripe_lib.api_key = STRIPE_SECRET_KEY
+
+    for c in candidates:
+        sub_id = c["stripe_subscription_id"]
+        try:
+            real_sub = stripe_lib.Subscription.retrieve(sub_id)
+            period_end = real_sub.get("current_period_end")
+            cape = real_sub.get("cancel_at_period_end")
+            real_status = real_sub.get("status")
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            entry = {
+                "id": c["id"],
+                "email": c["email"],
+                "sub_id": sub_id,
+                "our_canceled_at": c["canceled_at"].isoformat() if c["canceled_at"] else None,
+                "stripe_status": real_status,
+                "stripe_period_end": datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat() if period_end else None,
+                "stripe_cancel_at_period_end": cape,
+            }
+            if period_end and period_end > now_ts:
+                entry["bucket"] = "in_grace"
+                in_grace.append(entry)
+            else:
+                entry["bucket"] = "truly_expired"
+                truly_expired.append(entry)
+        except stripe_lib.error.InvalidRequestError:
+            not_found.append({"id": c["id"], "email": c["email"], "sub_id": sub_id})
+        except Exception as e:
+            errors.append({"id": c["id"], "email": c["email"], "sub_id": sub_id, "error": str(e)})
+
+    return {
+        "status": "ok",
+        "scanned_days": cutoff_days,
+        "candidates_total": len(candidates),
+        "in_grace_count": len(in_grace),
+        "truly_expired_count": len(truly_expired),
+        "not_found_count": len(not_found),
+        "errors_count": len(errors),
+        "in_grace_sample": in_grace[:50],
+        "in_grace_full": in_grace,
+        "truly_expired_sample": truly_expired[:10],
+        "not_found_sample": not_found[:10],
+        "errors_sample": errors[:10],
+        "note": "READ-ONLY. 'in_grace' records are candidates for Phase 4 backfill (reactivate as cancel_state='pending').",
+    }
 
 
 # --- Static + Routing ---
