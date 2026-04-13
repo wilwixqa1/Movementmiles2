@@ -9144,7 +9144,7 @@ async def s26_backfill_pending(request: Request):
                  AND stripe_subscription_id LIKE 'sub_%'
                  AND canceled_at IS NOT NULL
                  AND canceled_at > NOW() - ($1 || ' days')::INTERVAL
-                 AND (import_batch IS NULL OR import_batch NOT LIKE 's25_test_cancel_%')
+                 AND (import_batch IS NULL OR import_batch NOT LIKE '%s25_test_cancel_%')
                ORDER BY canceled_at DESC""",
             str(days)
         )
