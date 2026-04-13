@@ -9131,32 +9131,48 @@ async def s26_backfill_pending(request: Request):
         body = {}
     preview = body.get("preview", True)
     days = max(1, min(int(body.get("days", 60)), 365))
+    id_skip = set(int(x) for x in body.get("id_skip", []))
 
     batch_id = f"s26_backfill_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, email, stripe_subscription_id, canceled_at
+            """SELECT id, email, stripe_subscription_id, canceled_at, import_batch
                FROM subscriptions
                WHERE status = 'canceled'
                  AND source = 'stripe'
                  AND stripe_subscription_id LIKE 'sub_%'
                  AND canceled_at IS NOT NULL
                  AND canceled_at > NOW() - ($1 || ' days')::INTERVAL
+                 AND (import_batch IS NULL OR import_batch NOT LIKE 's25_test_cancel_%')
                ORDER BY canceled_at DESC""",
             str(days)
         )
+        # Build set of emails that already have an active sub elsewhere
+        active_emails_rows = await conn.fetch(
+            "SELECT DISTINCT lower(email) AS em FROM subscriptions WHERE status IN ('active', 'trialing') AND email IS NOT NULL AND email != ''"
+        )
+        active_emails = set(r["em"] for r in active_emails_rows)
 
     import stripe as _s26_stripe
     _s26_stripe.api_key = STRIPE_SECRET_KEY
     to_reactivate = []
     skipped_expired = []
     skipped_dispute = []
+    skipped_dup_active = []
+    skipped_id_list = []
     not_found = []
     errors = []
 
     for r in rows:
         sub_id = r["stripe_subscription_id"]
+        if r["id"] in id_skip:
+            skipped_id_list.append({"id": r["id"], "email": r["email"]})
+            continue
+        # Skip if email already has another active sub
+        if r["email"] and r["email"].strip().lower() in active_emails:
+            skipped_dup_active.append({"id": r["id"], "email": r["email"], "sub_id": sub_id})
+            continue
         try:
             real = _s26_stripe.Subscription.retrieve(sub_id)
             pe = real.get("current_period_end")
@@ -9193,13 +9209,16 @@ async def s26_backfill_pending(request: Request):
             "would_reactivate": len(to_reactivate),
             "skipped_truly_expired": len(skipped_expired),
             "skipped_dispute_or_failure": len(skipped_dispute),
+            "skipped_dup_active_email": len(skipped_dup_active),
+            "skipped_by_id_list": len(skipped_id_list),
             "not_found_in_stripe": len(not_found),
             "errors": len(errors),
             "reactivate_sample": to_reactivate[:50],
+            "skipped_dup_active_sample": skipped_dup_active[:10],
             "skipped_dispute_sample": skipped_dispute[:10],
             "not_found_sample": not_found[:10],
             "errors_sample": errors[:10],
-            "note": "Send {\"preview\": false} to apply.",
+            "note": "Send {\"preview\": false} to apply. Use {\"id_skip\": [123, 456]} to exclude specific ids. Records with import_batch starting 's25_test_cancel_' are auto-excluded.",
         }
 
     # APPLY
