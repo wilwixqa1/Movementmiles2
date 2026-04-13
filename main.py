@@ -9282,6 +9282,128 @@ async def s26_backfill_pending(request: Request):
     }
 
 
+# --- S26: Fuzzy email-match diagnostic for historical Stripe records ---
+# Tosh's S25 response showed that some "missing from ymove" Stripe records are
+# actually present in ymove under a slightly different email (e.g. amets30 vs
+# amets20, or alessandracelia.volpato vs alessandraclelia.volpato).
+# This is read-only: takes a list of candidate Stripe sub_ids, pulls customer
+# name from Stripe, then searches our DB for active records with similar
+# names or local-part. Outputs candidates for manual review. No writes.
+
+def _s26_levenshtein(a: str, b: str) -> int:
+    """Tiny Levenshtein distance, no external deps."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(
+                prev[j] + 1,
+                curr[j - 1] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            )
+        prev = curr
+    return prev[-1]
+
+
+@app.post("/api/admin/s26-fuzzy-email-match")
+async def s26_fuzzy_email_match(request: Request):
+    """READ-ONLY: For each candidate Stripe sub_id, fetch customer name from Stripe,
+    then search ALL ymove-source emails in our DB for fuzzy matches by name + local-part.
+    Body: {"sub_ids": ["sub_xxx", ...]}  (defaults to S25 historical 8 if omitted)
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Default candidates: the 8 historical Stripe emails from S25 wrap
+    default_emails = [
+        "abbey.e.baier@gmail.com", "ahfouch@gmail.com",
+        "alessandraclelia.volpato@gmail.com", "amets30@yahoo.com",
+        "andreedesrochers@gmail.com", "cassyroop@gmail.com",
+        "chloe.levray@gmail.com", "hstrandness@gmail.com",
+    ]
+    candidate_emails = body.get("emails", default_emails)
+
+    import stripe as _s26_stripe
+    _s26_stripe.api_key = STRIPE_SECRET_KEY
+
+    # Pull all known emails + names from our DB once
+    async with db_pool.acquire() as conn:
+        known = await conn.fetch(
+            """SELECT lower(email) AS email, first_name, last_name, source, status,
+                      stripe_subscription_id
+               FROM subscriptions
+               WHERE email IS NOT NULL AND email != ''"""
+        )
+
+    db_by_email = {r["email"]: dict(r) for r in known}
+    all_db_emails = list(db_by_email.keys())
+
+    results = []
+    for src_email in candidate_emails:
+        src_email_l = src_email.strip().lower()
+        entry = {"candidate_email": src_email_l, "stripe_customer_name": None,
+                 "exact_match_in_db": src_email_l in db_by_email,
+                 "matches": []}
+
+        # Find the Stripe customer for this email via the subscription record in our DB
+        our_rec = db_by_email.get(src_email_l)
+        if our_rec and (our_rec.get("stripe_subscription_id") or "").startswith("sub_"):
+            try:
+                real = _s26_stripe.Subscription.retrieve(our_rec["stripe_subscription_id"])
+                cust_id = real.get("customer")
+                if cust_id:
+                    cust = _s26_stripe.Customer.retrieve(cust_id)
+                    entry["stripe_customer_name"] = cust.get("name") or ""
+            except Exception as e:
+                entry["stripe_lookup_error"] = str(e)
+
+        # Compute fuzzy matches in our DB
+        local_part = src_email_l.split("@")[0]
+        cand_name_lower = (entry["stripe_customer_name"] or "").lower().strip()
+
+        for db_email, rec in db_by_email.items():
+            if db_email == src_email_l:
+                continue
+            if rec["status"] not in ("active", "trialing"):
+                continue
+            db_local = db_email.split("@")[0]
+            local_dist = _s26_levenshtein(local_part, db_local)
+            db_name = ((rec.get("first_name") or "") + " " + (rec.get("last_name") or "")).lower().strip()
+            name_match = bool(cand_name_lower and db_name and (cand_name_lower in db_name or db_name in cand_name_lower))
+
+            if local_dist <= 3 or name_match:
+                entry["matches"].append({
+                    "db_email": db_email,
+                    "db_name": db_name or None,
+                    "source": rec["source"],
+                    "local_part_distance": local_dist,
+                    "name_match": name_match,
+                    "sub_id": rec["stripe_subscription_id"],
+                })
+
+        # Sort matches by best (low distance, name match wins ties)
+        entry["matches"].sort(key=lambda m: (0 if m["name_match"] else 1, m["local_part_distance"]))
+        entry["matches"] = entry["matches"][:5]
+        results.append(entry)
+
+    return {"status": "ok", "candidates_checked": len(results), "results": results}
+
+
 # --- S26 one-off: Markus reactivation + email typo fix ---
 # Markus is a real ymove user (markus.zwigart@gmx.de) who entered a typo in Stripe
 # checkout (markus.zwigart@gmx.dr). S25 cancelled him as junk. This endpoint
