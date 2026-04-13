@@ -2951,6 +2951,15 @@ async def _run_shadow_sync(run_id: int):
     try:
         print(f"[Shadow Sync] Run {run_id} starting...")
 
+        # S26 Phase 0: Expire any pending-cancel records whose period_end has passed.
+        # Runs first so the rest of the sync sees the post-expiry state.
+        try:
+            async with db_pool.acquire() as conn:
+                _sweep_result = await s26_expire_pending_cancels(conn)
+            print(f"[Shadow Sync] S26 expiry sweep: {_sweep_result.get('expired_count', 0)} records expired")
+        except Exception as _se:
+            print(f"[Shadow Sync] S26 expiry sweep error (non-fatal): {_se}")
+
         # --- Gather our DB state ---
         async with db_pool.acquire() as conn:
             # All our active Apple/Google/undetermined subs with email
