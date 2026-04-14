@@ -10674,6 +10674,99 @@ async def s28_cleanup(request: Request):
     }
 
 
+# --- S28: Diagnostic for the +3 Stripe drift between full dump and cleanup apply ---
+# Lists every Stripe-source active+trialing record created or updated after a
+# given timestamp. Helps verify whether drift between a baseline snapshot and
+# the current state is explained by new webhooks or something else.
+
+@app.get("/api/admin/s28-recent-stripe")
+async def s28_recent_stripe(request: Request, since: str = ""):
+    """READ-ONLY. Lists Stripe-source active+trialing records created or updated
+    after the given ISO timestamp. Defaults to 2 hours ago if no 'since' provided.
+
+    Query params:
+      since: ISO timestamp (e.g. '2026-04-14T04:00:00+00:00')
+
+    No DB writes.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    # Parse since or default to 2 hours ago
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid 'since' timestamp: {since}")
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    async with db_pool.acquire() as conn:
+        # Records created after the cutoff
+        created_after = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id,
+                      stripe_customer_id, plan_amount, plan_interval,
+                      created_at, updated_at, import_batch
+               FROM subscriptions
+               WHERE source = 'stripe'
+                 AND status IN ('active', 'trialing')
+                 AND created_at >= $1
+               ORDER BY created_at DESC""",
+            since_dt
+        )
+
+        # Records updated (but not created) after the cutoff — records that
+        # existed before but were touched recently
+        updated_after = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id,
+                      stripe_customer_id, plan_amount, plan_interval,
+                      created_at, updated_at, import_batch
+               FROM subscriptions
+               WHERE source = 'stripe'
+                 AND status IN ('active', 'trialing')
+                 AND updated_at >= $1
+                 AND (created_at IS NULL OR created_at < $1)
+               ORDER BY updated_at DESC""",
+            since_dt
+        )
+
+        # Total current stripe active+trialing count for sanity
+        total_stripe = await conn.fetchval(
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE source = 'stripe' AND status IN ('active', 'trialing')"""
+        )
+
+    def row_out(r):
+        return {
+            "id": r["id"],
+            "email": r["email"],
+            "status": r["status"],
+            "sub_id": r["stripe_subscription_id"],
+            "plan_amount": r["plan_amount"],
+            "plan_interval": r["plan_interval"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            "import_batch": r["import_batch"],
+        }
+
+    return {
+        "status": "ok",
+        "since": since_dt.isoformat(),
+        "total_stripe_active_trialing_now": total_stripe,
+        "created_after_count": len(created_after),
+        "created_after_records": [row_out(r) for r in created_after],
+        "updated_after_only_count": len(updated_after),
+        "updated_after_only_records": [row_out(r) for r in updated_after],
+        "note": (
+            "READ-ONLY. 'created_after' = records inserted since the cutoff (new webhooks). "
+            "'updated_after_only' = records that existed before but got touched (edits, cleanup batches)."
+        ),
+    }
+
+
 # --- Static + Routing ---
 
 @app.get("/mm-admin")
