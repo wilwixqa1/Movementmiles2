@@ -9842,6 +9842,138 @@ async def s28_verify_only_in_ours(request: Request):
     }
 
 
+@app.post("/api/admin/s28-ymove-bulk-no-filter")
+async def s28_ymove_bulk_no_filter(request: Request):
+    """READ-ONLY. Hit ymove member-lookup/all with NO status filter (and also try
+    status=all and status=expired) to see if records exist that the default
+    status=subscribed query doesn't return.
+
+    Compares to our active+trialing Apple records and reports the delta.
+    No DB writes."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async def pull_with_status(status_param: str) -> dict:
+        """Pull bulk list with given status param (or empty for no filter)."""
+        result = {"status_param": status_param, "pull_status": "starting", "pages": 0,
+                  "total_users": 0, "by_provider": {}, "emails_by_provider": {}}
+        emails_seen = set()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                page = 1
+                while True:
+                    params = {"page": str(page)}
+                    if status_param:
+                        params["status"] = status_param
+                    try:
+                        resp = await client.get(
+                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                            headers={"X-Authorization": YMOVE_API_KEY},
+                            params=params
+                        )
+                    except httpx.TimeoutException:
+                        result["pull_status"] = f"timeout_page_{page}"
+                        break
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "5"))
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if resp.status_code != 200:
+                        result["pull_status"] = f"http_{resp.status_code}_page_{page}"
+                        break
+                    data = resp.json()
+                    users = data.get("users", [])
+                    for u in users:
+                        em = (u.get("email") or "").strip().lower()
+                        if not em or em in emails_seen:
+                            continue
+                        emails_seen.add(em)
+                        provider = (u.get("subscriptionProvider") or "undetermined").lower()
+                        if provider not in ("apple", "google", "stripe", "manual", "undetermined"):
+                            provider = "undetermined"
+                        result["by_provider"][provider] = result["by_provider"].get(provider, 0) + 1
+                        result["emails_by_provider"].setdefault(provider, []).append({
+                            "email": em,
+                            "active_subscription": u.get("activeSubscription"),
+                            "previously_subscribed": u.get("previouslySubscribed"),
+                        })
+                    total_pages = data.get("totalPages", 1)
+                    result["pages"] = page
+                    if page >= total_pages:
+                        result["pull_status"] = "success"
+                        break
+                    page += 1
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            result["pull_status"] = f"error: {str(e)[:200]}"
+        result["total_users"] = len(emails_seen)
+        return result, emails_seen
+
+    # Pull with three different status values to compare
+    no_filter_result, no_filter_emails = await pull_with_status("")
+    # Brief gap between pulls
+    await asyncio.sleep(1.0)
+    all_filter_result, all_filter_emails = await pull_with_status("all")
+
+    # Pull our current Apple records
+    async with db_pool.acquire() as conn:
+        our_apple_rows = await conn.fetch("""
+            SELECT lower(email) AS email, stripe_subscription_id, status, source
+            FROM subscriptions
+            WHERE source = 'apple'
+              AND status IN ('active', 'trialing')
+              AND email IS NOT NULL AND email != ''
+        """)
+    our_apple_emails = {r["email"] for r in our_apple_rows}
+
+    # Compare: which Apple-classified emails does no-filter pull have that we don't?
+    def compare_apple(pull_result, pull_emails_set):
+        ymove_apple_emails = set()
+        for entry in pull_result["emails_by_provider"].get("apple", []):
+            if entry.get("active_subscription"):
+                ymove_apple_emails.add(entry["email"])
+
+        ymove_apple_active_count = len(ymove_apple_emails)
+        in_ymove_not_ours = sorted(ymove_apple_emails - our_apple_emails)
+        in_ours_not_ymove = sorted(our_apple_emails - ymove_apple_emails)
+        return {
+            "ymove_apple_active_count": ymove_apple_active_count,
+            "our_apple_count": len(our_apple_emails),
+            "in_ymove_not_ours_count": len(in_ymove_not_ours),
+            "in_ymove_not_ours_sample": in_ymove_not_ours[:30],
+            "in_ours_not_ymove_count": len(in_ours_not_ymove),
+            "in_ours_not_ymove_sample": in_ours_not_ymove[:30],
+        }
+
+    no_filter_apple_compare = compare_apple(no_filter_result, no_filter_emails)
+    all_filter_apple_compare = compare_apple(all_filter_result, all_filter_emails)
+
+    # Strip the heavy emails_by_provider from response (keep counts only) to keep payload sane
+    no_filter_clean = {k: v for k, v in no_filter_result.items() if k != "emails_by_provider"}
+    all_filter_clean = {k: v for k, v in all_filter_result.items() if k != "emails_by_provider"}
+
+    return {
+        "status": "ok",
+        "note": "READ-ONLY. Compares ymove bulk pulls under different status filters.",
+        "no_filter": {
+            "pull": no_filter_clean,
+            "apple_compare": no_filter_apple_compare,
+        },
+        "status_all": {
+            "pull": all_filter_clean,
+            "apple_compare": all_filter_apple_compare,
+        },
+        "interpretation_hint": (
+            "If no_filter or status=all returns more Apple users with activeSubscription=true "
+            "than the default status=subscribed pull, our shadow sync is missing them."
+        ),
+    }
+
+
 def _s28_verdict(our_rec, stripe_check) -> str:
     """Categorize a Stripe-source record based on our DB state vs Stripe API truth."""
     if not our_rec:
