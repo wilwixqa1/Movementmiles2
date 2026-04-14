@@ -9601,6 +9601,261 @@ async def s26_pending_cancel_diagnostic(request: Request, days: int = 60):
     }
 
 
+# --- S28: Verify only_in_ours records against source-of-truth APIs ---
+# Reads the 17 only_in_ours emails from the latest ymove-diff (8 historical Stripe,
+# 9 Apple/Google) plus the 9 backfill records, and checks each against its
+# source-of-truth API. Stripe records hit Stripe API. Apple/Google records hit
+# ymove member-lookup (single-email, no status filter).
+# READ-ONLY. No DB writes. No preview/apply needed.
+
+S28_STRIPE_HISTORICAL_EMAILS = [
+    "abbey.e.baier@gmail.com",
+    "ahfouch@gmail.com",
+    "alessandraclelia.volpato@gmail.com",
+    "amets30@yahoo.com",
+    "andreedesrochers@gmail.com",
+    "cassyroop@gmail.com",
+    "chloe.levray@gmail.com",
+    "hstrandness@gmail.com",
+]
+
+S28_APPLE_GOOGLE_ONLY_IN_OURS = [
+    "andrea.nenadic@gmail.com",
+    "juliette-bisot@hotmail.fr",
+    "llbankert@gmail.com",
+    "morganaj1022@gmail.com",
+    "nienkenijp@gmail.com",
+    "smb2895@optonline.net",
+    "vacantpatient@gmail.com",
+    "brigidcgriffin@gmail.com",
+    "jennifer.miller4@gmail.com",
+]
+
+S28_BACKFILL_BATCH = "s26_backfill_20260413_011354"
+
+
+@app.post("/api/admin/s28-verify-only-in-ours")
+async def s28_verify_only_in_ours(request: Request):
+    """READ-ONLY. For every record in only_in_ours from the latest ymove-diff,
+    verify it against the appropriate source of truth.
+
+    - Stripe-source emails: hit Stripe API. Look up customer, list subs, return active state.
+    - Apple/Google-source emails: hit ymove member-lookup (single email), return found/active state.
+    - Backfill batch records: hit Stripe API, confirm period_end semantics still valid.
+
+    No DB writes. No body required. Returns categorized results.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    import stripe as _s28_stripe
+    _s28_stripe.api_key = STRIPE_SECRET_KEY
+
+    # ---------- Pull our DB records for all target emails ----------
+    all_emails = (
+        [e.lower() for e in S28_STRIPE_HISTORICAL_EMAILS]
+        + [e.lower() for e in S28_APPLE_GOOGLE_ONLY_IN_OURS]
+    )
+    async with db_pool.acquire() as conn:
+        our_rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id, stripe_customer_id,
+                      plan_amount, plan_interval, current_period_end, created_at, import_batch
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+               ORDER BY email, created_at DESC""",
+            all_emails
+        )
+        our_by_email = {}
+        for r in our_rows:
+            em = r["email"].lower()
+            our_by_email.setdefault(em, []).append(dict(r))
+
+        # Backfill batch records (separate query, fetch all 9)
+        backfill_rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id, stripe_customer_id,
+                      plan_amount, plan_interval, current_period_end, cancel_state,
+                      pending_cancel_at, created_at
+               FROM subscriptions
+               WHERE import_batch = $1
+               ORDER BY email""",
+            S28_BACKFILL_BATCH
+        )
+
+    # ---------- Helper: hit Stripe API for an email ----------
+    def stripe_check(email: str, expected_sub_id: str = None) -> dict:
+        result = {"email": email, "stripe_found": False, "any_active": False, "subs": []}
+        try:
+            customers = _s28_stripe.Customer.list(email=email, limit=10)
+            if not customers.data:
+                result["stripe_found"] = False
+                result["note"] = "No Stripe customer with this email"
+                return result
+            result["stripe_found"] = True
+            result["customer_count"] = len(customers.data)
+            for cust in customers.data:
+                subs = _s28_stripe.Subscription.list(customer=cust.id, status="all", limit=20)
+                for s in subs.data:
+                    sub_info = {
+                        "sub_id": s.id,
+                        "status": s.status,
+                        "customer_id": cust.id,
+                        "current_period_end": s.current_period_end,
+                        "cancel_at_period_end": s.cancel_at_period_end,
+                        "canceled_at": s.canceled_at,
+                        "matches_our_sub_id": (s.id == expected_sub_id) if expected_sub_id else None,
+                    }
+                    if s.status in ("active", "trialing"):
+                        result["any_active"] = True
+                    result["subs"].append(sub_info)
+        except Exception as e:
+            result["error"] = str(e)[:200]
+        return result
+
+    # ---------- Helper: hit ymove single-email lookup ----------
+    async def ymove_check(email: str) -> dict:
+        result = {"email": email, "ymove_found": False}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": YMOVE_API_KEY},
+                    params={"email": email}
+                )
+                if resp.status_code != 200:
+                    result["error"] = f"HTTP {resp.status_code}"
+                    return result
+                data = resp.json()
+                if not data.get("found"):
+                    result["ymove_found"] = False
+                    result["note"] = "ymove returned found=false"
+                    return result
+                result["ymove_found"] = True
+                user = data.get("user", {})
+                result["active_subscription"] = user.get("activeSubscription")
+                result["previously_subscribed"] = user.get("previouslySubscribed")
+                result["subscription_provider"] = user.get("subscriptionProvider")
+                result["ymove_user_id"] = user.get("id") or user.get("userId")
+                # Capture status if present
+                result["status_field"] = user.get("status") or user.get("subscriptionStatus")
+        except Exception as e:
+            result["error"] = str(e)[:200]
+        return result
+
+    # ---------- Verify Stripe historical 8 ----------
+    stripe_historical_results = []
+    for email in S28_STRIPE_HISTORICAL_EMAILS:
+        em = email.lower()
+        our = our_by_email.get(em, [])
+        our_rec = our[0] if our else None
+        expected_sub_id = our_rec["stripe_subscription_id"] if our_rec else None
+        check = stripe_check(em, expected_sub_id)
+        stripe_historical_results.append({
+            "email": em,
+            "our_record": {
+                "sub_id": our_rec["stripe_subscription_id"] if our_rec else None,
+                "status": our_rec["status"] if our_rec else None,
+                "created_at": our_rec["created_at"].isoformat() if our_rec and our_rec["created_at"] else None,
+                "current_period_end": our_rec["current_period_end"].isoformat() if our_rec and our_rec.get("current_period_end") else None,
+                "plan_amount": our_rec["plan_amount"] if our_rec else None,
+            } if our_rec else None,
+            "stripe_truth": check,
+            "verdict": _s28_verdict(our_rec, check),
+        })
+
+    # ---------- Verify Apple/Google 9 against ymove ----------
+    apple_google_results = []
+    for email in S28_APPLE_GOOGLE_ONLY_IN_OURS:
+        em = email.lower()
+        our = our_by_email.get(em, [])
+        our_rec = our[0] if our else None
+        ycheck = await ymove_check(em)
+        apple_google_results.append({
+            "email": em,
+            "our_record": {
+                "sub_id": our_rec["stripe_subscription_id"] if our_rec else None,
+                "source": our_rec["source"] if our_rec else None,
+                "status": our_rec["status"] if our_rec else None,
+                "created_at": our_rec["created_at"].isoformat() if our_rec and our_rec["created_at"] else None,
+                "import_batch": our_rec["import_batch"] if our_rec else None,
+            } if our_rec else None,
+            "ymove_truth": ycheck,
+        })
+        await asyncio.sleep(0.3)  # rate-limit politeness
+
+    # ---------- Verify backfill batch 9 against Stripe ----------
+    backfill_results = []
+    for r in backfill_rows:
+        email = r["email"].lower()
+        check = stripe_check(email, r["stripe_subscription_id"])
+        backfill_results.append({
+            "email": email,
+            "our_record": {
+                "id": r["id"],
+                "sub_id": r["stripe_subscription_id"],
+                "status": r["status"],
+                "cancel_state": r.get("cancel_state"),
+                "pending_cancel_at": r["pending_cancel_at"].isoformat() if r.get("pending_cancel_at") else None,
+                "current_period_end": r["current_period_end"].isoformat() if r.get("current_period_end") else None,
+                "plan_interval": r.get("plan_interval"),
+                "plan_amount": r.get("plan_amount"),
+            },
+            "stripe_truth": check,
+            "verdict": _s28_verdict(dict(r), check),
+        })
+
+    # ---------- Summary tallies ----------
+    def tally(results, key="verdict"):
+        out = {}
+        for r in results:
+            v = r.get(key, "unknown")
+            out[v] = out.get(v, 0) + 1
+        return out
+
+    return {
+        "status": "ok",
+        "note": "READ-ONLY verification of only_in_ours records against source-of-truth APIs.",
+        "summary": {
+            "stripe_historical_count": len(stripe_historical_results),
+            "apple_google_count": len(apple_google_results),
+            "backfill_count": len(backfill_results),
+            "stripe_historical_verdicts": tally(stripe_historical_results),
+            "backfill_verdicts": tally(backfill_results),
+        },
+        "stripe_historical": stripe_historical_results,
+        "apple_google": apple_google_results,
+        "backfill_batch": backfill_results,
+    }
+
+
+def _s28_verdict(our_rec, stripe_check) -> str:
+    """Categorize a Stripe-source record based on our DB state vs Stripe API truth."""
+    if not our_rec:
+        return "no_record_in_our_db"
+    if stripe_check.get("error"):
+        return "stripe_api_error"
+    if not stripe_check.get("stripe_found"):
+        return "no_stripe_customer"
+    if stripe_check.get("any_active"):
+        # Find the active sub
+        active_subs = [s for s in stripe_check["subs"] if s["status"] in ("active", "trialing")]
+        if active_subs:
+            our_sub_id = our_rec.get("stripe_subscription_id")
+            matching = [s for s in active_subs if s["sub_id"] == our_sub_id]
+            if matching:
+                if matching[0].get("cancel_at_period_end"):
+                    return "active_pending_cancel_in_stripe"
+                return "active_in_stripe_matches_ours"
+            return "active_in_stripe_different_sub_id"
+    return "no_active_sub_in_stripe"
+
+
 # --- Static + Routing ---
 
 @app.get("/mm-admin")
