@@ -10314,6 +10314,366 @@ def _s28_verdict(our_rec, stripe_check) -> str:
     return "no_active_sub_in_stripe"
 
 
+# --- S28 Cleanup: consolidated reconciliation cleanup ---
+# Does 5 actions in one batch with preview/apply pattern:
+#  1. Reverse the S26 backfill (9 records back to canceled)
+#  2. Soft-cancel 7 stale apple records
+#  3. Soft-cancel 2 stale google records
+#  4. Relabel 2 apple -> google (Cat 6b)
+#  5. Run Cat 2 name-match diagnostic as part of preview output
+#
+# All actions use a single batch_id so the whole thing is reversible.
+# Cat 6a left as apple (per S25 finding that ymove 'manual' doesn't mean comped).
+# Cat 6c/6d left as stripe (they're real paying Stripe customers).
+
+S28_CLEANUP_BACKFILL_BATCH = "s26_backfill_20260413_011354"
+
+S28_CLEANUP_STALE_APPLE_EMAILS = [
+    "andrea.nenadic@gmail.com",
+    "juliette-bisot@hotmail.fr",
+    "llbankert@gmail.com",
+    "morganaj1022@gmail.com",
+    "nienkenijp@gmail.com",
+    "smb2895@optonline.net",
+    "vacantpatient@gmail.com",
+]
+
+S28_CLEANUP_STALE_GOOGLE_EMAILS = [
+    "brigidcgriffin@gmail.com",
+    "jennifer.miller4@gmail.com",
+]
+
+S28_CLEANUP_RELABEL_APPLE_TO_GOOGLE = [
+    "chame.abbey@gmail.com",
+    "marisol.diaz927@gmail.com",
+]
+
+S28_CAT2_HISTORICAL_STRIPE = [
+    "ahfouch@gmail.com",
+    "alessandraclelia.volpato@gmail.com",
+    "amets30@yahoo.com",
+    "andreedesrochers@gmail.com",
+    "chloe.levray@gmail.com",
+    "hstrandness@gmail.com",
+]
+
+
+@app.post("/api/admin/s28-cleanup")
+async def s28_cleanup(request: Request):
+    """S28 consolidated cleanup. Preview/apply pattern.
+
+    Body: {"preview": true/false}
+
+    Actions (all in one batch_id):
+      1. Reverse S26 backfill (9 records back to canceled)
+      2. Soft-cancel 7 stale apple records
+      3. Soft-cancel 2 stale google records
+      4. Relabel 2 apple -> google
+      5. Cat 2 name-match diagnostic (preview only; read-only)
+
+    All changes tagged with batch_id for reversibility.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = body.get("preview", True)
+
+    batch_id = f"s28_cleanup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    # ---------- Gather current state for each action ----------
+    async with db_pool.acquire() as conn:
+        # Action 1: backfill records
+        backfill_rows = await conn.fetch(
+            """SELECT id, email, status, cancel_state, pending_cancel_at, canceled_at,
+                      cancel_requested_at, reactivated_at,
+                      stripe_subscription_id, plan_amount, plan_interval
+               FROM subscriptions
+               WHERE import_batch = $1
+               ORDER BY email""",
+            S28_CLEANUP_BACKFILL_BATCH
+        )
+
+        # Action 2: stale apple records
+        stale_apple_rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id,
+                      plan_amount, import_batch, created_at
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+                 AND source = 'apple'
+               ORDER BY email""",
+            [e.lower() for e in S28_CLEANUP_STALE_APPLE_EMAILS]
+        )
+
+        # Action 3: stale google records
+        stale_google_rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id,
+                      plan_amount, import_batch, created_at
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+                 AND source = 'google'
+               ORDER BY email""",
+            [e.lower() for e in S28_CLEANUP_STALE_GOOGLE_EMAILS]
+        )
+
+        # Action 4: relabel apple -> google
+        relabel_rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id,
+                      plan_amount, import_batch
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+                 AND source = 'apple'
+               ORDER BY email""",
+            [e.lower() for e in S28_CLEANUP_RELABEL_APPLE_TO_GOOGLE]
+        )
+
+    # ---------- Safety checks: every expected record must be present ----------
+    safety_errors = []
+    if len(backfill_rows) != 9:
+        safety_errors.append(f"Expected 9 backfill records, found {len(backfill_rows)}")
+    if len(stale_apple_rows) != 7:
+        safety_errors.append(f"Expected 7 stale apple records, found {len(stale_apple_rows)}")
+    if len(stale_google_rows) != 2:
+        safety_errors.append(f"Expected 2 stale google records, found {len(stale_google_rows)}")
+    if len(relabel_rows) != 2:
+        safety_errors.append(f"Expected 2 relabel records, found {len(relabel_rows)}")
+
+    if safety_errors and not preview:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "safety check failed", "errors": safety_errors,
+                    "note": "Run preview first to see current state."}
+        )
+
+    # ---------- Action 5: Cat 2 name-match diagnostic (read-only) ----------
+    cat2_name_matches = []
+    if preview:
+        import stripe as _s28_stripe
+        _s28_stripe.api_key = STRIPE_SECRET_KEY
+
+        async with db_pool.acquire() as conn:
+            all_db_names = await conn.fetch(
+                """SELECT id, lower(email) AS email, first_name, last_name,
+                          source, status, stripe_subscription_id
+                   FROM subscriptions
+                   WHERE first_name IS NOT NULL AND last_name IS NOT NULL
+                     AND first_name != '' AND last_name != ''"""
+            )
+
+        name_index = {}
+        for r in all_db_names:
+            key = (r["first_name"] or "").lower().strip() + "|" + (r["last_name"] or "").lower().strip()
+            name_index.setdefault(key, []).append(dict(r))
+
+        for email in S28_CAT2_HISTORICAL_STRIPE:
+            em = email.lower()
+            entry = {"email": em, "stripe_customer_name": None, "matches_in_db": []}
+            try:
+                customers = _s28_stripe.Customer.list(email=em, limit=3)
+                if customers.data:
+                    cust = customers.data[0]
+                    cust_name = cust.get("name") or ""
+                    entry["stripe_customer_name"] = cust_name
+                    entry["stripe_customer_id"] = cust.id
+                    if cust_name:
+                        parts = cust_name.strip().split()
+                        if len(parts) >= 2:
+                            first = parts[0].lower()
+                            last = " ".join(parts[1:]).lower()
+                            key = first + "|" + last
+                            if key in name_index:
+                                for match in name_index[key]:
+                                    if match["email"] != em:
+                                        entry["matches_in_db"].append({
+                                            "email": match["email"],
+                                            "source": match["source"],
+                                            "status": match["status"],
+                                            "sub_id": match["stripe_subscription_id"],
+                                            "first_name": match["first_name"],
+                                            "last_name": match["last_name"],
+                                        })
+            except Exception as e:
+                entry["error"] = str(e)[:200]
+            cat2_name_matches.append(entry)
+
+    # ---------- Build preview response ----------
+    def row_to_preview(r):
+        return {
+            "id": r["id"],
+            "email": r["email"],
+            "current_status": r.get("status"),
+            "current_source": r.get("source"),
+            "sub_id": r.get("stripe_subscription_id"),
+            "plan_amount": r.get("plan_amount"),
+            "import_batch": r.get("import_batch"),
+        }
+
+    preview_data = {
+        "batch_id": batch_id,
+        "action_1_reverse_backfill": {
+            "count": len(backfill_rows),
+            "expected": 9,
+            "records": [
+                {
+                    "id": r["id"],
+                    "email": r["email"],
+                    "current_status": r["status"],
+                    "current_canceled_at": r["canceled_at"].isoformat() if r["canceled_at"] else None,
+                    "cancel_requested_at_in_db": r["cancel_requested_at"].isoformat() if r["cancel_requested_at"] else None,
+                    "will_restore_canceled_at_to": (
+                        r["cancel_requested_at"].isoformat() if r["cancel_requested_at"]
+                        else (r["canceled_at"].isoformat() if r["canceled_at"] else "NOW() (FALLBACK - would be today, VERIFY)")
+                    ),
+                    "timestamp_source": (
+                        "cancel_requested_at (original saved by S26 backfill)" if r["cancel_requested_at"]
+                        else ("canceled_at (unexpected)" if r["canceled_at"] else "NOW() FALLBACK - WARNING")
+                    ),
+                    "pending_cancel_at": r["pending_cancel_at"].isoformat() if r["pending_cancel_at"] else None,
+                    "sub_id": r["stripe_subscription_id"],
+                    "plan_amount": r["plan_amount"],
+                }
+                for r in backfill_rows
+            ],
+            "description": "Set status back to canceled, clear cancel_state, restore canceled_at from cancel_requested_at (where S26 preserved the original), clear reactivated_at and pending_cancel_at",
+            "mrr_impact_cents": sum(r["plan_amount"] or 0 for r in backfill_rows),
+        },
+        "action_2_cancel_stale_apple": {
+            "count": len(stale_apple_rows),
+            "expected": 7,
+            "records": [row_to_preview(r) for r in stale_apple_rows],
+            "description": "Soft-cancel: status='canceled', canceled_at=NOW()",
+            "mrr_impact_cents": sum(r["plan_amount"] or 0 for r in stale_apple_rows),
+        },
+        "action_3_cancel_stale_google": {
+            "count": len(stale_google_rows),
+            "expected": 2,
+            "records": [row_to_preview(r) for r in stale_google_rows],
+            "description": "Soft-cancel: status='canceled', canceled_at=NOW()",
+            "mrr_impact_cents": sum(r["plan_amount"] or 0 for r in stale_google_rows),
+        },
+        "action_4_relabel_apple_to_google": {
+            "count": len(relabel_rows),
+            "expected": 2,
+            "records": [row_to_preview(r) for r in relabel_rows],
+            "description": "UPDATE source='google' (no status change)",
+            "mrr_impact_cents": 0,
+        },
+        "safety_errors": safety_errors,
+    }
+
+    if preview:
+        preview_data["cat2_name_match_diagnostic"] = {
+            "description": "Checks if 6 historical Stripe customers share a name with any other record in our DB under a different email",
+            "results": cat2_name_matches,
+        }
+        preview_data["note"] = "PREVIEW ONLY. Send {preview: false} to apply."
+        return preview_data
+
+    # ---------- APPLY MODE ----------
+    applied = {
+        "backfill_reversed": 0,
+        "stale_apple_canceled": 0,
+        "stale_google_canceled": 0,
+        "apple_to_google_relabeled": 0,
+        "errors": [],
+    }
+
+    async with db_pool.acquire() as conn:
+        # Action 1: Reverse backfill. Per S26 backfill code, original canceled_at
+        # was saved to cancel_requested_at before being NULLed. Restore it.
+        for r in backfill_rows:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET status = 'canceled',
+                           cancel_state = NULL,
+                           pending_cancel_at = NULL,
+                           canceled_at = COALESCE(cancel_requested_at, canceled_at, NOW()),
+                           reactivated_at = NULL,
+                           import_batch = $1,
+                           updated_at = NOW()
+                       WHERE id = $2""",
+                    batch_id + "_reverse_backfill", r["id"]
+                )
+                applied["backfill_reversed"] += 1
+            except Exception as e:
+                applied["errors"].append({"action": "reverse_backfill", "id": r["id"],
+                                          "email": r["email"], "error": str(e)[:200]})
+
+        # Action 2: Stale apple soft-cancel
+        for r in stale_apple_rows:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET status = 'canceled',
+                           canceled_at = NOW(),
+                           import_batch = $1,
+                           updated_at = NOW()
+                       WHERE id = $2""",
+                    batch_id + "_stale_apple", r["id"]
+                )
+                applied["stale_apple_canceled"] += 1
+            except Exception as e:
+                applied["errors"].append({"action": "stale_apple", "id": r["id"],
+                                          "email": r["email"], "error": str(e)[:200]})
+
+        # Action 3: Stale google soft-cancel
+        for r in stale_google_rows:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET status = 'canceled',
+                           canceled_at = NOW(),
+                           import_batch = $1,
+                           updated_at = NOW()
+                       WHERE id = $2""",
+                    batch_id + "_stale_google", r["id"]
+                )
+                applied["stale_google_canceled"] += 1
+            except Exception as e:
+                applied["errors"].append({"action": "stale_google", "id": r["id"],
+                                          "email": r["email"], "error": str(e)[:200]})
+
+        # Action 4: Relabel apple -> google
+        for r in relabel_rows:
+            try:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET source = 'google',
+                           import_batch = $1,
+                           updated_at = NOW()
+                       WHERE id = $2""",
+                    batch_id + "_relabel_ag", r["id"]
+                )
+                applied["apple_to_google_relabeled"] += 1
+            except Exception as e:
+                applied["errors"].append({"action": "relabel_ag", "id": r["id"],
+                                          "email": r["email"], "error": str(e)[:200]})
+
+    return {
+        "status": "applied",
+        "batch_id": batch_id,
+        "applied": applied,
+        "reversal_info": {
+            "backfill_reversed_tag": batch_id + "_reverse_backfill",
+            "stale_apple_tag": batch_id + "_stale_apple",
+            "stale_google_tag": batch_id + "_stale_google",
+            "relabel_tag": batch_id + "_relabel_ag",
+            "note": "Each action has its own batch tag suffix. To undo a specific action, filter by that tag.",
+        },
+    }
+
+
 # --- Static + Routing ---
 
 @app.get("/mm-admin")
