@@ -290,14 +290,17 @@ async def startup():
                 id="daily_digest",
                 replace_existing=True,
             )
-            # S20: Daily shadow sync at 8:00 AM ET (1 hour before digest)
-            if YMOVE_API_KEY:
-                scheduler.add_job(
-                    run_daily_shadow_sync,
-                    CronTrigger(hour=8, minute=0, timezone=et),
-                    id="daily_shadow_sync",
-                    replace_existing=True,
-                )
+            # S28 PAUSED: Daily shadow sync is disabled to protect S28 cleanup work
+            # from being undone by automated reactivation/relabeling. Re-enable in
+            # S29 after the reconciliation discussion with Tosh and Ahmed is resolved.
+            # See docs/s28/ for context. To re-enable, uncomment the block below.
+            # if YMOVE_API_KEY:
+            #     scheduler.add_job(
+            #         run_daily_shadow_sync,
+            #         CronTrigger(hour=8, minute=0, timezone=et),
+            #         id="daily_shadow_sync",
+            #         replace_existing=True,
+            #     )
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
             print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg})")
