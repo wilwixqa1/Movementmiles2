@@ -9842,6 +9842,62 @@ async def s28_verify_only_in_ours(request: Request):
     }
 
 
+@app.post("/api/admin/s28-test-account-scan")
+async def s28_test_account_scan(request: Request):
+    """READ-ONLY. Scan our active+trialing records for emails matching the
+    _is_test_email filter. These are likely records imported before ymove's
+    test-account filter was active, still sitting in our DB while Tosh's
+    dashboard filters them out. No DB writes."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id,
+                   created_at, import_batch, plan_amount
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+              AND email IS NOT NULL AND email != ''
+            ORDER BY source, email
+        """)
+
+    matches_by_source = {}
+    all_matches = []
+    for r in rows:
+        em = r["email"]
+        if _is_test_email(em):
+            entry = {
+                "id": r["id"],
+                "email": em,
+                "source": r["source"],
+                "status": r["status"],
+                "sub_id": r["stripe_subscription_id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "import_batch": r["import_batch"],
+                "plan_amount": r["plan_amount"],
+            }
+            matches_by_source.setdefault(r["source"] or "null", []).append(entry)
+            all_matches.append(entry)
+
+    summary = {
+        "total_active_trialing_scanned": len(rows),
+        "total_test_matches": len(all_matches),
+        "matches_by_source": {k: len(v) for k, v in matches_by_source.items()},
+        "test_patterns_used": _TEST_EMAIL_PATTERNS,
+        "test_domains_used": _TEST_EMAIL_DOMAINS,
+    }
+
+    return {
+        "status": "ok",
+        "note": "READ-ONLY. Finds active records matching our test-account filter.",
+        "summary": summary,
+        "matches_by_source": matches_by_source,
+        "all_matches": all_matches,
+    }
+
+
 @app.post("/api/admin/s28-ymove-bulk-no-filter")
 async def s28_ymove_bulk_no_filter(request: Request):
     """READ-ONLY. Hit ymove member-lookup/all with NO status filter (and also try
