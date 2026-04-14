@@ -9749,6 +9749,8 @@ async def s28_verify_only_in_ours(request: Request):
         return result
 
     # ---------- Verify Stripe historical 8 ----------
+    # Check both Stripe API (sub state) AND ymove single-email lookup (does ymove
+    # have this email under any provider, regardless of status filter from bulk pull?)
     stripe_historical_results = []
     for email in S28_STRIPE_HISTORICAL_EMAILS:
         em = email.lower()
@@ -9756,6 +9758,7 @@ async def s28_verify_only_in_ours(request: Request):
         our_rec = our[0] if our else None
         expected_sub_id = our_rec["stripe_subscription_id"] if our_rec else None
         check = stripe_check(em, expected_sub_id)
+        ycheck = await ymove_check(em)
         stripe_historical_results.append({
             "email": em,
             "our_record": {
@@ -9766,8 +9769,10 @@ async def s28_verify_only_in_ours(request: Request):
                 "plan_amount": our_rec["plan_amount"] if our_rec else None,
             } if our_rec else None,
             "stripe_truth": check,
+            "ymove_truth": ycheck,
             "verdict": _s28_verdict(our_rec, check),
         })
+        await asyncio.sleep(0.3)  # rate-limit politeness for ymove
 
     # ---------- Verify Apple/Google 9 against ymove ----------
     apple_google_results = []
@@ -9789,11 +9794,12 @@ async def s28_verify_only_in_ours(request: Request):
         })
         await asyncio.sleep(0.3)  # rate-limit politeness
 
-    # ---------- Verify backfill batch 9 against Stripe ----------
+    # ---------- Verify backfill batch 9 against Stripe AND ymove ----------
     backfill_results = []
     for r in backfill_rows:
         email = r["email"].lower()
         check = stripe_check(email, r["stripe_subscription_id"])
+        ycheck = await ymove_check(email)
         backfill_results.append({
             "email": email,
             "our_record": {
@@ -9807,8 +9813,10 @@ async def s28_verify_only_in_ours(request: Request):
                 "plan_amount": r.get("plan_amount"),
             },
             "stripe_truth": check,
+            "ymove_truth": ycheck,
             "verdict": _s28_verdict(dict(r), check),
         })
+        await asyncio.sleep(0.3)
 
     # ---------- Summary tallies ----------
     def tally(results, key="verdict"):
