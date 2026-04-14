@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
 import httpx
 import os
@@ -9839,6 +9839,268 @@ async def s28_verify_only_in_ours(request: Request):
         "stripe_historical": stripe_historical_results,
         "apple_google": apple_google_results,
         "backfill_batch": backfill_results,
+    }
+
+
+import os as _s28_os
+
+_S28_DUMP_CACHE_PATH = "/tmp/s28_ymove_dump_cache.json"
+
+
+@app.post("/api/admin/s28-full-dump")
+@app.get("/api/admin/s28-full-dump")
+async def s28_full_dump(request: Request):
+    """READ-ONLY. Produces a complete row-by-row reconciliation between our
+    active+trialing subscriptions and ymove's member-lookup/all bulk pull.
+
+    No categorization. No verdicts. No filtering of results. One row per
+    unique email from either side, with every relevant field.
+
+    Query params:
+      ymove_status: status filter for ymove API (default: empty = no filter)
+      format: 'json' (default) or 'csv' (returns downloadable file)
+      use_cache: 'true' uses /tmp cache if present, otherwise re-pulls
+      force_refresh: 'true' forces a re-pull even if cache exists
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+    if not YMOVE_API_KEY:
+        raise HTTPException(status_code=500, detail="YMOVE_API_KEY not configured")
+
+    ymove_status = request.query_params.get("ymove_status", "")
+    fmt = request.query_params.get("format", "json").lower()
+    use_cache = request.query_params.get("use_cache", "").lower() == "true"
+    force_refresh = request.query_params.get("force_refresh", "").lower() == "true"
+
+    started_at = datetime.now(timezone.utc)
+    pull_source = "fresh"
+    ymove_raw = None
+
+    # ---------- Cache check ----------
+    if use_cache and not force_refresh and _s28_os.path.exists(_S28_DUMP_CACHE_PATH):
+        try:
+            with open(_S28_DUMP_CACHE_PATH, "r") as f:
+                cached = json.load(f)
+            if cached.get("ymove_status_param") == ymove_status:
+                ymove_raw = cached.get("users", [])
+                pull_source = f"cache ({cached.get('cached_at')})"
+        except Exception as e:
+            print(f"[s28-full-dump] cache read error: {e}")
+
+    # ---------- Fresh pull if no cache hit ----------
+    if ymove_raw is None:
+        ymove_raw = []
+        pages_pulled = 0
+        pull_status = "starting"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                page = 1
+                while True:
+                    params = {"page": str(page)}
+                    if ymove_status:
+                        params["status"] = ymove_status
+                    try:
+                        resp = await client.get(
+                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup/all",
+                            headers={"X-Authorization": YMOVE_API_KEY},
+                            params=params
+                        )
+                    except httpx.TimeoutException:
+                        pull_status = f"timeout_page_{page}"
+                        break
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "5"))
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if resp.status_code != 200:
+                        pull_status = f"http_{resp.status_code}_page_{page}"
+                        break
+                    data = resp.json()
+                    users = data.get("users", [])
+                    ymove_raw.extend(users)
+                    total_pages = data.get("totalPages", 1)
+                    pages_pulled = page
+                    if page >= total_pages:
+                        pull_status = "success"
+                        break
+                    page += 1
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            pull_status = f"error: {str(e)[:200]}"
+
+        if pull_status != "success":
+            return JSONResponse(status_code=502, content={
+                "error": "ymove pull failed",
+                "pull_status": pull_status,
+                "pages_pulled": pages_pulled,
+            })
+
+        # Write to cache for future calls
+        try:
+            with open(_S28_DUMP_CACHE_PATH, "w") as f:
+                json.dump({
+                    "cached_at": datetime.now(timezone.utc).isoformat(),
+                    "ymove_status_param": ymove_status,
+                    "pages_pulled": pages_pulled,
+                    "users": ymove_raw,
+                }, f)
+        except Exception as e:
+            print(f"[s28-full-dump] cache write error: {e}")
+
+    # ---------- Index ymove data by lowercased email ----------
+    ymove_by_email = {}
+    for u in ymove_raw:
+        em = (u.get("email") or "").strip().lower()
+        if not em:
+            continue
+        provider = (u.get("subscriptionProvider") or None)
+        if provider:
+            provider = provider.lower()
+            if provider not in ("apple", "google", "stripe", "manual", "undetermined"):
+                provider = "undetermined"
+        ymove_by_email[em] = {
+            "ymove_provider": provider,
+            "ymove_active_subscription": u.get("activeSubscription"),
+            "ymove_previously_subscribed": u.get("previouslySubscribed"),
+            "ymove_user_id": u.get("id") or u.get("userId"),
+            "ymove_first_name": u.get("firstName") or u.get("first_name") or "",
+            "ymove_last_name": u.get("lastName") or u.get("last_name") or "",
+        }
+
+    # ---------- Pull our active+trialing ----------
+    async with db_pool.acquire() as conn:
+        our_rows = await conn.fetch("""
+            SELECT id, email, source, status, stripe_subscription_id,
+                   stripe_customer_id, plan_amount, plan_interval,
+                   current_period_end, created_at, import_batch,
+                   cancel_state, pending_cancel_at,
+                   first_name, last_name
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+              AND email IS NOT NULL AND email != ''
+        """)
+
+    our_by_email = {}
+    for r in our_rows:
+        em = r["email"].strip().lower()
+        # If there's a duplicate on same email, keep the most recent (higher id)
+        existing = our_by_email.get(em)
+        if existing is None or r["id"] > existing["id"]:
+            our_by_email[em] = {
+                "id": r["id"],
+                "email_raw": r["email"],
+                "our_source": r["source"],
+                "our_sub_id": r["stripe_subscription_id"],
+                "our_customer_id": r["stripe_customer_id"],
+                "our_status": r["status"],
+                "our_plan_amount": r["plan_amount"],
+                "our_plan_interval": r["plan_interval"],
+                "our_current_period_end": r["current_period_end"].isoformat() if r["current_period_end"] else None,
+                "our_created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "our_import_batch": r["import_batch"],
+                "our_cancel_state": r["cancel_state"],
+                "our_pending_cancel_at": r["pending_cancel_at"].isoformat() if r["pending_cancel_at"] else None,
+                "our_first_name": r["first_name"],
+                "our_last_name": r["last_name"],
+            }
+
+    # ---------- Full outer join ----------
+    all_emails = sorted(set(our_by_email.keys()) | set(ymove_by_email.keys()))
+    rows_out = []
+    count_in_both = 0
+    count_only_in_ours = 0
+    count_only_in_ymove = 0
+    for em in all_emails:
+        ours = our_by_email.get(em)
+        theirs = ymove_by_email.get(em)
+        in_ours = ours is not None
+        in_ymove = theirs is not None
+        if in_ours and in_ymove:
+            count_in_both += 1
+        elif in_ours:
+            count_only_in_ours += 1
+        else:
+            count_only_in_ymove += 1
+
+        row = {
+            "email": em,
+            "in_ours": in_ours,
+            "in_ymove": in_ymove,
+            "our_source": ours["our_source"] if ours else None,
+            "our_sub_id": ours["our_sub_id"] if ours else None,
+            "our_status": ours["our_status"] if ours else None,
+            "our_plan_amount": ours["our_plan_amount"] if ours else None,
+            "our_plan_interval": ours["our_plan_interval"] if ours else None,
+            "our_created_at": ours["our_created_at"] if ours else None,
+            "our_current_period_end": ours["our_current_period_end"] if ours else None,
+            "our_import_batch": ours["our_import_batch"] if ours else None,
+            "our_cancel_state": ours["our_cancel_state"] if ours else None,
+            "our_pending_cancel_at": ours["our_pending_cancel_at"] if ours else None,
+            "our_id": ours["id"] if ours else None,
+            "our_first_name": ours["our_first_name"] if ours else None,
+            "our_last_name": ours["our_last_name"] if ours else None,
+            "ymove_provider": theirs["ymove_provider"] if theirs else None,
+            "ymove_active_subscription": theirs["ymove_active_subscription"] if theirs else None,
+            "ymove_previously_subscribed": theirs["ymove_previously_subscribed"] if theirs else None,
+            "ymove_user_id": theirs["ymove_user_id"] if theirs else None,
+            "ymove_first_name": theirs["ymove_first_name"] if theirs else None,
+            "ymove_last_name": theirs["ymove_last_name"] if theirs else None,
+        }
+        rows_out.append(row)
+
+    runtime_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+
+    pull_meta = {
+        "ymove_status_param": ymove_status or "(none)",
+        "pull_source": pull_source,
+        "total_ymove_records": len(ymove_by_email),
+        "total_our_records": len(our_by_email),
+        "runtime_seconds": round(runtime_seconds, 1),
+    }
+    counts = {
+        "in_both": count_in_both,
+        "only_in_ours": count_only_in_ours,
+        "only_in_ymove": count_only_in_ymove,
+        "total_unique_emails": len(all_emails),
+    }
+
+    # ---------- CSV output path ----------
+    if fmt == "csv":
+        import csv as _csv
+        from io import StringIO as _StringIO
+        buf = _StringIO()
+        fieldnames = [
+            "email", "in_ours", "in_ymove",
+            "our_source", "our_sub_id", "our_status",
+            "our_plan_amount", "our_plan_interval",
+            "our_created_at", "our_current_period_end",
+            "our_import_batch", "our_cancel_state", "our_pending_cancel_at",
+            "our_id", "our_first_name", "our_last_name",
+            "ymove_provider", "ymove_active_subscription",
+            "ymove_previously_subscribed", "ymove_user_id",
+            "ymove_first_name", "ymove_last_name",
+        ]
+        writer = _csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows_out:
+            writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
+        csv_text = buf.getvalue()
+        filename = f"s28_full_dump_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+        return Response(
+            content=csv_text,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    # ---------- JSON output path (default) ----------
+    return {
+        "status": "ok",
+        "note": "READ-ONLY full dump. No categorization. Use .rows to iterate.",
+        "pull_meta": pull_meta,
+        "counts": counts,
+        "rows": rows_out,
     }
 
 
