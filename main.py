@@ -3164,9 +3164,15 @@ async def _run_shadow_sync(run_id: int):
                 "UPDATE ymove_sync_runs SET phase = 'computing_diff', ymove_active_count = $1 WHERE id = $2",
                 len(ymove_all_emails), run_id
             )
-            # Query active Stripe emails to separate from cross-platform switchers
+            # Query active Stripe emails to separate from cross-platform switchers.
+            # S29: include 'past_due' so dunning Stripe users are classified as
+            # active_stripe_in_ymove (counted, no action) rather than
+            # cross_platform_switchers (flagged for review). ymove counts dunning
+            # as active in its bulk pull; our webhook pipeline is the source of
+            # truth for past_due -> active/canceled transitions, so the sync
+            # should take no action on these records.
             active_stripe_rows = await conn.fetch(
-                "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing') AND source = 'stripe'"
+                "SELECT DISTINCT lower(email) as em FROM subscriptions WHERE email != '' AND status IN ('active', 'trialing', 'past_due') AND source = 'stripe'"
             )
         active_stripe_emails = set(r["em"] for r in active_stripe_rows)
 
