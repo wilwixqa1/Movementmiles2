@@ -2982,6 +2982,7 @@ async def _run_shadow_sync(run_id: int):
                    AND s.email != '' AND s.email IS NOT NULL
                    AND (s.import_batch IS NULL OR s.import_batch NOT LIKE 's23_provider_cleanup%%')
                    AND (s.import_batch IS NULL OR s.import_batch NOT LIKE 's24_%%')
+                   AND (s.import_batch IS NULL OR s.import_batch NOT LIKE 's28_cleanup_%%')
                    AND NOT EXISTS (
                        SELECT 1 FROM subscriptions s2
                        WHERE lower(s2.email) = lower(s.email)
@@ -6448,7 +6449,15 @@ async def health():
     db_status = "connected" if db_pool else "not connected"
     stripe_status = "configured" if STRIPE_SECRET_KEY else "not configured"
     digest_status = "active" if (RESEND_API_KEY and DIGEST_RECIPIENTS and scheduler) else "disabled"
-    shadow_sync_status = "active" if (YMOVE_API_KEY and scheduler) else "disabled"
+    # Shadow sync status: check for actual job registration, not just scheduler existence.
+    # S28 paused the shadow sync by commenting out add_job; scheduler still runs digest.
+    shadow_sync_job_registered = False
+    if scheduler:
+        try:
+            shadow_sync_job_registered = scheduler.get_job("daily_shadow_sync") is not None
+        except Exception:
+            shadow_sync_job_registered = False
+    shadow_sync_status = "active" if (YMOVE_API_KEY and shadow_sync_job_registered) else "disabled"
     return {
         "status": "ok",
         "service": "Movement & Miles",
@@ -7105,7 +7114,8 @@ async def ymove_diff(request: Request):
               AND (
                 s_cancelled.import_batch LIKE 's23_%' OR
                 s_cancelled.import_batch LIKE 's24_%' OR
-                s_cancelled.import_batch LIKE 's25_%'
+                s_cancelled.import_batch LIKE 's25_%' OR
+                s_cancelled.import_batch LIKE 's28_%'
               )
               AND s_active.id != s_cancelled.id
             ORDER BY s_active.email
@@ -9176,6 +9186,7 @@ async def s26_backfill_pending(request: Request):
                  AND canceled_at IS NOT NULL
                  AND canceled_at > NOW() - ($1 || ' days')::INTERVAL
                  AND (import_batch IS NULL OR import_batch NOT LIKE '%s25_test_cancel_%')
+                 AND (import_batch IS NULL OR import_batch NOT LIKE 's28_cleanup_%')
                ORDER BY canceled_at DESC""",
             str(days)
         )
