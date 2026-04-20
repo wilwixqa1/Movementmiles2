@@ -290,17 +290,18 @@ async def startup():
                 id="daily_digest",
                 replace_existing=True,
             )
-            # S28 PAUSED: Daily shadow sync is disabled to protect S28 cleanup work
-            # from being undone by automated reactivation/relabeling. Re-enable in
-            # S29 after the reconciliation discussion with Tosh and Ahmed is resolved.
-            # See docs/s28/ for context. To re-enable, uncomment the block below.
-            # if YMOVE_API_KEY:
-            #     scheduler.add_job(
-            #         run_daily_shadow_sync,
-            #         CronTrigger(hour=8, minute=0, timezone=et),
-            #         id="daily_shadow_sync",
-            #         replace_existing=True,
-            #     )
+            # S29: Re-enabled daily shadow sync after S28 cleanup work was verified
+            # safe (run_27 on 2026-04-20 confirmed guardrails hold: 0 S28 cleanup
+            # records were touched). S29 also added s28_cleanup_% exclusion to the
+            # reactivation guard and expanded Step 0 past_due skip to prevent
+            # duplicate creation for past_due Stripe users.
+            if YMOVE_API_KEY:
+                scheduler.add_job(
+                    run_daily_shadow_sync,
+                    CronTrigger(hour=8, minute=0, timezone=et),
+                    id="daily_shadow_sync",
+                    replace_existing=True,
+                )
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
             print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg})")
@@ -3760,21 +3761,28 @@ async def run_daily_shadow_sync():
                         if not email:
                             continue
 
-                        # S24 Step 0: Skip if email already has ANY active record.
-                        # Bug fix: previous waterfall only checked Meg/Stripe ID patterns,
-                        # not "is there already an active record for this email at all?"
+                        # S24 Step 0: Skip if email already has ANY active-ish record.
+                        # S29 update: also includes 'past_due'. Why: the 14 past_due Stripe
+                        # records appear in ymove's bulk pull as subscribed (ymove counts
+                        # dunning as active). Without this, the daily sync would fall through
+                        # the waterfall (Meg check misses sub_* IDs, Stripe check filters to
+                        # status=active only and misses past_due) and create duplicate
+                        # ymove_new_undetermined_* records. Excluding past_due here keeps
+                        # those records as-is; webhook pipeline updates their status.
+                        # Original S24 context: previous waterfall only checked Meg/Stripe
+                        # ID patterns, not "is there already an active record at all?"
                         # Result: emails with existing ymove_new_apple_* records would get
                         # a NEW ymove_new_undetermined_* record inserted alongside, because
-                        # the synthetic IDs differ in the provider segment so ON CONFLICT misses.
-                        # 9 manual duplicates created on 2026-04-11 traced to this gap.
+                        # the synthetic IDs differ in the provider segment so ON CONFLICT
+                        # misses. 9 manual duplicates created on 2026-04-11 traced to this.
                         existing_active = await conn.fetchval(
                             """SELECT id FROM subscriptions
                                WHERE lower(email) = lower($1)
-                               AND status IN ('active', 'trialing')
+                               AND status IN ('active', 'trialing', 'past_due')
                                LIMIT 1""", email
                         )
                         if existing_active:
-                            print(f"[Daily Sync] Step 0 skip: {email} already has active record (id={existing_active})")
+                            print(f"[Daily Sync] Step 0 skip: {email} already has active/past_due record (id={existing_active})")
                             continue
 
                         # Step 1: Check Meg import records for known provider
