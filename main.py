@@ -2265,6 +2265,78 @@ async def inspect_email(request: Request):
     }
 
 
+@app.post("/api/admin/reclassify-undetermined")
+async def reclassify_undetermined(request: Request):
+    """S30 Change B backfill: reclassify undetermined records whose correct
+    provider is known from ymove. Pairs with the Change B waterfall update
+    that now uses ymove's provider for apple/google truly_new imports.
+
+    Body: {assignments: [{email, new_source}, ...], preview: true/false}
+    Updates subscriptions.source for matching undetermined records.
+    Batch-tagged with s30_reclassify_undet_<ts> for revert.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    assignments = body.get("assignments", [])
+    preview = body.get("preview", True)
+    if not assignments:
+        return JSONResponse(status_code=400, content={"error": "assignments list required"})
+    for a in assignments:
+        if a.get("new_source") not in ("apple", "google"):
+            return JSONResponse(status_code=400, content={"error": f"Invalid new_source in {a}: must be apple or google"})
+
+    batch_id = f"s30_reclassify_undet_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        results = []
+        for a in assignments:
+            email = a["email"].strip().lower()
+            new_source = a["new_source"]
+            # Only target undetermined records. Don't touch stripe/apple/google records.
+            row = await conn.fetchrow(
+                """SELECT id, stripe_subscription_id, source, status
+                   FROM subscriptions
+                   WHERE lower(email) = $1
+                     AND source = 'undetermined'
+                     AND status IN ('active', 'trialing')
+                   ORDER BY created_at DESC LIMIT 1""",
+                email
+            )
+            if not row:
+                results.append({"email": email, "action": "skipped", "reason": "no active undetermined record"})
+                continue
+            if preview:
+                results.append({
+                    "email": email, "action": "would_reclassify",
+                    "id": row["id"], "sub_id": row["stripe_subscription_id"],
+                    "from_source": "undetermined", "to_source": new_source
+                })
+            else:
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET source = $1, updated_at = NOW(), import_batch = $2
+                       WHERE id = $3""",
+                    new_source, batch_id, row["id"]
+                )
+                results.append({
+                    "email": email, "action": "reclassified",
+                    "id": row["id"], "sub_id": row["stripe_subscription_id"],
+                    "from_source": "undetermined", "to_source": new_source
+                })
+
+    return {
+        "status": "preview" if preview else "ok",
+        "batch_id": batch_id if not preview else None,
+        "total": len(assignments),
+        "results": results,
+        "revert_hint": f"Revert: UPDATE subscriptions SET source='undetermined' WHERE import_batch='{batch_id}'"
+    }
+
+
 @app.post("/api/admin/null-out-false-conversions-v2")
 async def null_out_false_conversions_v2(request: Request):
     """S30 follow-up: Null out Meg-imported Apple/Google subs (import_*_* /
@@ -4324,7 +4396,12 @@ async def run_daily_shadow_sync():
             all_unknown = switcher_list + [t for t in truly_new_list if not _is_test_email(t.get("email", ""))]
 
             if all_unknown:
-                # Three-step waterfall: Meg import → Stripe API → undetermined
+                # Four-step waterfall: ymove provider (apple/google) → Meg import → Stripe API → undetermined
+                # S30 Change B: ymove's bulk pull tells us the provider for each sub.
+                # When it says apple/google, trust that and import with correct source
+                # instead of falling through to undetermined. For stripe/manual/null,
+                # fall through to the original waterfall (stripe gets verified via API).
+                ymove_provider_identified = []
                 meg_identified = []
                 stripe_identified = []
                 non_stripe = []
@@ -4360,6 +4437,20 @@ async def run_daily_shadow_sync():
                             print(f"[Daily Sync] Step 0 skip: {email} already has active/past_due record (id={existing_active})")
                             continue
 
+                        # S30 Change B — Step 0.5: If ymove told us the provider is
+                        # apple or google, trust that. This avoids falling through to
+                        # 'undetermined' when we have good data upstream. Validated
+                        # against sofiaredivo90 (apple) and rapakiwi (google), both of
+                        # which the 2026-04-20 sync imported as undetermined despite
+                        # ymove telling us the correct provider.
+                        # For stripe/manual/null provider values: fall through to the
+                        # original waterfall so (a) Stripe gets verified via API, and
+                        # (b) manual/unknown records stay in the cautious path.
+                        ymove_provider = item.get("provider", "")
+                        if ymove_provider in ("apple", "google"):
+                            ymove_provider_identified.append({"email": email, "source": ymove_provider})
+                            continue
+
                         # Step 1: Check Meg import records for known provider
                         meg_record = await conn.fetchrow(
                             """SELECT source FROM subscriptions
@@ -4391,6 +4482,30 @@ async def run_daily_shadow_sync():
                         except Exception as e:
                             stripe_errors += 1
                             non_stripe.append({"email": email})
+
+                # S30 Change B: Auto-import ymove-provider-identified users with correct source
+                # (apple/google as told by ymove's bulk pull). Uses same synthetic ID format
+                # as the Meg waterfall so dedup / reactivation semantics match.
+                imported_ymove_provider = 0
+                if ymove_provider_identified:
+                    batch_id_ymove_prov = f"autosync_ymove_provider_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    async with db_pool.acquire() as conn:
+                        for item in ymove_provider_identified:
+                            email_hash = hashlib.md5(item["email"].encode()).hexdigest()[:16]
+                            syn_id = f"ymove_new_{item['source']}_{email_hash}"
+                            try:
+                                await conn.execute("""
+                                    INSERT INTO subscriptions (
+                                        stripe_customer_id, stripe_subscription_id, email, status,
+                                        plan_interval, plan_amount, currency, source,
+                                        created_at, updated_at, import_batch
+                                    ) VALUES ('', $1, $2, 'active', 'month', 1999, 'usd', $3, NOW(), NOW(), $4)
+                                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                                """, syn_id, item["email"], item["source"], batch_id_ymove_prov)
+                                imported_ymove_provider += 1
+                            except Exception as e:
+                                print(f"[Daily Sync] ymove-provider import error for {item['email']}: {e}")
+                    print(f"[Daily Sync] Auto-imported {imported_ymove_provider} ymove-provider-identified users (batch={batch_id_ymove_prov})")
 
                 # Auto-import Meg-identified users with correct source
                 if meg_identified:
@@ -4459,6 +4574,7 @@ async def run_daily_shadow_sync():
 
                 # Log summary
                 print(f"[Daily Sync] Gap report: {len(all_unknown)} users in ymove not in our DB. "
+                      f"ymove-provider-identified: {len(ymove_provider_identified)}, "
                       f"Meg-identified: {len(meg_identified)}, Stripe: {len(stripe_identified)}, "
                       f"Undetermined: {len(non_stripe)}, Stripe errors: {stripe_errors}")
             else:
