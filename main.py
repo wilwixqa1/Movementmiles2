@@ -294,6 +294,8 @@ async def startup():
                     await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_email_lower ON subscriptions (lower(email))")
                     await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_trial_start ON subscriptions (trial_start) WHERE trial_start IS NOT NULL")
                     await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_import_batch ON subscriptions (import_batch) WHERE import_batch IS NOT NULL")
+                    # S30: index for effective_canceled_at used by churn and LTV metrics
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_effective_canceled_at ON subscriptions (effective_canceled_at) WHERE effective_canceled_at IS NOT NULL")
                 print("[Startup] Block 4: Indexes ready")
             except Exception as e:
                 print(f"[Startup] Index creation deferred (non-fatal): {e}")
@@ -1577,10 +1579,11 @@ async def gather_daily_stats() -> dict:
         )
 
         # Cancellations in last 24h (S22: include converted_at to distinguish paid vs trial)
+        # S30: use effective_canceled_at so batch cleanup events don't appear as fresh cancels.
         cancellations = await conn.fetch(
-            """SELECT source, email, canceled_at, converted_at, trial_end FROM subscriptions
-               WHERE canceled_at > NOW() - INTERVAL '24 hours'
-               ORDER BY canceled_at DESC"""
+            """SELECT source, email, effective_canceled_at AS canceled_at, converted_at, trial_end FROM subscriptions
+               WHERE effective_canceled_at > NOW() - INTERVAL '24 hours'
+               ORDER BY effective_canceled_at DESC"""
         )
 
         # Current MRR
@@ -6116,19 +6119,21 @@ async def admin_stats(request: Request):
         ) or 0
 
         # Churn: canceled in last 30 days vs active at start of period
+        # S30: use effective_canceled_at to exclude batch cleanup events that write
+        # canceled_at = NOW() for records that actually churned weeks/months earlier.
         churned_30d = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
-               WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'"""
+               WHERE status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '30 days'"""
         )
         # S22: Split churn into paid vs trial
         churned_30d_paid = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
-               WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'
+               WHERE status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '30 days'
                AND converted_at IS NOT NULL"""
         )
         churned_30d_trial = await conn.fetchval(
             """SELECT COUNT(*) FROM subscriptions
-               WHERE status = 'canceled' AND canceled_at > NOW() - INTERVAL '30 days'
+               WHERE status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '30 days'
                AND converted_at IS NULL"""
         )
 
@@ -6177,9 +6182,11 @@ async def admin_stats(request: Request):
             "SELECT COUNT(*) FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''"
         )
 
-        # Phase 5b: MRR trend - weekly (last 12 weeks) + monthly (last 12 months)
-        # Note: reactivated subs count from their created_at because they were paying
-        # on Apple/Google the whole time - our DB just had bad data before S19 reconciliation.
+        # S30: MRR trend uses effective_canceled_at, not canceled_at. A sub contributes
+        # to MRR at week w if: (a) created before w, AND (b) still active today, OR
+        # cancelled with effective_canceled_at > w. Batch cleanup records with NULL
+        # effective_canceled_at but status='canceled' are EXCLUDED (honest: we don't
+        # know when they actually churned, so we can't place them on the timeline).
         mrr_trend_weekly = await conn.fetch(
             """SELECT
                 to_char(w, 'YYYY-MM-DD') as period,
@@ -6191,7 +6198,7 @@ async def admin_stats(request: Request):
                    '1 week'::interval
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
-                   AND (s.canceled_at IS NULL OR s.canceled_at > w)
+                   AND (s.status IN ('active', 'trialing') OR s.effective_canceled_at > w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
@@ -6206,17 +6213,26 @@ async def admin_stats(request: Request):
                    '1 month'::interval
                ) AS w
                LEFT JOIN subscriptions s ON s.created_at <= w
-                   AND (s.canceled_at IS NULL OR s.canceled_at > w)
+                   AND (s.status IN ('active', 'trialing') OR s.effective_canceled_at > w)
                    AND s.status != 'incomplete_expired'
                GROUP BY w ORDER BY w"""
         )
 
         # Avg subscriber lifetime (all who ever converted â includes churned for honest LTV)
+        # S30: Avg subscriber lifetime (converted subs, for honest LTV).
+        # Uses effective_canceled_at. Active subs use NOW() as end bound. Canceled
+        # subs with real effective date use that. Canceled subs with NULL effective
+        # (batch cleanups) are EXCLUDED since true churn timing is unknown and
+        # including them with a NOW() end-bound would inflate the average.
         avg_sub_age = await conn.fetchval(
-            """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (COALESCE(canceled_at, NOW()) - created_at)) / 86400), 0)
+            """SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (
+                   CASE WHEN status IN ('active', 'trialing') THEN NOW()
+                        ELSE effective_canceled_at END
+                   - created_at)) / 86400), 0)
                FROM subscriptions
-               WHERE converted_at IS NOT NULL
-               OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end)"""
+               WHERE (converted_at IS NOT NULL
+                      OR (trial_end IS NOT NULL AND current_period_start IS NOT NULL AND current_period_start > trial_end))
+                 AND (status IN ('active', 'trialing') OR effective_canceled_at IS NOT NULL)"""
         )
 
         # Avg monthly revenue per converted sub (includes churned for honest LTV)
