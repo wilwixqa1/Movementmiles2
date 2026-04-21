@@ -1705,6 +1705,76 @@ async def gather_daily_stats() -> dict:
         total_fees_cents += fee
     net_mrr_cents = current_mrr_cents - total_fees_cents
 
+    # S30c: Check reconciliation snapshot for drift/duplicate/sync-health warnings.
+    # Three conditions trigger a warning block in the digest:
+    #   1. Latest snapshot missing (no successful sync today) OR sync failed
+    #   2. Drift > 1% between our and ymove active totals
+    #   3. Any email with 2+ active/trialing rows
+    # If all three are clean, warnings list is empty and digest looks normal.
+    reconciliation_warnings = []
+    try:
+        async with db_pool.acquire() as conn:
+            latest_snap = await conn.fetchrow(
+                """SELECT * FROM reconciliation_snapshots
+                   ORDER BY created_at DESC LIMIT 1"""
+            )
+            latest_run = await conn.fetchrow(
+                "SELECT id, status, started_at, completed_at, error FROM ymove_sync_runs ORDER BY started_at DESC LIMIT 1"
+            )
+        # Sync health: snapshot must exist and be from today (ET).
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        today_et_date = now_et.date()
+        if not latest_snap:
+            reconciliation_warnings.append({
+                "severity": "high",
+                "category": "sync_health",
+                "message": "No reconciliation snapshot found. The daily sync has not written one yet."
+            })
+        else:
+            snap_date_et = latest_snap["created_at"].astimezone(ZoneInfo("America/New_York")).date()
+            if snap_date_et < today_et_date:
+                reconciliation_warnings.append({
+                    "severity": "high",
+                    "category": "sync_health",
+                    "message": f"Latest reconciliation snapshot is from {snap_date_et} ET, not today ({today_et_date} ET). The 8 AM sync likely did not run."
+                })
+            # Drift: > 1% is a warning
+            delta_pct = float(latest_snap["delta_pct"] or 0)
+            if delta_pct > 1.0:
+                reconciliation_warnings.append({
+                    "severity": "high",
+                    "category": "drift",
+                    "message": (f"Drift between our and ymove active totals is {delta_pct}% "
+                                f"(ours: {latest_snap['our_active_total']}, ymove: {latest_snap['ymove_active_total']}). "
+                                f"Threshold is 1%.")
+                })
+            # Duplicates
+            dup_list = latest_snap["active_duplicate_emails"] if isinstance(latest_snap["active_duplicate_emails"], list) \
+                       else (json.loads(latest_snap["active_duplicate_emails"]) if latest_snap["active_duplicate_emails"] else [])
+            if dup_list:
+                reconciliation_warnings.append({
+                    "severity": "medium",
+                    "category": "duplicates",
+                    "message": f"{len(dup_list)} email(s) have 2+ active/trialing subscription records: {', '.join(d['email'] for d in dup_list[:5])}{'...' if len(dup_list) > 5 else ''}"
+                })
+            # Verify errors
+            verify_errors = latest_snap["verify_errors"] or 0
+            if verify_errors > 0:
+                reconciliation_warnings.append({
+                    "severity": "medium",
+                    "category": "sync_health",
+                    "message": f"Latest sync run had {verify_errors} verify error(s) while checking individual ymove lookups."
+                })
+        # Failed run
+        if latest_run and latest_run["status"] == "failed":
+            reconciliation_warnings.append({
+                "severity": "high",
+                "category": "sync_health",
+                "message": f"Latest sync run (id={latest_run['id']}) FAILED: {latest_run['error'] or 'no error detail'}"
+            })
+    except Exception as e:
+        print(f"[Digest] Reconciliation warnings check error: {e}")
+
     return {
         "conversions_today": len(conversions_today),
         "conversion_details": [{"email": r["email"] or "n/a", "source": r["source"], "plan": f"${(r['plan_amount'] or 0)/100:.2f}/{r['plan_interval'] or '?'}"} for r in conversions_today],
@@ -1733,6 +1803,7 @@ async def gather_daily_stats() -> dict:
         "mrr_by_source": [{"source": r["source"], "mrr_cents": r["mrr_cents"] or 0} for r in mrr_by_source],
         "subs_by_utm_24h": [{"channel": r["channel"], "count": r["count"]} for r in subs_by_utm_24h],
         "top_traffic_7d": [{"channel": r["channel"], "views": r["views"]} for r in top_traffic_7d],
+        "reconciliation_warnings": reconciliation_warnings,
     }
 
 
@@ -1798,6 +1869,36 @@ def build_digest_html(stats: dict, insights: str) -> str:
     # Format insights â convert newlines and bullet points to HTML
     insights_html = insights_clean.replace("\n\n", "</p><p style='margin:0 0 12px'>").replace("\n- ", "<br>&#8226; ").replace("\n", "<br>")
 
+    # S30c: Build reconciliation warning block. Only rendered when warnings exist.
+    # Amber for medium severity, red for high severity.
+    warnings = stats.get("reconciliation_warnings", [])
+    warnings_html = ""
+    if warnings:
+        has_high = any(w.get("severity") == "high" for w in warnings)
+        border_color = "#c0392b" if has_high else "#b35a00"
+        bg_color = "#fdecea" if has_high else "#fdf3e6"
+        title_color = "#7a1d15" if has_high else "#704100"
+        warning_items_html = ""
+        for w in warnings:
+            sev_label = "HIGH" if w.get("severity") == "high" else "NOTICE"
+            sev_color = "#c0392b" if w.get("severity") == "high" else "#b35a00"
+            cat = (w.get("category") or "").replace("_", " ").title()
+            msg = w.get("message", "")
+            warning_items_html += (
+                f'<tr><td style="padding:8px 0;font-size:13px;line-height:1.5;color:#333">'
+                f'<span style="display:inline-block;padding:2px 8px;font-size:10px;font-weight:700;color:#fff;background:{sev_color};border-radius:4px;vertical-align:middle;margin-right:8px">{sev_label}</span>'
+                f'<strong style="color:{title_color}">{cat}:</strong> {msg}'
+                f'</td></tr>'
+            )
+        warnings_html = (
+            f'<tr><td style="padding:20px 32px 0">'
+            f'<div style="background:{bg_color};border-left:4px solid {border_color};border-radius:0 8px 8px 0;padding:14px 18px">'
+            f'<h3 style="margin:0 0 6px;color:{title_color};font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em">Reconciliation Warnings</h3>'
+            f'<table width="100%" cellpadding="0" cellspacing="0">{warning_items_html}</table>'
+            f'</div>'
+            f'</td></tr>'
+        )
+
     html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
@@ -1811,6 +1912,8 @@ def build_digest_html(stats: dict, insights: str) -> str:
   <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:600">Movement &amp; Miles</h1>
   <p style="margin:6px 0 0;color:rgba(255,255,255,0.7);font-size:13px">Daily Digest &mdash; {date_str}</p>
 </td></tr>
+
+{warnings_html}
 
 <!-- AI Insights -->
 <tr><td style="padding:28px 32px 20px">
@@ -2262,6 +2365,137 @@ async def inspect_email(request: Request):
                 else "truly_new"
             )
         }
+    }
+
+
+@app.get("/api/admin/list-sync-runs")
+async def list_sync_runs(request: Request):
+    """S30c: Diagnostic endpoint returning the most recent N ymove_sync_runs rows.
+    Useful for verifying the scheduled cron fired, debugging off-by-one run_id
+    questions, and seeing historical run status at a glance.
+    Usage: /api/admin/list-sync-runs?pw=mmadmin2026&limit=10"""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", 10)), 100))
+    except ValueError:
+        limit = 10
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, status, phase, started_at, completed_at,
+                      progress_current, progress_total,
+                      our_active_count, ymove_active_count, error
+               FROM ymove_sync_runs
+               ORDER BY started_at DESC LIMIT $1""",
+            limit
+        )
+    return {
+        "count": len(rows),
+        "runs": [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "phase": r["phase"],
+                "started_at": str(r["started_at"]) if r["started_at"] else None,
+                "completed_at": str(r["completed_at"]) if r["completed_at"] else None,
+                "duration_seconds": (
+                    (r["completed_at"] - r["started_at"]).total_seconds()
+                    if r["completed_at"] and r["started_at"] else None
+                ),
+                "progress": f"{r['progress_current']}/{r['progress_total']}" if r["progress_total"] else None,
+                "our_active_count": r["our_active_count"],
+                "ymove_active_count": r["ymove_active_count"],
+                "error": r["error"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/admin/run-daily-sync-now")
+async def run_daily_sync_now(request: Request):
+    """S30c: Manually trigger run_daily_shadow_sync. Useful when the scheduled
+    8 AM cron missed (Railway cold-start) or for testing without waiting for
+    the next day.
+
+    Fires the full daily sync pipeline including auto-apply of deactivations
+    and reactivations, snapshot write, and waterfall imports. Runs in the
+    background; poll /api/admin/list-sync-runs to see progress.
+
+    Body: {confirm: true} required to execute (defense against accidental clicks).
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    if not body.get("confirm"):
+        return JSONResponse(status_code=400, content={
+            "error": "Pass {confirm: true} to execute. This fires the daily sync right now with auto-apply of changes."
+        })
+
+    # Fire the daily sync as a background task so this endpoint returns fast.
+    asyncio.create_task(run_daily_shadow_sync())
+    return {
+        "status": "started",
+        "note": "Daily sync started in background. Poll /api/admin/list-sync-runs to check progress.",
+        "poll_hint": "fetch('/api/admin/list-sync-runs?pw=mmadmin2026&limit=3').then(r=>r.json()).then(d=>console.log(d))"
+    }
+
+
+@app.get("/api/admin/list-snapshots")
+async def list_snapshots(request: Request):
+    """S30c: Return the most recent N reconciliation_snapshots rows.
+    Useful for historical drift inspection and verifying the snapshot writer
+    is running. Usage: /api/admin/list-snapshots?pw=mmadmin2026&limit=14"""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", 14)), 365))
+    except ValueError:
+        limit = 14
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, run_id, created_at,
+                      our_active_total, ymove_active_total,
+                      our_by_source, ymove_by_provider,
+                      active_duplicate_emails, verify_errors,
+                      pull_all_status, delta_pct
+               FROM reconciliation_snapshots
+               ORDER BY created_at DESC LIMIT $1""",
+            limit
+        )
+    def _parse(v):
+        if v is None or isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+    return {
+        "count": len(rows),
+        "snapshots": [
+            {
+                "id": r["id"],
+                "run_id": r["run_id"],
+                "created_at": str(r["created_at"]),
+                "our_active_total": r["our_active_total"],
+                "ymove_active_total": r["ymove_active_total"],
+                "delta_pct": float(r["delta_pct"]) if r["delta_pct"] is not None else None,
+                "our_by_source": _parse(r["our_by_source"]),
+                "ymove_by_provider": _parse(r["ymove_by_provider"]),
+                "active_duplicate_emails": _parse(r["active_duplicate_emails"]),
+                "verify_errors": r["verify_errors"],
+                "pull_all_status": r["pull_all_status"],
+            }
+            for r in rows
+        ]
     }
 
 
@@ -3892,6 +4126,15 @@ async def _run_shadow_sync(run_id: int):
                 else:
                     truly_new.append({"email": email, "provider": ymove_all_emails.get(email, "undetermined")})
 
+        # S30: per-provider breakdown of ymove's active set, used by reconciliation
+        # snapshots written after successful daily syncs.
+        ymove_by_provider = {"apple": 0, "google": 0, "stripe": 0, "manual": 0, "null": 0}
+        for _email, _prov in ymove_all_emails.items():
+            if _prov in ("apple", "google", "stripe", "manual"):
+                ymove_by_provider[_prov] += 1
+            else:
+                ymove_by_provider["null"] += 1
+
         # Build final results
         results = {
             "to_deactivate": to_deactivate,
@@ -3909,6 +4152,7 @@ async def _run_shadow_sync(run_id: int):
             "verified_count": len(verify_results),
             "provider_healed": provider_healed,
             "s26_conflicting_expired_vs_bulk": conflicting_expired_vs_bulk,
+            "ymove_by_provider": ymove_by_provider,
         }
 
         async with db_pool.acquire() as conn:
@@ -4334,6 +4578,70 @@ async def backfill_ymove_dates(request: Request):
     }
 
 
+async def _write_reconciliation_snapshot(run_id: int, res_data: dict):
+    """S30c: Write a row to reconciliation_snapshots capturing the state of the
+    two systems at the time of a successful sync run. Called by
+    run_daily_shadow_sync after a successful completion. Feeds both the
+    digest warning block and the list-snapshots diagnostic endpoint.
+
+    Fails gracefully: if anything goes wrong, log and return without raising.
+    Missing a snapshot is bad but not fatal. Silently failing would be worse
+    than a log line and a missing row."""
+    if not db_pool:
+        return
+    try:
+        # Our active breakdown by source (plus trialing, which is counted as active)
+        async with db_pool.acquire() as conn:
+            by_source_rows = await conn.fetch(
+                """SELECT source, COUNT(*) AS n FROM subscriptions
+                   WHERE status IN ('active', 'trialing')
+                     AND email != '' AND email IS NOT NULL
+                   GROUP BY source"""
+            )
+            our_by_source = {r["source"] or "null": r["n"] for r in by_source_rows}
+            our_total = sum(our_by_source.values())
+
+            # Duplicate active emails: emails with 2+ active/trialing rows.
+            dup_rows = await conn.fetch(
+                """SELECT lower(email) AS email, COUNT(*) AS n
+                   FROM subscriptions
+                   WHERE status IN ('active', 'trialing')
+                     AND email != '' AND email IS NOT NULL
+                   GROUP BY lower(email)
+                   HAVING COUNT(*) > 1
+                   ORDER BY n DESC, lower(email)"""
+            )
+            duplicate_emails = [{"email": r["email"], "count": r["n"]} for r in dup_rows]
+
+        # ymove-side breakdown came from the sync results (computed during _run_shadow_sync)
+        ymove_by_provider = res_data.get("ymove_by_provider", {})
+        ymove_total = sum(ymove_by_provider.values())
+        verify_errors = res_data.get("errors", 0)
+        pull_all_status = res_data.get("pull_all_status", "unknown")
+
+        delta_pct = 0.0
+        if ymove_total > 0:
+            delta_pct = round(100 * abs(our_total - ymove_total) / ymove_total, 3)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO reconciliation_snapshots (
+                       run_id, our_active_total, ymove_active_total,
+                       our_by_source, ymove_by_provider, active_duplicate_emails,
+                       verify_errors, pull_all_status, delta_pct
+                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                run_id, our_total, ymove_total,
+                json.dumps(our_by_source, default=str),
+                json.dumps(ymove_by_provider, default=str),
+                json.dumps(duplicate_emails, default=str),
+                verify_errors, pull_all_status, delta_pct
+            )
+        print(f"[Daily Sync] Snapshot written: our={our_total}, ymove={ymove_total}, "
+              f"delta={delta_pct}%, duplicates={len(duplicate_emails)}, verify_errors={verify_errors}")
+    except Exception as e:
+        print(f"[Daily Sync] Snapshot write error: {e}")
+
+
 async def run_daily_shadow_sync():
     """Automated daily shadow sync: verify all Apple/Google against ymove, auto-apply safe changes."""
     print(f"[Daily Sync] Starting automated shadow sync at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
@@ -4579,6 +4887,11 @@ async def run_daily_shadow_sync():
                       f"Undetermined: {len(non_stripe)}, Stripe errors: {stripe_errors}")
             else:
                 print("[Daily Sync] No unknown users found. Webhook pipeline is healthy.")
+
+            # S30c: Write reconciliation snapshot for the digest warning block
+            # and historical drift monitoring. Runs regardless of whether there
+            # were any unknown users.
+            await _write_reconciliation_snapshot(run_id, res_data)
         else:
             status = run["status"] if run else "unknown"
             error = run.get("error", "") if run else ""
