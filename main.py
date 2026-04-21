@@ -2319,10 +2319,16 @@ async def null_out_false_conversions_v2(request: Request):
         )
 
         if preview:
+            # S30: aggregate converted_at by day for visibility into the backfill scope
+            day_distribution = {}
+            for r in targets:
+                day = str(r["converted_at"].date())
+                day_distribution[day] = day_distribution.get(day, 0) + 1
             return {
                 "status": "preview",
                 "batch_id": batch_id,
                 "would_null_out": len(targets),
+                "by_day": day_distribution,
                 "sample": [
                     {
                         "id": r["id"], "email": r["email"], "source": r["source"],
