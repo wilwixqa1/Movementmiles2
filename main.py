@@ -2265,6 +2265,104 @@ async def inspect_email(request: Request):
     }
 
 
+@app.post("/api/admin/null-out-false-conversions-v2")
+async def null_out_false_conversions_v2(request: Request):
+    """S30 follow-up: Null out Apple/Google subs where converted_at == trial_end
+    (exact microsecond match). This fingerprint identifies the S18 auto-stamp
+    bug where trial_end and converted_at were both set by a single batch operation
+    (converted_at = trial_end from the S18 stamper, where trial_end itself came
+    from the backfill-trial-dates endpoint). Real trial-to-paid transitions have
+    a small time gap between trial_end and the actual billing/conversion event.
+
+    Scope: source IN ('apple', 'google') only. Stripe webhook converted_at
+    stamps are correct and NEVER equal trial_end exactly -- Stripe's billing
+    event fires seconds-to-minutes after trial_end.
+
+    Excludes: reactivated_at IS NOT NULL records (already cleaned in v1).
+
+    Body: {preview: true/false}.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    preview = body.get("preview", True)
+
+    batch_id = f"s30_null_conversions_v2_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        targets = await conn.fetch(
+            """SELECT id, email, source, stripe_subscription_id,
+                      converted_at, trial_end, reactivated_at, created_at, import_batch
+               FROM subscriptions
+               WHERE converted_at IS NOT NULL
+                 AND trial_end IS NOT NULL
+                 AND converted_at = trial_end
+                 AND source IN ('apple', 'google')
+                 AND reactivated_at IS NULL
+               ORDER BY converted_at DESC"""
+        )
+
+        if preview:
+            return {
+                "status": "preview",
+                "batch_id": batch_id,
+                "would_null_out": len(targets),
+                "sample": [
+                    {
+                        "id": r["id"], "email": r["email"], "source": r["source"],
+                        "sub_id": r["stripe_subscription_id"],
+                        "converted_at": str(r["converted_at"]),
+                        "trial_end": str(r["trial_end"]),
+                        "created_at": str(r["created_at"]),
+                        "import_batch": r["import_batch"],
+                    }
+                    for r in targets[:25]
+                ],
+                "note": "All records have converted_at == trial_end exactly (microsecond match). These are S18 auto-stamp artifacts, not real trial->paid conversions. Send preview: false to apply."
+            }
+
+        nulled = 0
+        for r in targets:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET converted_at = NULL, updated_at = NOW() WHERE id = $1",
+                    r["id"]
+                )
+                try:
+                    await conn.execute(
+                        """INSERT INTO subscription_events (event_type, stripe_subscription_id, source, data, stripe_event_id)
+                           VALUES ('s30_null_conversion_v2', $1, $2, $3, $4)""",
+                        r["stripe_subscription_id"], r["source"],
+                        json.dumps({
+                            "batch_id": batch_id,
+                            "original_converted_at": str(r["converted_at"]),
+                            "trial_end": str(r["trial_end"]),
+                            "reason": "exact_microsecond_match_trial_end_equals_converted_at"
+                        }),
+                        f"{batch_id}_{r['id']}"
+                    )
+                except Exception as _e:
+                    print(f"[S30 null-conv v2] audit log error for {r['id']}: {_e}")
+                nulled += 1
+            except Exception as e:
+                print(f"[S30 null-conv v2] error on {r['id']}: {e}")
+
+        return {
+            "status": "applied",
+            "batch_id": batch_id,
+            "nulled_out": nulled,
+            "total_targeted": len(targets),
+            "revert_hint": "Same revert mechanism as v1: POST /api/admin/revert-s30-null-conversions with batch_id."
+        }
+
+
 @app.get("/api/admin/inspect-converted-at-cluster")
 async def inspect_converted_at_cluster(request: Request):
     """S30: Deep-dive endpoint for a suspicious cluster of converted_at stamps.
@@ -2630,7 +2728,7 @@ async def revert_s30_null_conversions(request: Request):
     async with db_pool.acquire() as conn:
         events = await conn.fetch(
             """SELECT stripe_subscription_id, data FROM subscription_events
-               WHERE event_type = 's30_null_conversion'
+               WHERE event_type IN ('s30_null_conversion', 's30_null_conversion_v2')
                  AND stripe_event_id LIKE $1""",
             f"{batch_id}_%"
         )
