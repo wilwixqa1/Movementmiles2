@@ -245,6 +245,25 @@ async def startup():
                         error TEXT
                     )
                 """)
+                # S30: snapshot of every successful daily sync for drift monitoring.
+                # Written by run_daily_shadow_sync after a successful run. Read by the
+                # daily digest (warning block conditional on drift / duplicates /
+                # sync health) and by the list-snapshots diagnostic endpoint.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        run_id INTEGER,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        our_active_total INTEGER DEFAULT 0,
+                        ymove_active_total INTEGER DEFAULT 0,
+                        our_by_source JSONB,
+                        ymove_by_provider JSONB,
+                        active_duplicate_emails JSONB,
+                        verify_errors INTEGER DEFAULT 0,
+                        pull_all_status TEXT,
+                        delta_pct NUMERIC
+                    )
+                """)
             print("[Startup] Block 3: Analytics tables ready")
 
             # Block 3b: UTM links table (S23)
@@ -2240,6 +2259,116 @@ async def inspect_email(request: Request):
                 else "truly_new"
             )
         }
+    }
+
+
+@app.get("/api/admin/inspect-conversions-30d")
+async def inspect_conversions_30d(request: Request):
+    """S30: Diagnostic for the paid-conversions-30d metric.
+    Breaks down conversions in the last 30d by source, by import_batch pattern,
+    and by reactivation status. Helps identify whether cleanup operations
+    (reactivations, batch imports) are inflating the conversion count.
+    Usage: /api/admin/inspect-conversions-30d?pw=mmadmin2026"""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+
+    async with db_pool.acquire() as conn:
+        # Total conversions in last 30d
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE converted_at > NOW() - INTERVAL '30 days'"
+        ) or 0
+
+        # Breakdown by source
+        by_source = await conn.fetch(
+            """SELECT source, COUNT(*) AS n
+               FROM subscriptions
+               WHERE converted_at > NOW() - INTERVAL '30 days'
+               GROUP BY source ORDER BY n DESC"""
+        )
+
+        # Breakdown: reactivated vs fresh conversions
+        # Reactivated = reactivated_at IS NOT NULL. Conversion stamp may have happened
+        # AFTER the reactivation in some cleanup scenarios.
+        reactivated_in_window = await conn.fetchval(
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE converted_at > NOW() - INTERVAL '30 days'
+                 AND reactivated_at IS NOT NULL"""
+        ) or 0
+
+        # Breakdown: subs whose converted_at was stamped AFTER the sub was already
+        # active/known (suspicious -- these are likely cleanup stamps, not fresh conversions).
+        # Heuristic: converted_at - created_at > 7 days AND reactivated_at IS NOT NULL
+        # OR converted_at > created_at + 90 days (was active for 3+ months before "converting")
+        suspicious = await conn.fetch(
+            """SELECT id, email, source, stripe_subscription_id,
+                      converted_at, created_at, reactivated_at,
+                      trial_start, trial_end, import_batch,
+                      EXTRACT(DAY FROM (converted_at - created_at)) AS days_between
+               FROM subscriptions
+               WHERE converted_at > NOW() - INTERVAL '30 days'
+                 AND (
+                      reactivated_at IS NOT NULL
+                      OR (converted_at - created_at) > INTERVAL '90 days'
+                 )
+               ORDER BY converted_at DESC"""
+        )
+
+        # Breakdown by import_batch pattern
+        by_batch = await conn.fetch(
+            """SELECT COALESCE(
+                       CASE
+                         WHEN import_batch LIKE 'meg_ag_%' THEN 'meg_ag_* (Meg import)'
+                         WHEN import_batch LIKE 's23_%' THEN 's23_* (provider cleanup)'
+                         WHEN import_batch LIKE 's24_%' THEN 's24_*'
+                         WHEN import_batch LIKE 's25_%' THEN 's25_*'
+                         WHEN import_batch LIKE 's26_%' THEN 's26_*'
+                         WHEN import_batch LIKE 's28_%' THEN 's28_*'
+                         WHEN import_batch LIKE 'shadow_%' THEN 'shadow_* (shadow sync)'
+                         WHEN import_batch LIKE 'autosync_%' THEN 'autosync_* (daily sync)'
+                         WHEN import_batch LIKE 'ymove_%' THEN 'ymove_*'
+                         ELSE import_batch
+                       END, '(null)') AS batch_bucket,
+                      COUNT(*) AS n
+               FROM subscriptions
+               WHERE converted_at > NOW() - INTERVAL '30 days'
+               GROUP BY batch_bucket
+               ORDER BY n DESC"""
+        )
+
+        # Timeline: conversions_at date distribution
+        timeline = await conn.fetch(
+            """SELECT DATE(converted_at) AS day, COUNT(*) AS n
+               FROM subscriptions
+               WHERE converted_at > NOW() - INTERVAL '30 days'
+               GROUP BY day ORDER BY day DESC"""
+        )
+
+    return {
+        "total_conversions_30d": total,
+        "reactivated_in_window": reactivated_in_window,
+        "reactivated_pct_of_total": round(100 * reactivated_in_window / total, 1) if total else 0,
+        "by_source": [{"source": r["source"], "n": r["n"]} for r in by_source],
+        "by_import_batch": [{"batch": r["batch_bucket"], "n": r["n"]} for r in by_batch],
+        "timeline": [{"day": str(r["day"]), "n": r["n"]} for r in timeline],
+        "suspicious_count": len(suspicious),
+        "suspicious_sample": [
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "source": r["source"],
+                "sub_id": r["stripe_subscription_id"],
+                "converted_at": str(r["converted_at"]),
+                "created_at": str(r["created_at"]),
+                "reactivated_at": str(r["reactivated_at"]) if r["reactivated_at"] else None,
+                "trial_end": str(r["trial_end"]) if r["trial_end"] else None,
+                "import_batch": r["import_batch"],
+                "days_created_to_converted": int(r["days_between"]) if r["days_between"] is not None else None,
+            }
+            for r in suspicious[:50]
+        ],
+        "note": "reactivated_in_window suggests conversions that were stamped post-reactivation. Suspicious records have either reactivated_at set OR days_created_to_converted > 90."
     }
 
 
