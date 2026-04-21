@@ -1334,7 +1334,12 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Apple dedup error: {e}")
 
-        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel)
+        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
+        # S30: Added reactivated_at IS NULL guard. Reactivated subs cannot be "newly
+        # converting" — their trial ended historically. Without this guard, ymove
+        # webhook events for reactivated subs would re-stamp converted_at to the
+        # current trial_end (which ymove sets to the current period_end), inflating
+        # the conversions_30d metric. 253 false-stamps on 2026-04-06 confirmed this bug.
         try:
             conv_check = await conn.fetchrow(
                 """SELECT id, trial_end FROM subscriptions
@@ -1343,7 +1348,8 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                    AND status = 'active'
                    AND trial_end IS NOT NULL
                    AND trial_end < NOW()
-                   AND canceled_at IS NULL""",
+                   AND canceled_at IS NULL
+                   AND reactivated_at IS NULL""",
                 transaction_id
             )
             if conv_check:
@@ -1453,7 +1459,8 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Google dedup error: {e}")
 
-        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel)
+        # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
+        # S30: Added reactivated_at IS NULL guard (see Apple handler for full rationale).
         try:
             conv_check = await conn.fetchrow(
                 """SELECT id, trial_end FROM subscriptions
@@ -1462,7 +1469,8 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                    AND status = 'active'
                    AND trial_end IS NOT NULL
                    AND trial_end < NOW()
-                   AND canceled_at IS NULL""",
+                   AND canceled_at IS NULL
+                   AND reactivated_at IS NULL""",
                 external_id
             )
             if conv_check:
@@ -1985,24 +1993,19 @@ async def run_daily_digest():
     """Orchestrator: auto-stamp conversions -> gather stats -> AI insights -> build email -> send."""
     print(f"[Digest] Starting daily digest at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
     try:
-        # S18: Auto-stamp Apple/Google conversions (trial expired + active + no cancel)
-        if db_pool:
-            try:
-                async with db_pool.acquire() as conn:
-                    result = await conn.execute(
-                        """UPDATE subscriptions SET converted_at = trial_end
-                           WHERE converted_at IS NULL
-                           AND source IN ('apple', 'google')
-                           AND status = 'active'
-                           AND trial_end IS NOT NULL
-                           AND trial_end < NOW()
-                           AND canceled_at IS NULL"""
-                    )
-                    stamped = int(result.split(" ")[-1]) if result else 0
-                    if stamped > 0:
-                        print(f"[Digest] Auto-stamped {stamped} Apple/Google conversions")
-            except Exception as e:
-                print(f"[Digest] Auto-stamp error: {e}")
+        # S30: Previously, we auto-stamped converted_at = trial_end on Apple/Google subs
+        # that survived past their trial. This was a backfill for Meg-imported subs with
+        # unset converted_at. It has been disabled for two reasons:
+        #  1. Meg no longer imports subs; all new subs come via webhooks which stamp
+        #     converted_at correctly in real-time.
+        #  2. It false-stamped 253 subs on 2026-04-06: ymove sent webhook events for
+        #     previously-reactivated subs, the webhook UPSERT set trial_end = NOW(),
+        #     and this auto-stamp then set converted_at = trial_end = NOW(). Those 253
+        #     subs showed up as "paid conversions in last 30d" when they had actually
+        #     converted historically (or never). Conversion stamping must come from real
+        #     trial-to-paid webhook events only.
+        # The webhook-level stampers at _ymove_handle_created (Apple/Google) still run,
+        # but now with a reactivated_at IS NULL guard to prevent the same bug.
 
         stats = await gather_daily_stats()
         if "error" in stats:
@@ -2370,6 +2373,162 @@ async def inspect_conversions_30d(request: Request):
         ],
         "note": "reactivated_in_window suggests conversions that were stamped post-reactivation. Suspicious records have either reactivated_at set OR days_created_to_converted > 90."
     }
+
+
+@app.post("/api/admin/null-out-false-conversions")
+async def null_out_false_conversions(request: Request):
+    """S30: Backfill fix for the paid-conversions-30d inflation bug.
+    Nulls out converted_at for subs that were false-stamped during cleanup:
+    any sub where converted_at was set while reactivated_at is also set AND the
+    stamp happened close to or after the reactivation. These are NOT real
+    conversions -- they're cleanup-era false stamps caused by the ymove webhook
+    re-setting trial_end on reactivated subs, triggering the S18 conversion
+    detection.
+
+    Also includes records where converted_at was set > 90 days AFTER created_at
+    AND reactivated_at is present (strongly indicates historical sub that
+    got a fresh stamp during cleanup era).
+
+    Batch-tagged with s30_null_conversions_<ts> for revertibility.
+    Body: {preview: true/false}. Default is preview.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    preview = body.get("preview", True)
+
+    batch_id = f"s30_null_conversions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    async with db_pool.acquire() as conn:
+        # Target: subs with converted_at + reactivated_at BOTH set where the
+        # stamp likely was false (post-reactivation false-stamp).
+        # Rule: reactivated_at IS NOT NULL AND converted_at >= reactivated_at
+        # (the stamp came at or after reactivation, so cannot be from original trial).
+        targets = await conn.fetch(
+            """SELECT id, email, source, stripe_subscription_id,
+                      converted_at, reactivated_at, trial_end, created_at, import_batch
+               FROM subscriptions
+               WHERE converted_at IS NOT NULL
+                 AND reactivated_at IS NOT NULL
+                 AND converted_at >= reactivated_at
+               ORDER BY converted_at DESC"""
+        )
+
+        if preview:
+            return {
+                "status": "preview",
+                "batch_id": batch_id,
+                "would_null_out": len(targets),
+                "sample": [
+                    {
+                        "id": r["id"],
+                        "email": r["email"],
+                        "source": r["source"],
+                        "sub_id": r["stripe_subscription_id"],
+                        "converted_at": str(r["converted_at"]),
+                        "reactivated_at": str(r["reactivated_at"]),
+                        "trial_end": str(r["trial_end"]) if r["trial_end"] else None,
+                        "created_at": str(r["created_at"]),
+                        "import_batch": r["import_batch"],
+                    }
+                    for r in targets[:25]
+                ],
+                "note": "Send preview: false to execute. These records will have converted_at set to NULL. Their subscription records are otherwise unchanged."
+            }
+
+        # Apply: NULL out converted_at for targets. Tag with batch_id for revert.
+        # Note: we do NOT append batch_id to import_batch because that would
+        # clobber the original batch context. Instead we track the null-outs
+        # in a comment-only convention: revert = set converted_at = trial_end
+        # for records we target by this exact rule, which is what null-out does.
+        # To make reversible, we write an audit row to subscription_events.
+        nulled = 0
+        for r in targets:
+            try:
+                await conn.execute(
+                    "UPDATE subscriptions SET converted_at = NULL, updated_at = NOW() WHERE id = $1",
+                    r["id"]
+                )
+                # Audit log for revert
+                try:
+                    await conn.execute(
+                        """INSERT INTO subscription_events (event_type, stripe_subscription_id, source, data, stripe_event_id)
+                           VALUES ('s30_null_conversion', $1, $2, $3, $4)""",
+                        r["stripe_subscription_id"], r["source"],
+                        json.dumps({
+                            "batch_id": batch_id,
+                            "original_converted_at": str(r["converted_at"]),
+                            "reactivated_at": str(r["reactivated_at"]),
+                            "reason": "false_stamp_post_reactivation"
+                        }),
+                        f"{batch_id}_{r['id']}"
+                    )
+                except Exception as _e:
+                    # Audit log failure is non-fatal
+                    print(f"[S30 null-conv] audit log error for {r['id']}: {_e}")
+                nulled += 1
+            except Exception as e:
+                print(f"[S30 null-conv] error on {r['id']}: {e}")
+
+        return {
+            "status": "applied",
+            "batch_id": batch_id,
+            "nulled_out": nulled,
+            "total_targeted": len(targets),
+            "revert_hint": "POST /api/admin/revert-s30-null-conversions with batch_id to restore."
+        }
+
+
+@app.post("/api/admin/revert-s30-null-conversions")
+async def revert_s30_null_conversions(request: Request):
+    """S30: Undo null_out_false_conversions by restoring converted_at from the
+    audit log in subscription_events. Body: {batch_id: 's30_null_conversions_...'}.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    body = await request.json()
+    batch_id = body.get("batch_id", "")
+    if not batch_id or not batch_id.startswith("s30_null_conversions_"):
+        return JSONResponse(status_code=400, content={"error": "Valid batch_id required"})
+
+    async with db_pool.acquire() as conn:
+        events = await conn.fetch(
+            """SELECT stripe_subscription_id, data FROM subscription_events
+               WHERE event_type = 's30_null_conversion'
+                 AND stripe_event_id LIKE $1""",
+            f"{batch_id}_%"
+        )
+
+        restored = 0
+        errors = 0
+        for ev in events:
+            try:
+                data = ev["data"] if isinstance(ev["data"], dict) else json.loads(ev["data"])
+                original = data.get("original_converted_at")
+                if not original:
+                    continue
+                await conn.execute(
+                    """UPDATE subscriptions SET converted_at = $1, updated_at = NOW()
+                       WHERE stripe_subscription_id = $2 AND converted_at IS NULL""",
+                    datetime.fromisoformat(original.replace("Z", "+00:00")) if isinstance(original, str) else original,
+                    ev["stripe_subscription_id"]
+                )
+                restored += 1
+            except Exception as e:
+                errors += 1
+                print(f"[S30 revert null-conv] error: {e}")
+
+        return {"status": "ok", "batch_id": batch_id, "restored": restored, "errors": errors, "total_events": len(events)}
 
 
 @app.get("/api/admin/inspect-ymove-user")
@@ -4953,10 +5112,12 @@ async def sync_trialing(request: Request):
                     z["id"]
                 )
 
-                # If now active, they converted from trial and we missed it
+                # If now active, they converted from trial and we missed it.
+                # S30: Skip reactivated subs (they converted historically, not at trial_end).
                 if real_status == "active":
                     await conn.execute(
-                        "UPDATE subscriptions SET converted_at = COALESCE(trial_end, NOW()) WHERE id = $1 AND converted_at IS NULL",
+                        """UPDATE subscriptions SET converted_at = COALESCE(trial_end, NOW())
+                           WHERE id = $1 AND converted_at IS NULL AND reactivated_at IS NULL""",
                         z["id"]
                     )
                     results["now_active"] += 1
