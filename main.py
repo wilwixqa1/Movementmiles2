@@ -2280,18 +2280,21 @@ async def inspect_converted_at_cluster(request: Request):
     if not db_pool:
         return JSONResponse(status_code=500, content={"error": "no db"})
 
+    try:
+        day_obj = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": f"Invalid day format: {day}. Use YYYY-MM-DD."})
+
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, email, source, stripe_subscription_id,
                       converted_at, reactivated_at, trial_start, trial_end,
                       created_at, current_period_start, current_period_end,
-                      canceled_at, status, import_batch,
-                      EXTRACT(DAY FROM (converted_at - created_at)) AS days_created_to_converted,
-                      EXTRACT(EPOCH FROM (converted_at - trial_end)) AS seconds_trial_end_to_converted
+                      canceled_at, status, import_batch
                FROM subscriptions
                WHERE DATE(converted_at) = $1
                ORDER BY converted_at""",
-            day
+            day_obj
         )
 
         # Aggregate buckets
@@ -2336,7 +2339,11 @@ async def inspect_converted_at_cluster(request: Request):
             if r["trial_end"] and r["converted_at"] and r["trial_end"] == r["converted_at"]:
                 buckets["trial_end_equals_converted_at"] += 1
 
-            if r["seconds_trial_end_to_converted"] is not None and abs(r["seconds_trial_end_to_converted"]) < 1:
+            # Compute trial_end to converted_at delta in Python
+            secs_te_to_conv = None
+            if r["trial_end"] and r["converted_at"]:
+                secs_te_to_conv = (r["converted_at"] - r["trial_end"]).total_seconds()
+            if secs_te_to_conv is not None and abs(secs_te_to_conv) < 1:
                 buckets["trial_end_within_1s_of_converted"] += 1
 
             if r["created_at"]:
@@ -2354,8 +2361,15 @@ async def inspect_converted_at_cluster(request: Request):
                 buckets["autosync_pattern"] += 1
 
         # Sample records for human inspection
-        sample = [
-            {
+        sample = []
+        for r in rows[:30]:
+            days_c_to_conv = None
+            if r["created_at"] and r["converted_at"]:
+                days_c_to_conv = (r["converted_at"] - r["created_at"]).days
+            secs_te_to_conv = None
+            if r["trial_end"] and r["converted_at"]:
+                secs_te_to_conv = (r["converted_at"] - r["trial_end"]).total_seconds()
+            sample.append({
                 "id": r["id"],
                 "email": r["email"],
                 "source": r["source"],
@@ -2370,11 +2384,9 @@ async def inspect_converted_at_cluster(request: Request):
                 "canceled_at": str(r["canceled_at"]) if r["canceled_at"] else None,
                 "status": r["status"],
                 "import_batch": r["import_batch"],
-                "days_created_to_converted": int(r["days_created_to_converted"]) if r["days_created_to_converted"] is not None else None,
-                "seconds_trial_end_to_converted": float(r["seconds_trial_end_to_converted"]) if r["seconds_trial_end_to_converted"] is not None else None,
-            }
-            for r in rows[:30]
-        ]
+                "days_created_to_converted": days_c_to_conv,
+                "seconds_trial_end_to_converted": secs_te_to_conv,
+            })
 
     return {"day": day, "aggregates": buckets, "sample": sample}
 
