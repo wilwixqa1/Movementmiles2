@@ -2267,16 +2267,21 @@ async def inspect_email(request: Request):
 
 @app.post("/api/admin/null-out-false-conversions-v2")
 async def null_out_false_conversions_v2(request: Request):
-    """S30 follow-up: Null out Apple/Google subs where converted_at == trial_end
-    (exact microsecond match). This fingerprint identifies the S18 auto-stamp
-    bug where trial_end and converted_at were both set by a single batch operation
-    (converted_at = trial_end from the S18 stamper, where trial_end itself came
-    from the backfill-trial-dates endpoint). Real trial-to-paid transitions have
-    a small time gap between trial_end and the actual billing/conversion event.
+    """S30 follow-up: Null out Meg-imported Apple/Google subs (import_*_* /
+    meg_*_* sub_id pattern) where converted_at == trial_end exactly.
 
-    Scope: source IN ('apple', 'google') only. Stripe webhook converted_at
-    stamps are correct and NEVER equal trial_end exactly -- Stripe's billing
-    event fires seconds-to-minutes after trial_end.
+    Context: these records had trial_start/trial_end populated by the
+    backfill-trial-dates endpoint (SET trial_start = created_at, trial_end =
+    created_at + 30 days) with synthetic dates, not real ymove data. When the
+    synthetic trial_end passed NOW(), the S18 auto-stamp fired and stamped
+    converted_at = trial_end. These are NOT real trial-to-paid events.
+
+    CRITICAL: webhook-sourced Apple subs (numeric transactionId) and Google
+    subs (ym_google_*) are EXCLUDED from this backfill, even when they share
+    the converted_at = trial_end signature. Those records had trial dates set
+    by ymove's actual webhook data (real trial periods), so converted_at =
+    trial_end for them represents a legitimate conversion event that the
+    S18 auto-stamp correctly recorded.
 
     Excludes: reactivated_at IS NOT NULL records (already cleaned in v1).
 
@@ -2306,6 +2311,10 @@ async def null_out_false_conversions_v2(request: Request):
                  AND converted_at = trial_end
                  AND source IN ('apple', 'google')
                  AND reactivated_at IS NULL
+                 AND (stripe_subscription_id LIKE 'import_apple_%'
+                      OR stripe_subscription_id LIKE 'import_google_%'
+                      OR stripe_subscription_id LIKE 'meg_apple_%'
+                      OR stripe_subscription_id LIKE 'meg_google_%')
                ORDER BY converted_at DESC"""
         )
 
