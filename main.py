@@ -2265,6 +2265,120 @@ async def inspect_email(request: Request):
     }
 
 
+@app.get("/api/admin/inspect-converted-at-cluster")
+async def inspect_converted_at_cluster(request: Request):
+    """S30: Deep-dive endpoint for a suspicious cluster of converted_at stamps.
+    Returns all subs where converted_at is on a specific day, with full attributes
+    to identify the shared pattern.
+    Usage: /api/admin/inspect-converted-at-cluster?pw=mmadmin2026&day=2026-04-06
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    day = request.query_params.get("day", "").strip()
+    if not day:
+        return JSONResponse(status_code=400, content={"error": "day query param required (format: YYYY-MM-DD)"})
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, source, stripe_subscription_id,
+                      converted_at, reactivated_at, trial_start, trial_end,
+                      created_at, current_period_start, current_period_end,
+                      canceled_at, status, import_batch,
+                      EXTRACT(DAY FROM (converted_at - created_at)) AS days_created_to_converted,
+                      EXTRACT(EPOCH FROM (converted_at - trial_end)) AS seconds_trial_end_to_converted
+               FROM subscriptions
+               WHERE DATE(converted_at) = $1
+               ORDER BY converted_at""",
+            day
+        )
+
+        # Aggregate buckets
+        buckets = {
+            "total": len(rows),
+            "by_source": {},
+            "by_batch_pattern": {},
+            "reactivated_set": 0,
+            "reactivated_null": 0,
+            "trial_end_equals_converted_at": 0,
+            "trial_end_within_1s_of_converted": 0,
+            "created_in_last_30d": 0,
+            "created_in_last_7d": 0,
+            "stripe_subs": 0,
+            "imported_meg_pattern": 0,
+            "autosync_pattern": 0,
+        }
+        for r in rows:
+            src = r["source"] or "?"
+            buckets["by_source"][src] = buckets["by_source"].get(src, 0) + 1
+
+            batch = r["import_batch"] or "(null)"
+            bucket_name = "(null)"
+            if batch.startswith("meg_"): bucket_name = "meg_*"
+            elif batch.startswith("ymove_react_"): bucket_name = "ymove_react_*"
+            elif batch.startswith("ymove_import_"): bucket_name = "ymove_import_*"
+            elif batch.startswith("shadow_"): bucket_name = "shadow_*"
+            elif batch.startswith("autosync_"): bucket_name = "autosync_*"
+            elif batch.startswith("s23_"): bucket_name = "s23_*"
+            elif batch.startswith("s24_"): bucket_name = "s24_*"
+            elif batch.startswith("s25_"): bucket_name = "s25_*"
+            elif batch.startswith("s26_"): bucket_name = "s26_*"
+            elif batch.startswith("s28_"): bucket_name = "s28_*"
+            else: bucket_name = batch[:20]
+            buckets["by_batch_pattern"][bucket_name] = buckets["by_batch_pattern"].get(bucket_name, 0) + 1
+
+            if r["reactivated_at"] is not None:
+                buckets["reactivated_set"] += 1
+            else:
+                buckets["reactivated_null"] += 1
+
+            if r["trial_end"] and r["converted_at"] and r["trial_end"] == r["converted_at"]:
+                buckets["trial_end_equals_converted_at"] += 1
+
+            if r["seconds_trial_end_to_converted"] is not None and abs(r["seconds_trial_end_to_converted"]) < 1:
+                buckets["trial_end_within_1s_of_converted"] += 1
+
+            if r["created_at"]:
+                age_days = (datetime.now(timezone.utc) - r["created_at"]).days
+                if age_days <= 30:
+                    buckets["created_in_last_30d"] += 1
+                if age_days <= 7:
+                    buckets["created_in_last_7d"] += 1
+
+            sub_id = r["stripe_subscription_id"] or ""
+            if sub_id.startswith("sub_"): buckets["stripe_subs"] += 1
+            if sub_id.startswith("import_apple_") or sub_id.startswith("import_google_") or sub_id.startswith("meg_apple_") or sub_id.startswith("meg_google_"):
+                buckets["imported_meg_pattern"] += 1
+            if "autosync" in (r["import_batch"] or ""):
+                buckets["autosync_pattern"] += 1
+
+        # Sample records for human inspection
+        sample = [
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "source": r["source"],
+                "sub_id": r["stripe_subscription_id"],
+                "converted_at": str(r["converted_at"]),
+                "reactivated_at": str(r["reactivated_at"]) if r["reactivated_at"] else None,
+                "trial_start": str(r["trial_start"]) if r["trial_start"] else None,
+                "trial_end": str(r["trial_end"]) if r["trial_end"] else None,
+                "created_at": str(r["created_at"]),
+                "current_period_start": str(r["current_period_start"]) if r["current_period_start"] else None,
+                "current_period_end": str(r["current_period_end"]) if r["current_period_end"] else None,
+                "canceled_at": str(r["canceled_at"]) if r["canceled_at"] else None,
+                "status": r["status"],
+                "import_batch": r["import_batch"],
+                "days_created_to_converted": int(r["days_created_to_converted"]) if r["days_created_to_converted"] is not None else None,
+                "seconds_trial_end_to_converted": float(r["seconds_trial_end_to_converted"]) if r["seconds_trial_end_to_converted"] is not None else None,
+            }
+            for r in rows[:30]
+        ]
+
+    return {"day": day, "aggregates": buckets, "sample": sample}
+
+
 @app.get("/api/admin/inspect-conversions-30d")
 async def inspect_conversions_30d(request: Request):
     """S30: Diagnostic for the paid-conversions-30d metric.
