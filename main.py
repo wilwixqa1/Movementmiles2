@@ -147,6 +147,32 @@ async def startup():
                 for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source']:
                     await conn.execute(f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS utm_meta_raw JSONB")
+                # S30: effective_canceled_at separates "when user actually stopped paying"
+                # from "when our DB recorded the cancel". Batch cleanups (S28 stale sweeps,
+                # shadow sync deactivations, dedup cleanups) write canceled_at = NOW() even
+                # though the real cancel happened weeks/months earlier. Metrics queries now
+                # use effective_canceled_at, which is NULL for cleanup-batch cancels. This
+                # stops false churn spikes on cleanup days and gives honest MRR trends.
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS effective_canceled_at TIMESTAMPTZ")
+                # One-time backfill: for existing canceled records, populate effective_canceled_at
+                # = canceled_at ONLY where the cancel was NOT a batch cleanup. Batch-tagged
+                # records keep effective_canceled_at = NULL (honest "unknown when it really
+                # ended"). Idempotent: WHERE effective_canceled_at IS NULL ensures reruns
+                # don't re-write.
+                await conn.execute("""
+                    UPDATE subscriptions
+                    SET effective_canceled_at = canceled_at
+                    WHERE status = 'canceled'
+                      AND canceled_at IS NOT NULL
+                      AND effective_canceled_at IS NULL
+                      AND (import_batch IS NULL
+                           OR (import_batch NOT LIKE 's28_cleanup_%'
+                               AND import_batch NOT LIKE '%s25_test_cancel_%'
+                               AND import_batch NOT LIKE 's23_provider_cleanup%'
+                               AND import_batch NOT LIKE 's24_%'
+                               AND import_batch NOT LIKE 'shadow_%'
+                               AND import_batch NOT LIKE 'autosync_%'))
+                """)
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS subscription_events (
                         id SERIAL PRIMARY KEY,
@@ -797,8 +823,8 @@ async def stripe_webhook(request: Request):
                         plan_interval, plan_amount, currency, source,
                         trial_start, trial_end,
                         current_period_start, current_period_end,
-                        canceled_at, updated_at
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,NOW())
+                        canceled_at, effective_canceled_at, updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,$12,NOW())
                     ON CONFLICT (stripe_subscription_id) DO UPDATE SET
                         status = EXCLUDED.status,
                         plan_interval = EXCLUDED.plan_interval,
@@ -809,6 +835,7 @@ async def stripe_webhook(request: Request):
                         current_period_start = EXCLUDED.current_period_start,
                         current_period_end = EXCLUDED.current_period_end,
                         canceled_at = EXCLUDED.canceled_at,
+                        effective_canceled_at = EXCLUDED.canceled_at,
                         updated_at = NOW()
                 """,
                     customer_id, sub_id, email, status,
@@ -1509,6 +1536,7 @@ async def _ymove_handle_cancelled(conn, event_data: dict, email: str, ymove_user
             if not handled_pending:
                 await conn.execute(
                     """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                       effective_canceled_at = NOW(),
                        cancel_state = 'expired', updated_at = NOW() WHERE id = $1""",
                     active_sub["id"]
                 )
@@ -4713,8 +4741,8 @@ async def backfill_stripe(request: Request):
                             plan_interval, plan_amount, currency, source,
                             trial_start, trial_end,
                             current_period_start, current_period_end,
-                            canceled_at, created_at, updated_at
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,COALESCE($13,NOW()),NOW())
+                            canceled_at, effective_canceled_at, created_at, updated_at
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'stripe',$8,$9,$10,$11,$12,$12,COALESCE($13,NOW()),NOW())
                         ON CONFLICT (stripe_subscription_id) DO UPDATE SET
                             status = EXCLUDED.status,
                             plan_interval = EXCLUDED.plan_interval,
@@ -4725,6 +4753,7 @@ async def backfill_stripe(request: Request):
                             current_period_start = EXCLUDED.current_period_start,
                             current_period_end = EXCLUDED.current_period_end,
                             canceled_at = EXCLUDED.canceled_at,
+                            effective_canceled_at = EXCLUDED.canceled_at,
                             created_at = EXCLUDED.created_at,
                             updated_at = NOW()
                     """,
@@ -4780,6 +4809,7 @@ async def sync_trialing(request: Request):
                     """UPDATE subscriptions SET
                        status = $1,
                        canceled_at = $2,
+                       effective_canceled_at = $2,
                        current_period_start = $3,
                        current_period_end = $4,
                        updated_at = NOW()
@@ -9135,6 +9165,7 @@ async def s26_expire_pending_cancels(conn) -> dict:
                 """UPDATE subscriptions
                    SET status = 'canceled',
                        canceled_at = COALESCE(canceled_at, NOW()),
+                       effective_canceled_at = COALESCE(effective_canceled_at, pending_cancel_at, NOW()),
                        cancel_state = 'expired',
                        updated_at = NOW()
                    WHERE id = $1""",
