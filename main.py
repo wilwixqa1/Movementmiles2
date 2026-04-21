@@ -2302,6 +2302,15 @@ async def null_out_false_conversions_v2(request: Request):
     batch_id = f"s30_null_conversions_v2_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
     async with db_pool.acquire() as conn:
+        # S30: Target ONLY the April 6 20:30 UTC batch event. The v1 null-out already
+        # handled 136 reactivated-then-stamped records. This targets a specific
+        # second-level window where the S18 auto-stamp fired against ~106 Meg-imported
+        # subs in one go, identified by (a) import_apple_*/import_google_*/meg_*
+        # sub_id pattern, (b) converted_at between 2026-04-06 20:30:00 and 20:31:00,
+        # (c) converted_at = trial_end (S18 signature).
+        # Other records with converted_at = trial_end but outside this window are
+        # LEFT ALONE -- they're distributed organically across years (real Meg imports
+        # with their original trial_end dates where S18 correctly stamped converted_at).
         targets = await conn.fetch(
             """SELECT id, email, source, stripe_subscription_id,
                       converted_at, trial_end, reactivated_at, created_at, import_batch
@@ -2315,6 +2324,8 @@ async def null_out_false_conversions_v2(request: Request):
                       OR stripe_subscription_id LIKE 'import_google_%'
                       OR stripe_subscription_id LIKE 'meg_apple_%'
                       OR stripe_subscription_id LIKE 'meg_google_%')
+                 AND converted_at >= '2026-04-06 20:30:00+00:00'::timestamptz
+                 AND converted_at <  '2026-04-06 20:31:00+00:00'::timestamptz
                ORDER BY converted_at DESC"""
         )
 
