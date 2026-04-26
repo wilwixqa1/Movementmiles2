@@ -868,6 +868,21 @@ async def stripe_webhook(request: Request):
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
 
+            # S31: When a real Stripe sub gets created or transitions into a
+            # live status, deactivate any synthetic records for the same email.
+            # Catches cases where the user previously had a placeholder record
+            # (ymove_new_*, import_*, meg_*, autosync_*) from a sync/import path
+            # before their Stripe webhook fired. Real records (numeric Apple,
+            # ym_google_*, other sub_*) are NEVER touched here.
+            if email and status in ("active", "trialing", "past_due") and event_type in (
+                "customer.subscription.created",
+                "customer.subscription.updated",
+            ):
+                await _deactivate_other_source_active(
+                    conn, email, sub_id,
+                    f"s31_webhook_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                )
+
             # S26 Phase 2: Period-end cancellation semantics
             # Stripe model: cancel click sets cancel_at_period_end=true, status stays active.
             # subscription.deleted only fires when the period actually ends (or immediate cancel).
@@ -1314,25 +1329,17 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Apple name store error: {e}")
 
-        # S18: Dedup - deactivate synthetic Meg-import record if real transaction arrived
+        # S31: Dedup synthetic records when a real Apple transaction arrives.
+        # Replaces the original S18 logic which only caught meg_apple_* records.
+        # Now catches any synthetic ID (ymove_new_*, import_*, meg_*, autosync_*)
+        # for the same email. Real records (sub_*, numeric, ym_google_*) are
+        # NEVER touched here — those are owned by their own webhook pipelines.
+        # See _deactivate_other_source_active for the full pattern list.
         if email:
-            try:
-                synthetic = await conn.fetch(
-                    """SELECT id, stripe_subscription_id FROM subscriptions
-                       WHERE lower(email) = lower($1)
-                       AND stripe_subscription_id LIKE 'meg_apple_%'
-                       AND stripe_subscription_id != $2
-                       AND status IN ('active', 'trialing')""",
-                    email, transaction_id
-                )
-                for syn in synthetic:
-                    await conn.execute(
-                        "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
-                        syn["id"]
-                    )
-                    print(f"[ymove] Dedup: deactivated synthetic {syn['stripe_subscription_id']} for {email} (real: {transaction_id})")
-            except Exception as e:
-                print(f"[ymove] Apple dedup error: {e}")
+            await _deactivate_other_source_active(
+                conn, email, transaction_id,
+                f"s31_webhook_apple_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            )
 
         # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
         # S30: Added reactivated_at IS NULL guard. Reactivated subs cannot be "newly
@@ -1439,25 +1446,13 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             except Exception as e:
                 print(f"[ymove] Google name store error: {e}")
 
-        # S18: Dedup - deactivate synthetic Meg-import record if real transaction arrived
+        # S31: Dedup synthetic records when a real Google transaction arrives.
+        # Same expansion as Apple handler — see _deactivate_other_source_active.
         if email:
-            try:
-                synthetic = await conn.fetch(
-                    """SELECT id, stripe_subscription_id FROM subscriptions
-                       WHERE lower(email) = lower($1)
-                       AND stripe_subscription_id LIKE 'meg_google_%'
-                       AND stripe_subscription_id != $2
-                       AND status IN ('active', 'trialing')""",
-                    email, external_id
-                )
-                for syn in synthetic:
-                    await conn.execute(
-                        "UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(), updated_at = NOW() WHERE id = $1",
-                        syn["id"]
-                    )
-                    print(f"[ymove] Dedup: deactivated synthetic {syn['stripe_subscription_id']} for {email} (real: {external_id})")
-            except Exception as e:
-                print(f"[ymove] Google dedup error: {e}")
+            await _deactivate_other_source_active(
+                conn, email, external_id,
+                f"s31_webhook_google_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            )
 
         # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
         # S30: Added reactivated_at IS NULL guard (see Apple handler for full rationale).
@@ -3949,6 +3944,18 @@ async def _run_shadow_sync(run_id: int):
                 for email, prov in verify_providers.items():
                     r = our_active_lookup.get(email)
                     if r and r["source"] != prov and prov in ("apple", "google", "stripe"):
+                        # S31: don't allow undetermined -> stripe heal. A record
+                        # with a ymove_new_undetermined_* / autosync_undetermined_*
+                        # sub_id has no business becoming source='stripe' — that
+                        # mislabels a synthetic as a real Stripe record. The
+                        # alanna/sergeev phantoms in S30 happened exactly this
+                        # way (Step 3 fallback created them as undetermined,
+                        # this heal block then flipped them to stripe). Real
+                        # Stripe records have sub_* IDs and arrive via webhook.
+                        sub_id = r.get("stripe_subscription_id", "") or ""
+                        if prov == "stripe" and not sub_id.startswith("sub_"):
+                            print(f"[Shadow Sync] S31 guard: refusing to heal {email} {r['source']}->stripe because sub_id is synthetic ({sub_id}); flag for cleanup")
+                            continue
                         try:
                             await conn.execute(
                                 "UPDATE subscriptions SET source = $1, updated_at = NOW() WHERE id = $2",
@@ -4774,21 +4781,71 @@ async def run_daily_shadow_sync():
                             continue
 
                         # Step 2: Check Stripe
+                        # S31 Bug 1 fix: widened status filter to catch past_due/
+                        # trialing users. Previously this filtered to status='active'
+                        # only, which meant a Stripe sub that was transiently past_due
+                        # during renewal billing would fall through to the undetermined
+                        # fallback (Step 3) and create a phantom record alongside the
+                        # real Stripe sub. Two such phantoms (alanna, sergeev.vict)
+                        # were created in runs 21 and 25. Widening the filter here is
+                        # the primary fix; the local DB recheck below is defense in
+                        # depth. Note: 'incomplete' deliberately excluded — that
+                        # status means the user started checkout but never paid, not
+                        # a real subscription.
                         try:
                             customers = stripe.Customer.list(email=email, limit=1)
                             if customers.data:
                                 cust = customers.data[0]
-                                subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1)
-                                if subs.data:
+                                # status='all' returns every status incl. canceled.
+                                # We then filter Python-side to non-canceled.
+                                subs = stripe.Subscription.list(customer=cust.id, status="all", limit=10)
+                                live_subs = [s for s in subs.data if s.status in ("active", "trialing", "past_due")]
+                                if live_subs:
                                     stripe_identified.append({
                                         "email": email,
                                         "stripe_customer_id": cust.id,
-                                        "stripe_sub_id": subs.data[0].id,
+                                        "stripe_sub_id": live_subs[0].id,
                                     })
                                     continue
+                            # S31 Bug 1 fix (defense-in-depth): if Stripe API didn't
+                            # confirm an active sub, do one last local DB check.
+                            # If we already have ANY non-canceled record for this
+                            # email under any source, do NOT create a phantom.
+                            # This catches:
+                            #  (a) Stripe API transient errors that happened to
+                            #      not raise (returning empty data instead),
+                            #  (b) records under stripe source whose Stripe-side
+                            #      sub was deleted but our DB still has them
+                            #      active for legacy reasons,
+                            #  (c) any future bug that bypasses Step 0 / Step 0.5.
+                            existing_any = await conn.fetchval(
+                                """SELECT id FROM subscriptions
+                                   WHERE lower(email) = lower($1)
+                                     AND status IN ('active', 'trialing', 'past_due')
+                                   LIMIT 1""",
+                                email
+                            )
+                            if existing_any:
+                                print(f"[Daily Sync] Step 2.5 skip: {email} has existing non-canceled record (id={existing_any}); not creating phantom")
+                                continue
                             non_stripe.append({"email": email})
                         except Exception as e:
                             stripe_errors += 1
+                            # On exception, also do the local DB recheck before
+                            # falling through. Same rationale as above.
+                            try:
+                                existing_any = await conn.fetchval(
+                                    """SELECT id FROM subscriptions
+                                       WHERE lower(email) = lower($1)
+                                         AND status IN ('active', 'trialing', 'past_due')
+                                       LIMIT 1""",
+                                    email
+                                )
+                                if existing_any:
+                                    print(f"[Daily Sync] Step 2.5 skip (after exception): {email} has existing record (id={existing_any})")
+                                    continue
+                            except Exception as _ee:
+                                pass
                             non_stripe.append({"email": email})
 
                 # S30 Change B: Auto-import ymove-provider-identified users with correct source
@@ -5733,6 +5790,12 @@ async def backfill_stripe(request: Request):
                         _ts(sub.current_period_start), _ts(sub.current_period_end),
                         _ts(sub.canceled_at), real_created
                     )
+                    # S31: dedup synthetics for this email when backfilling a real Stripe sub
+                    if email and status in ("active", "trialing", "past_due"):
+                        await _deactivate_other_source_active(
+                            conn, email, sub_id,
+                            f"s31_backfill_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                        )
                 count += 1
             except Exception as e:
                 print(f"Backfill sub error: {e}")
@@ -11808,6 +11871,624 @@ async def s28_recent_stripe(request: Request, since: str = ""):
             "READ-ONLY. 'created_after' = records inserted since the cutoff (new webhooks). "
             "'updated_after_only' = records that existed before but got touched (edits, cleanup batches)."
         ),
+    }
+
+
+async def _ymove_member_lookup(email: str) -> dict:
+    """S31: Single-email lookup against ymove's /member-lookup endpoint.
+    Returns a dict with at least:
+      {
+        "found": bool,
+        "active": bool,
+        "provider": str | None,    # "stripe" | "apple" | "google" | "manual" | None
+        "user": dict,              # raw user object from ymove
+        "http_status": int | None,
+        "error": str | None,
+      }
+    Network errors return found=False with error populated; never raises."""
+    if not email or not email.strip():
+        return {"found": False, "active": False, "provider": None, "user": {}, "http_status": None, "error": "empty email"}
+    if not YMOVE_API_KEY:
+        return {"found": False, "active": False, "provider": None, "user": {}, "http_status": None, "error": "YMOVE_API_KEY not configured"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                headers={"X-Authorization": YMOVE_API_KEY},
+                params={"email": email}
+            )
+        if resp.status_code == 404:
+            return {"found": False, "active": False, "provider": None, "user": {}, "http_status": 404, "error": None}
+        if resp.status_code != 200:
+            return {"found": False, "active": False, "provider": None, "user": {}, "http_status": resp.status_code, "error": f"non-200: {resp.text[:200]}"}
+        raw = resp.json()
+        user = raw.get("user", {}) or {}
+        prov = user.get("subscriptionProvider")
+        if isinstance(prov, str):
+            prov = prov.strip().lower() or None
+        else:
+            prov = None
+        return {
+            "found": True,
+            "active": bool(user.get("activeSubscription", False)),
+            "provider": prov,
+            "user": user,
+            "http_status": 200,
+            "error": None,
+        }
+    except Exception as e:
+        return {"found": False, "active": False, "provider": None, "user": {}, "http_status": None, "error": str(e)[:200]}
+
+
+# ============================================================================
+# S31 — Active duplicate cleanup + database-level dedup invariant
+# ============================================================================
+#
+# Context: At S30 close, snapshots showed 11 emails with 2 active/trialing rows
+# each. Investigation surfaced three patterns:
+#   A) Pre-S24 stale apple synthetics (ymove_new_apple_*) sitting alongside
+#      real sub_* records. Step 0 didn't exist when these were created.
+#   B) Two phantoms from runs 21/25 created with sub_id='ymove_new_undetermined_*'
+#      whose source was later flipped to 'stripe' by the S25 self-heal block
+#      (line 3946). Real Stripe sub for the same email already existed.
+#   C) Two real cross-platform switchers in transit (msmeteyer Apple->Stripe
+#      trial; sarahwarf0723 Stripe->Apple). Not bugs — legitimate flow that
+#      needs the older record deactivated.
+#
+# Root causes addressed:
+#   1) Pattern A: stale synthetics never reaped. Cleanup endpoint (below).
+#   2) Pattern B: Step 3 fallback inserts even when an active Stripe sub
+#      exists for the email but was transiently absent from the
+#      active_stripe_emails set at sync time. Fix: last-mile Stripe API
+#      recheck before fallback insert (see _run_daily_shadow_sync).
+#   3) Pattern C: webhook handlers don't deactivate other-source active
+#      records when a real cross-platform switch happens. Fix: pre-insert
+#      cleanup helper used by stripe/apple/google webhook paths.
+#   4) DB invariant: a partial unique index on lower(email) where status
+#      is active/trialing/past_due makes the "no second active record per
+#      email" rule a hard guarantee.
+#
+# IMPORTANT: install order matters. The unique index endpoint will refuse
+# to run if any duplicates remain. Always run the cleanup first.
+
+S31_DEACTIVATE_REASON_SWITCH = "s31_other_source_switch"
+S31_DEACTIVATE_REASON_DUP = "s31_dup_cleanup"
+
+
+async def _deactivate_other_source_active(conn, email: str, keep_sub_id: str, batch_tag: str):
+    """Soft-cancel any active/trialing/past_due record for `email` whose
+    stripe_subscription_id is NOT `keep_sub_id` AND is a SYNTHETIC ID.
+
+    Synthetic = any of: ymove_new_*, ymove_switch_*, import_apple_*,
+    import_google_*, meg_apple_*, meg_google_*, autosync_*. These are
+    records the system created in a sync/import path; they're safe to
+    deactivate when a real webhook event arrives.
+
+    Real records (sub_*, numeric Apple, ym_google_*) are NEVER touched by
+    this helper — those records are owned by their respective webhook
+    pipelines and only their own cancellation events should retire them.
+    Skipping them avoids the risk of canceling the wrong real sub when a
+    user genuinely owns multiple subs across providers and we receive a
+    create event before a cancel event.
+
+    Used by stripe/apple/google webhook handlers to enforce the
+    one-active-synthetic-per-email rule alongside the DB unique index.
+
+    Returns the count of records deactivated. Caller is responsible for
+    the outer transaction; this function does not commit. Idempotent.
+    """
+    if not email or not email.strip():
+        return 0
+    try:
+        result = await conn.execute(
+            """UPDATE subscriptions
+               SET status = 'canceled',
+                   canceled_at = NOW(),
+                   effective_canceled_at = NOW(),
+                   updated_at = NOW(),
+                   import_batch = $1
+               WHERE lower(email) = lower($2)
+                 AND stripe_subscription_id != $3
+                 AND status IN ('active', 'trialing', 'past_due')
+                 AND (
+                     stripe_subscription_id LIKE 'ymove_new_%'
+                     OR stripe_subscription_id LIKE 'ymove_switch_%'
+                     OR stripe_subscription_id LIKE 'import_apple_%'
+                     OR stripe_subscription_id LIKE 'import_google_%'
+                     OR stripe_subscription_id LIKE 'meg_apple_%'
+                     OR stripe_subscription_id LIKE 'meg_google_%'
+                     OR stripe_subscription_id LIKE 'autosync_%'
+                 )""",
+            batch_tag, email, keep_sub_id
+        )
+        # asyncpg returns a string like "UPDATE N"
+        try:
+            count = int(result.split()[-1]) if result else 0
+        except (ValueError, IndexError):
+            count = 0
+        if count > 0:
+            print(f"[S31 dedup] Deactivated {count} synthetic record(s) for {email} (keep={keep_sub_id}, batch={batch_tag})")
+        return count
+    except Exception as e:
+        print(f"[S31 dedup] Error deactivating synthetics for {email}: {e}")
+        return 0
+
+
+@app.get("/api/admin/inspect-active-duplicates")
+async def inspect_active_duplicates(request: Request):
+    """S31: Read-only listing of all emails with 2+ active/trialing/past_due
+    records. The reconciliation snapshot's `active_duplicate_emails` field is
+    a summary; this endpoint returns full record detail for each duplicate
+    for triage.
+
+    Output groups records by email, marks one as the proposed "canonical"
+    record (the one to keep), and tags each non-canonical record with a
+    reason for cancellation. Does NOT modify any data."""
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        return JSONResponse(status_code=500, content={"error": "no db"})
+
+    async with db_pool.acquire() as conn:
+        dup_emails = await conn.fetch(
+            """SELECT lower(email) as email, COUNT(*) as cnt
+               FROM subscriptions
+               WHERE email IS NOT NULL AND email != ''
+                 AND status IN ('active', 'trialing', 'past_due')
+               GROUP BY lower(email)
+               HAVING COUNT(*) > 1
+               ORDER BY lower(email)"""
+        )
+
+        groups = []
+        for row in dup_emails:
+            email = row["email"]
+            records = await conn.fetch(
+                """SELECT id, stripe_subscription_id, source, status, plan_amount,
+                          created_at, updated_at, canceled_at, import_batch
+                   FROM subscriptions
+                   WHERE lower(email) = $1
+                     AND status IN ('active', 'trialing', 'past_due')
+                   ORDER BY created_at""",
+                email
+            )
+            recs = [dict(r) for r in records]
+            for r in recs:
+                r["created_at"] = str(r["created_at"]) if r["created_at"] else None
+                r["updated_at"] = str(r["updated_at"]) if r["updated_at"] else None
+                r["canceled_at"] = str(r["canceled_at"]) if r["canceled_at"] else None
+                r["sub_id_pattern"] = _classify_sub_id_pattern(r["stripe_subscription_id"])
+
+            canonical_idx = _pick_canonical_index(recs)
+            for i, r in enumerate(recs):
+                r["proposed_action"] = "keep" if i == canonical_idx else "cancel"
+                r["is_canonical"] = (i == canonical_idx)
+
+            groups.append({
+                "email": email,
+                "record_count": len(recs),
+                "records": recs,
+                "canonical_sub_id": recs[canonical_idx]["stripe_subscription_id"] if recs else None,
+                "needs_ymove_check": _needs_ymove_check(recs),
+            })
+
+    return {
+        "status": "ok",
+        "duplicate_email_count": len(groups),
+        "groups": groups,
+        "note": "READ-ONLY. Run /api/admin/cleanup-active-duplicates-s31 to apply fixes."
+    }
+
+
+def _classify_sub_id_pattern(sub_id: str) -> str:
+    """Classify a stripe_subscription_id into one of the known pattern buckets.
+    Used for canonical selection and audit output."""
+    if not sub_id:
+        return "empty"
+    if sub_id.startswith("sub_"):
+        return "real_stripe"
+    if sub_id.startswith("ym_google_"):
+        return "real_google"
+    # Numeric Apple transaction IDs are all-digit (no underscores)
+    if sub_id.isdigit():
+        return "real_apple"
+    if sub_id.startswith("ymove_switch_"):
+        return "synthetic_switch"
+    if sub_id.startswith("ymove_new_apple_"):
+        return "synthetic_apple"
+    if sub_id.startswith("ymove_new_google_"):
+        return "synthetic_google"
+    if sub_id.startswith("ymove_new_undetermined_"):
+        return "synthetic_undetermined"
+    if sub_id.startswith("import_apple_") or sub_id.startswith("meg_apple_"):
+        return "synthetic_meg_apple"
+    if sub_id.startswith("import_google_") or sub_id.startswith("meg_google_"):
+        return "synthetic_meg_google"
+    return "synthetic_other"
+
+
+# Priority order for canonical selection. Lower number = higher priority.
+# A real ID always beats a synthetic. Among reals, Stripe wins (it's our payment
+# system of record). Among synthetics, Meg imports beat shadow-sync-created
+# ones because they came from human-curated source data.
+_CANONICAL_PRIORITY = {
+    "real_stripe": 0,
+    "real_apple": 1,
+    "real_google": 2,
+    "synthetic_meg_apple": 10,
+    "synthetic_meg_google": 11,
+    "synthetic_apple": 20,
+    "synthetic_google": 21,
+    "synthetic_switch": 30,
+    "synthetic_undetermined": 40,
+    "synthetic_other": 50,
+    "empty": 99,
+}
+
+
+def _pick_canonical_index(records: list) -> int:
+    """Given a list of duplicate records (already filtered to active/trialing/
+    past_due), return the index of the record to keep. Tiebreaker: oldest
+    created_at wins (preserves history)."""
+    if not records:
+        return 0
+    best_idx = 0
+    best_priority = _CANONICAL_PRIORITY.get(records[0].get("sub_id_pattern", "synthetic_other"), 50)
+    best_created = records[0].get("created_at") or ""
+    for i in range(1, len(records)):
+        p = _CANONICAL_PRIORITY.get(records[i].get("sub_id_pattern", "synthetic_other"), 50)
+        c = records[i].get("created_at") or ""
+        if p < best_priority or (p == best_priority and c < best_created):
+            best_idx = i
+            best_priority = p
+            best_created = c
+    return best_idx
+
+
+def _needs_ymove_check(records: list) -> bool:
+    """A duplicate group needs a ymove cross-reference when the records
+    represent a real cross-platform switch (e.g. one real Stripe sub_* and
+    one numeric Apple ID). In that case we want ymove's current view to
+    decide which platform is canonical, not our local heuristic."""
+    patterns = [r.get("sub_id_pattern") for r in records]
+    real_patterns = [p for p in patterns if p in ("real_stripe", "real_apple", "real_google")]
+    # 2+ real records of different platforms = switcher
+    if len(real_patterns) >= 2 and len(set(real_patterns)) >= 2:
+        return True
+    return False
+
+
+@app.post("/api/admin/cleanup-active-duplicates-s31")
+async def cleanup_active_duplicates_s31(request: Request):
+    """S31: Cleanup endpoint for the 11+ duplicate active/trialing email
+    groups identified at S30 close. Preview/apply pattern with smart-mode
+    canonical selection.
+
+    Logic per duplicate group:
+      1. Classify each record's sub_id pattern.
+      2. Pick the canonical record using _pick_canonical_index (real beats
+         synthetic; among reals, stripe > apple > google; ties broken by
+         oldest created_at).
+      3. If the group needs ymove cross-reference (2+ real records on
+         different platforms), call ymove member lookup to confirm which
+         platform is current. Override canonical pick if ymove disagrees.
+      4. Soft-cancel all non-canonical records with batch_tag
+         s31_dup_cleanup_<timestamp>.
+
+    Confidence tiers (returned in preview output):
+      - high: one record is real_stripe, all others are synthetic. Auto-apply ok.
+      - medium: real records on multiple platforms, ymove cross-ref consulted.
+      - low: ambiguous (all synthetic, or ymove returned no provider). Skip
+        in apply mode unless explicit force=true.
+
+    Body: {preview: true|false, force_low_confidence: true|false}
+      preview=true (default): show planned actions, no writes.
+      preview=false: apply (skips low-confidence groups unless force is true).
+
+    Reversible via:
+      POST /api/admin/revert-batch with {batch_id: "s31_dup_cleanup_<ts>"}
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = body.get("preview", True)
+    force_low = body.get("force_low_confidence", False)
+    batch_id = f"s31_dup_cleanup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    # Step 1: Find all duplicate emails and their records
+    async with db_pool.acquire() as conn:
+        dup_emails_rows = await conn.fetch(
+            """SELECT lower(email) as email, COUNT(*) as cnt
+               FROM subscriptions
+               WHERE email IS NOT NULL AND email != ''
+                 AND status IN ('active', 'trialing', 'past_due')
+               GROUP BY lower(email)
+               HAVING COUNT(*) > 1
+               ORDER BY lower(email)"""
+        )
+        groups = []
+        for row in dup_emails_rows:
+            email = row["email"]
+            records = await conn.fetch(
+                """SELECT id, stripe_subscription_id, source, status, plan_amount,
+                          created_at, updated_at, canceled_at, import_batch
+                   FROM subscriptions
+                   WHERE lower(email) = $1
+                     AND status IN ('active', 'trialing', 'past_due')
+                   ORDER BY created_at""",
+                email
+            )
+            recs = [dict(r) for r in records]
+            for r in recs:
+                r["sub_id_pattern"] = _classify_sub_id_pattern(r["stripe_subscription_id"])
+            groups.append({"email": email, "records": recs})
+
+    # Step 2: For groups that need ymove cross-reference, consult ymove
+    # (outside DB transaction — network calls)
+    decisions = []
+    for g in groups:
+        email = g["email"]
+        recs = g["records"]
+        canonical_idx = _pick_canonical_index(recs)
+        confidence = "high"
+        ymove_says = None
+        notes = []
+
+        if _needs_ymove_check(recs):
+            confidence = "medium"
+            try:
+                lookup = await _ymove_member_lookup(email)
+                ymove_provider = lookup.get("provider") if lookup else None
+                ymove_says = ymove_provider
+                if ymove_provider in ("stripe", "apple", "google"):
+                    # Find a real record matching ymove's view
+                    target_pattern = f"real_{ymove_provider}"
+                    for i, r in enumerate(recs):
+                        if r["sub_id_pattern"] == target_pattern:
+                            if i != canonical_idx:
+                                notes.append(f"ymove says {ymove_provider}; overriding canonical from {recs[canonical_idx]['sub_id_pattern']} to {target_pattern}")
+                                canonical_idx = i
+                            else:
+                                notes.append(f"ymove confirms {ymove_provider}; canonical pick agrees")
+                            break
+                    else:
+                        notes.append(f"ymove says {ymove_provider} but no matching real record found in our group; using local canonical")
+                        confidence = "low"
+                else:
+                    notes.append(f"ymove returned no provider (got {ymove_provider!r}); using local canonical")
+                    confidence = "low"
+            except Exception as e:
+                notes.append(f"ymove lookup failed: {str(e)[:120]}; using local canonical")
+                confidence = "low"
+
+        # Detect low confidence based on patterns alone
+        canonical_rec = recs[canonical_idx]
+        if canonical_rec["sub_id_pattern"].startswith("synthetic_"):
+            # All-synthetic group. Confidence drops unless we have a clear
+            # winner (e.g. meg_apple over ymove_new_apple).
+            patterns_present = set(r["sub_id_pattern"] for r in recs)
+            if all(p.startswith("synthetic_") for p in patterns_present):
+                if confidence == "high":
+                    confidence = "low"
+                    notes.append("all records are synthetic; no real ID to anchor on")
+
+        to_cancel = [r for i, r in enumerate(recs) if i != canonical_idx]
+        decisions.append({
+            "email": email,
+            "confidence": confidence,
+            "ymove_says": ymove_says,
+            "canonical": {
+                "id": canonical_rec["id"],
+                "sub_id": canonical_rec["stripe_subscription_id"],
+                "source": canonical_rec["source"],
+                "pattern": canonical_rec["sub_id_pattern"],
+            },
+            "to_cancel": [
+                {
+                    "id": r["id"],
+                    "sub_id": r["stripe_subscription_id"],
+                    "source": r["source"],
+                    "pattern": r["sub_id_pattern"],
+                    "import_batch": r["import_batch"],
+                } for r in to_cancel
+            ],
+            "notes": notes,
+        })
+
+    # Counters
+    high_count = sum(1 for d in decisions if d["confidence"] == "high")
+    medium_count = sum(1 for d in decisions if d["confidence"] == "medium")
+    low_count = sum(1 for d in decisions if d["confidence"] == "low")
+    total_to_cancel = sum(len(d["to_cancel"]) for d in decisions)
+
+    if preview:
+        return {
+            "status": "preview",
+            "batch_id_if_applied": batch_id,
+            "duplicate_groups": len(decisions),
+            "confidence_breakdown": {
+                "high": high_count, "medium": medium_count, "low": low_count
+            },
+            "total_records_to_cancel": total_to_cancel,
+            "decisions": decisions,
+            "note": (
+                "Send preview: false to apply. Low-confidence groups are SKIPPED "
+                "by default; pass force_low_confidence: true to include them. "
+                f"Reversible via POST /api/admin/revert-batch with batch_id={batch_id}."
+            )
+        }
+
+    # APPLY mode — execute the cancellations in a single transaction
+    cancelled = 0
+    skipped_low = 0
+    errors = 0
+    cancelled_details = []
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            for d in decisions:
+                if d["confidence"] == "low" and not force_low:
+                    skipped_low += len(d["to_cancel"])
+                    continue
+                for tc in d["to_cancel"]:
+                    try:
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET status = 'canceled',
+                                   canceled_at = NOW(),
+                                   effective_canceled_at = NOW(),
+                                   updated_at = NOW(),
+                                   import_batch = $1
+                               WHERE id = $2
+                                 AND status IN ('active', 'trialing', 'past_due')""",
+                            batch_id, tc["id"]
+                        )
+                        cancelled += 1
+                        cancelled_details.append({
+                            "email": d["email"],
+                            "id": tc["id"],
+                            "sub_id": tc["sub_id"],
+                            "kept_sub_id": d["canonical"]["sub_id"],
+                        })
+                    except Exception as e:
+                        errors += 1
+                        print(f"[S31 cleanup] Error cancelling id={tc['id']} for {d['email']}: {e}")
+
+    return {
+        "status": "applied",
+        "batch_id": batch_id,
+        "groups_processed": len(decisions),
+        "records_cancelled": cancelled,
+        "records_skipped_low_confidence": skipped_low,
+        "errors": errors,
+        "cancelled_details": cancelled_details,
+        "revert_hint": f"POST /api/admin/revert-batch with {{\"batch_id\": \"{batch_id}\"}}"
+    }
+
+
+@app.post("/api/admin/install-unique-email-active-index")
+async def install_unique_email_active_index(request: Request):
+    """S31: Install a partial unique index on lower(email) for active/trialing/
+    past_due records. Hard DB-level guarantee against email-keyed duplicates.
+
+    Pre-flight check: refuses to install if any duplicate active emails still
+    exist in the table. Run /api/admin/cleanup-active-duplicates-s31 first.
+
+    Uses CREATE UNIQUE INDEX CONCURRENTLY to avoid locking the subscriptions
+    table during the build. CONCURRENTLY cannot run inside a transaction, so
+    we use a dedicated connection.
+
+    Idempotent: index name is fixed; if it already exists, returns "already
+    installed" without erroring.
+
+    Body: {confirm: true} required. Without confirm, returns dry-run info.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database connected")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    confirm = body.get("confirm", False)
+
+    INDEX_NAME = "idx_one_active_per_email"
+    INDEX_SQL = f"""
+        CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {INDEX_NAME}
+        ON subscriptions (lower(email))
+        WHERE email IS NOT NULL AND email != ''
+          AND status IN ('active', 'trialing', 'past_due')
+    """
+
+    async with db_pool.acquire() as conn:
+        # Check if already installed
+        existing = await conn.fetchval(
+            "SELECT indexname FROM pg_indexes WHERE indexname = $1", INDEX_NAME
+        )
+        # Check for any remaining duplicates that would block install
+        dup_count = await conn.fetchval(
+            """SELECT COUNT(*) FROM (
+                 SELECT lower(email) FROM subscriptions
+                 WHERE email IS NOT NULL AND email != ''
+                   AND status IN ('active', 'trialing', 'past_due')
+                 GROUP BY lower(email) HAVING COUNT(*) > 1
+               ) sub"""
+        )
+
+    if existing:
+        return {
+            "status": "already_installed",
+            "index_name": INDEX_NAME,
+            "duplicate_emails_remaining": dup_count,
+        }
+
+    if dup_count > 0:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "blocked",
+                "duplicate_emails_remaining": dup_count,
+                "note": "Cleanup duplicates first via /api/admin/cleanup-active-duplicates-s31"
+            }
+        )
+
+    if not confirm:
+        return {
+            "status": "dry_run",
+            "would_run_sql": INDEX_SQL.strip(),
+            "duplicate_emails_remaining": dup_count,
+            "note": "Send {confirm: true} to install. Index uses CONCURRENTLY (non-blocking) but cannot run inside a transaction."
+        }
+
+    # CREATE INDEX CONCURRENTLY cannot run inside a transaction. asyncpg's
+    # default mode runs each execute() in its own implicit transaction unless
+    # we explicitly suppress that. The standard workaround is to acquire a
+    # dedicated connection and disable the typecodec autosetup which sometimes
+    # introduces a transaction. The simplest reliable way: open a raw conn,
+    # run SET to disable autocommit-equivalents, then run the DDL.
+    try:
+        conn = await db_pool.acquire()
+        try:
+            # asyncpg auto-wraps in implicit txn for execute() — but only
+            # if a higher-level transaction context is active. At pool-acquire
+            # level, single statements run in implicit autocommit mode, which
+            # is what CONCURRENTLY needs. So this should just work.
+            await conn.execute(INDEX_SQL)
+        finally:
+            await db_pool.release(conn)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(e),
+                "note": "If error mentions 'cannot run inside a transaction', a previous failed attempt may have left an INVALID index. Drop it manually: DROP INDEX IF EXISTS " + INDEX_NAME + ";"
+            }
+        )
+
+    # Verify it landed and is valid
+    async with db_pool.acquire() as conn:
+        check = await conn.fetchrow(
+            """SELECT i.indexname, x.indisvalid
+               FROM pg_indexes i
+               JOIN pg_class c ON c.relname = i.indexname
+               JOIN pg_index x ON x.indexrelid = c.oid
+               WHERE i.indexname = $1""",
+            INDEX_NAME
+        )
+    return {
+        "status": "installed",
+        "index_name": INDEX_NAME,
+        "indisvalid": bool(check["indisvalid"]) if check else None,
+        "note": "Future inserts/updates that would create a second active record per email will fail with UniqueViolationError."
     }
 
 
