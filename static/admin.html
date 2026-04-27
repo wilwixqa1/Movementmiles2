@@ -673,11 +673,6 @@
         <div class="value" id="s-views-total">--</div>
         <div class="sub">Last 7 days tracked</div>
       </div>
-      <div class="stat-card">
-        <div class="label">Chat Sessions</div>
-        <div class="value" id="s-chats">--</div>
-        <div class="sub" id="s-chats-sub"></div>
-      </div>
     </div>
 
     <!-- Page Views Charts -->
@@ -1314,10 +1309,6 @@ function loadStats() {
     document.getElementById('s-leads').textContent = d.leads.total;
     document.getElementById('s-views-today').textContent = d.page_views.today;
     document.getElementById('s-views-total').textContent = d.page_views.total;
-    document.getElementById('s-chats').textContent = d.chats.total;
-
-    var chatSub = d.chats.by_type.map(function(c){return c.session_type+': '+c.count}).join(', ');
-    document.getElementById('s-chats-sub').textContent = chatSub || 'No sessions yet';
 
     renderBarChart('chart-by-page', d.page_views.by_page.slice(0, 8).map(function(r){
       var name = r.page.replace(/\s*[—|]\s*Movement\s*&?\s*Miles$/i, '').trim() || r.page;
