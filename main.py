@@ -7300,6 +7300,10 @@ async def admin_stats(request: Request):
         # NULL/empty UTM values bucket as 'direct' for source, 'none' for
         # medium/campaign (matches existing rolling-window labels).
         # Excludes incomplete_expired (failed checkouts that never became real subs).
+        # S32: also bound created_at <= NOW() — future-dated rows from bad
+        # imports/webhook payloads were appearing on the chart axis (e.g. 2026-12-28
+        # when today is 2026-04-26), pushing the visual to the right and making the
+        # 12-week window unreadable.
         utm_trend_source_weekly = await conn.fetch(
             """SELECT
                 to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
@@ -7308,6 +7312,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""
@@ -7320,6 +7325,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""
@@ -7332,6 +7338,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""
@@ -7345,6 +7352,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""
@@ -7357,6 +7365,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""
@@ -7369,6 +7378,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
                WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
                ORDER BY period, signups DESC"""

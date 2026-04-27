@@ -622,7 +622,8 @@
       </div>
       <div id="chart-utm-trend" style="width:100%;height:320px"></div>
       <div id="utm-trend-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:.78rem"></div>
-      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">Each line is a UTM value. Top 8 shown; the rest are bucketed as "other". Hover a line for the period total.</div>
+      <div id="utm-trend-untagged" style="font-size:.78rem;color:var(--navy-mid);margin-top:8px"></div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:4px">Untagged subscribers (Apple/Google checkout strips UTMs, plus pre-tracking historical data) are excluded from the lines. Top 8 tagged values shown; the rest are bucketed as "other".</div>
     </div>
 
     <div class="views-grid">
@@ -1572,11 +1573,21 @@ function renderUtmTrendChart() {
   }
 
   // Pivot rows into {period -> {dimValue -> measureValue}} and collect all periods + dim values.
+  // S32: 'direct' (untagged source) and 'none' (untagged medium/campaign) are EXCLUDED
+  // from the chart lines and surfaced as a separate count below the chart. Including them
+  // dwarfs the tagged campaigns visually because most subs (Apple/Google checkout strips
+  // UTMs) are untagged, making the tagged-line trends unreadable.
+  var UNTAGGED_VALUES = {'direct': true, 'none': true};
   var periodsSet = {};
   var dimTotals = {}; // total measure across all periods per dim value, for top-N selection
+  var untaggedTotal = 0;
   rows.forEach(function(r){
     periodsSet[r.period] = true;
     var v = (measure === 'paid_conversions') ? (r.paid_conversions || 0) : (r.signups || 0);
+    if (UNTAGGED_VALUES[r.dimension]) {
+      untaggedTotal += v;
+      return; // do NOT contribute to dimTotals; keeps it out of the lines
+    }
     dimTotals[r.dimension] = (dimTotals[r.dimension] || 0) + v;
   });
   var periods = Object.keys(periodsSet).sort();
@@ -1589,6 +1600,7 @@ function renderUtmTrendChart() {
   var pivot = {}; // period -> dimValue -> measureValue
   periods.forEach(function(p){ pivot[p] = {}; topDims.forEach(function(d){ pivot[p][d] = 0; }); if (hasOther) pivot[p]['other'] = 0; });
   rows.forEach(function(r){
+    if (UNTAGGED_VALUES[r.dimension]) return; // also excluded from the per-period pivot
     var v = (measure === 'paid_conversions') ? (r.paid_conversions || 0) : (r.signups || 0);
     var key = topDims.indexOf(r.dimension) >= 0 ? r.dimension : (hasOther ? 'other' : null);
     if (key !== null && pivot[r.period]) pivot[r.period][key] = (pivot[r.period][key] || 0) + v;
@@ -1673,6 +1685,24 @@ function renderUtmTrendChart() {
     periods.forEach(function(p){ total += pivot[p][s] || 0; });
     return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;background:' + color + ';border-radius:2px"></span>' + s + ' (' + total + ')</span>';
   }).join('');
+
+  // S32: untagged-count surface
+  var untaggedEl = document.getElementById('utm-trend-untagged');
+  if (untaggedEl) {
+    var measureLabel = measure === 'paid_conversions' ? 'paid conversions' : 'signups';
+    if (untaggedTotal > 0) {
+      var pluralN = untaggedTotal === 1 ? '' : 's';
+      untaggedEl.innerHTML = '<strong>' + untaggedTotal + '</strong> untagged ' + measureLabel + ' in this window (not shown on chart).';
+    } else {
+      untaggedEl.textContent = '';
+    }
+  }
+
+  // If excluding untagged left us with no tagged series, show an empty-state instead of a blank chart.
+  if (!seriesNames.length) {
+    container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">No UTM-tagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' in this window. ' + (untaggedTotal > 0 ? untaggedTotal + ' untagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' (Apple/Google or pre-tracking).' : '') + '</div>';
+    legend.innerHTML = '';
+  }
 }
 
 // S32: Channel Performance Table renderer + sort handler.
