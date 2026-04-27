@@ -7076,7 +7076,12 @@ async def admin_stats(request: Request):
                 "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
             )
         else:
-            total_views = await conn.fetchval("SELECT COUNT(*) FROM page_views")
+            # S32: When no date range is passed, default to last 7 days to match the
+            # "Last 7 days tracked" label on the admin dashboard. Previously this was
+            # SELECT COUNT(*) FROM page_views which returned all-time count.
+            total_views = await conn.fetchval(
+                "SELECT COUNT(*) FROM page_views WHERE created_at > NOW() - INTERVAL '7 days'"
+            )
             today_views = await conn.fetchval(
                 "SELECT COUNT(*) FROM page_views WHERE created_at::date = CURRENT_DATE"
             )
@@ -7230,6 +7235,61 @@ async def admin_stats(request: Request):
         )
         subs_with_utm = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''"
+        )
+
+        # S32: Channel Performance Table - one row per distinct (source, medium, campaign)
+        # combination present in either page_views or subscriptions over the last 30 days.
+        # Combines views, signups, paid conversions, CVR. Ad spend is keyed on
+        # (month, channel=utm_source) only - we leave CPA unfilled at the
+        # full-granularity row level and compute it client-side at the source level.
+        # NULL/empty UTM values bucket as 'direct' for source, 'none' for medium/campaign
+        # so the rollup from each side aligns on the same keys.
+        channel_perf_rows = await conn.fetch(
+            """WITH pv AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COUNT(*) as views
+                 FROM page_views
+                 WHERE created_at > NOW() - INTERVAL '30 days'
+                 GROUP BY 1, 2, 3
+               ),
+               sub AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COUNT(*) as signups,
+                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions
+                 FROM subscriptions
+                 WHERE created_at > NOW() - INTERVAL '30 days'
+                   AND status != 'incomplete_expired'
+                 GROUP BY 1, 2, 3
+               )
+               SELECT
+                 COALESCE(pv.utm_source, sub.utm_source) as utm_source,
+                 COALESCE(pv.utm_medium, sub.utm_medium) as utm_medium,
+                 COALESCE(pv.utm_campaign, sub.utm_campaign) as utm_campaign,
+                 COALESCE(pv.views, 0) as views,
+                 COALESCE(sub.signups, 0) as signups,
+                 COALESCE(sub.paid_conversions, 0) as paid_conversions
+               FROM pv
+               FULL OUTER JOIN sub
+                 ON pv.utm_source = sub.utm_source
+                 AND pv.utm_medium = sub.utm_medium
+                 AND pv.utm_campaign = sub.utm_campaign
+               ORDER BY signups DESC, views DESC"""
+        )
+
+        # S32: Ad spend by source for the trailing 30 days (or most recent month
+        # if there are entries that overlap the window). Used to compute CPA at
+        # the source level, since ad_spend is only keyed on (month, channel).
+        ad_spend_30d = await conn.fetch(
+            """SELECT channel, SUM(amount_cents) as total_cents
+               FROM ad_spend
+               WHERE month >= to_char(NOW() - INTERVAL '30 days', 'YYYY-MM')
+               GROUP BY channel"""
         )
 
         # S32: UTM trend over time (cohort view).
@@ -7606,6 +7666,21 @@ async def admin_stats(request: Request):
             "by_source": [{"channel": r["channel"], "count": r["count"]} for r in subs_by_utm_source],
             "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
             "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
+            "channel_performance": {
+                "window_days": 30,
+                "rows": [
+                    {
+                        "utm_source": r["utm_source"],
+                        "utm_medium": r["utm_medium"],
+                        "utm_campaign": r["utm_campaign"],
+                        "views": r["views"],
+                        "signups": r["signups"],
+                        "paid_conversions": r["paid_conversions"],
+                    }
+                    for r in channel_perf_rows
+                ],
+                "ad_spend_by_source_cents": {r["channel"]: r["total_cents"] for r in ad_spend_30d},
+            },
             "trend_weekly": {
                 "source": [
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}

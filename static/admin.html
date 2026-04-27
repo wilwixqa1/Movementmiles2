@@ -565,6 +565,38 @@
 
     <!-- Attribution Charts (S22: rewired from leads to subscription UTM data) -->
 
+    <!-- S32: Channel Performance Table - one row per source/medium/campaign with
+         views, signups, paid conversions, CVR, and source-level CPA. -->
+    <div class="card" style="margin-bottom:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+        <div class="section-title" style="margin-bottom:0">Channel Performance (last 30 days)</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)">Sorted by signups; click a column header to re-sort.</div>
+      </div>
+      <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
+        <table id="channel-perf-table" style="width:100%;font-size:.84rem">
+          <thead>
+            <tr>
+              <th style="cursor:pointer" onclick="sortChannelPerf('utm_source')">Source</th>
+              <th style="cursor:pointer" onclick="sortChannelPerf('utm_medium')">Medium</th>
+              <th style="cursor:pointer" onclick="sortChannelPerf('utm_campaign')">Campaign</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views')">Views</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Signups</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('paid_conversions')">Paid Conv</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('cvr')">CVR</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('cpa')">CPA</th>
+            </tr>
+          </thead>
+          <tbody id="channel-perf-tbody">
+            <tr><td colspan="8" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
+        CVR = Paid Conversions ÷ Views. CPA = Ad Spend ÷ Paid Conversions, computed at the Source level only (ad_spend is recorded per source per month, not per medium/campaign).
+        Untagged subs (Apple/Google checkout strips UTMs) appear under Source = "direct".
+      </div>
+    </div>
+
     <!-- S32: UTM Trend over time (cohort view) -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
@@ -1335,6 +1367,12 @@ function loadStats() {
     if (typeof window._utmTrendMeasure === 'undefined') window._utmTrendMeasure = 'signups';
     renderUtmTrendChart();
 
+    // S32: Channel Performance Table - stash + render.
+    window._channelPerf = sutm.channel_performance || {window_days: 30, rows: [], ad_spend_by_source_cents: {}};
+    if (typeof window._channelPerfSortKey === 'undefined') window._channelPerfSortKey = 'signups';
+    if (typeof window._channelPerfSortDir === 'undefined') window._channelPerfSortDir = 'desc';
+    renderChannelPerfTable();
+
     // Leads table
     // --- Ad Spend table ---
     renderAdSpendTable(d.ad_spend || []);
@@ -1644,6 +1682,85 @@ function renderUtmTrendChart() {
     periods.forEach(function(p){ total += pivot[p][s] || 0; });
     return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;background:' + color + ';border-radius:2px"></span>' + s + ' (' + total + ')</span>';
   }).join('');
+}
+
+// S32: Channel Performance Table renderer + sort handler.
+function renderChannelPerfTable() {
+  var perf = window._channelPerf || {rows: [], ad_spend_by_source_cents: {}};
+  var rows = (perf.rows || []).slice();
+  var spendBySrc = perf.ad_spend_by_source_cents || {};
+
+  // Compute source-level CPA: spend ÷ paid_conversions for each utm_source.
+  // Aggregate paid conversions per source first.
+  var paidBySrc = {};
+  rows.forEach(function(r){ paidBySrc[r.utm_source] = (paidBySrc[r.utm_source] || 0) + (r.paid_conversions || 0); });
+  // Annotate each row with derived fields used for sort + display.
+  rows.forEach(function(r){
+    r.cvr = (r.views > 0) ? (r.paid_conversions / r.views) : null;
+    var srcSpendCents = spendBySrc[r.utm_source];
+    var srcPaid = paidBySrc[r.utm_source] || 0;
+    if (srcSpendCents != null && srcPaid > 0) {
+      r._srcCpaCents = srcSpendCents / srcPaid;
+    } else {
+      r._srcCpaCents = null;
+    }
+    // For sort purposes, CPA is treated as null when not computable.
+    r.cpa = r._srcCpaCents;
+  });
+
+  var key = window._channelPerfSortKey || 'signups';
+  var dir = window._channelPerfSortDir || 'desc';
+  rows.sort(function(a, b){
+    var av = a[key];
+    var bv = b[key];
+    // Push nulls to the bottom regardless of direction.
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (typeof av === 'string') {
+      return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    }
+    return dir === 'asc' ? av - bv : bv - av;
+  });
+
+  var tbody = document.getElementById('channel-perf-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">No traffic or signups in the last 30 days yet.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(function(r){
+    var cvrDisplay = r.cvr == null ? '—' : (r.cvr * 100).toFixed(1) + '%';
+    var cpaDisplay = r._srcCpaCents == null ? '—' : '$' + (r._srcCpaCents / 100).toFixed(2);
+    // Keep it scannable: show campaign in a slightly muted tone if it's the
+    // 'none' bucket (no campaign value tagged).
+    var campCell = r.utm_campaign === 'none'
+      ? '<span style="color:var(--navy-mid)">none</span>'
+      : r.utm_campaign;
+    return '<tr>' +
+      '<td><strong>' + r.utm_source + '</strong></td>' +
+      '<td>' + r.utm_medium + '</td>' +
+      '<td>' + campCell + '</td>' +
+      '<td style="text-align:right">' + (r.views || 0) + '</td>' +
+      '<td style="text-align:right">' + (r.signups || 0) + '</td>' +
+      '<td style="text-align:right">' + (r.paid_conversions || 0) + '</td>' +
+      '<td style="text-align:right">' + cvrDisplay + '</td>' +
+      '<td style="text-align:right">' + cpaDisplay + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function sortChannelPerf(key) {
+  // Toggle direction if same key, else default direction by column type.
+  if (window._channelPerfSortKey === key) {
+    window._channelPerfSortDir = (window._channelPerfSortDir === 'desc') ? 'asc' : 'desc';
+  } else {
+    window._channelPerfSortKey = key;
+    // Numeric columns default desc (largest first); text columns default asc.
+    var numericKeys = ['views','signups','paid_conversions','cvr','cpa'];
+    window._channelPerfSortDir = numericKeys.indexOf(key) >= 0 ? 'desc' : 'asc';
+  }
+  renderChannelPerfTable();
 }
 
 function renderBarChart(containerId, data) {
