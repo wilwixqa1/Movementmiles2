@@ -837,6 +837,24 @@ async def stripe_webhook(request: Request):
 
             # Convert timestamps
 
+            # S32: Dedup synthetic records BEFORE the INSERT, not after.
+            # The unique partial index idx_one_active_per_email rejects any
+            # second active row for the same email. If a synthetic placeholder
+            # exists when the real Stripe webhook arrives, the INSERT below
+            # would fail with UniqueViolationError (ON CONFLICT only handles
+            # stripe_subscription_id collisions, not email collisions).
+            # Cancelling synthetics first removes them from the partial index
+            # so the real INSERT lands cleanly. Real records (numeric Apple,
+            # ym_google_*, other sub_*) are NEVER touched here.
+            if email and status in ("active", "trialing", "past_due") and event_type in (
+                "customer.subscription.created",
+                "customer.subscription.updated",
+            ):
+                await _deactivate_other_source_active(
+                    conn, email, sub_id,
+                    f"s31_webhook_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                )
+
             try:
                 await conn.execute("""
                     INSERT INTO subscriptions (
@@ -867,21 +885,6 @@ async def stripe_webhook(request: Request):
                 )
             except Exception as e:
                 print(f"Subscription upsert error: {e}")
-
-            # S31: When a real Stripe sub gets created or transitions into a
-            # live status, deactivate any synthetic records for the same email.
-            # Catches cases where the user previously had a placeholder record
-            # (ymove_new_*, import_*, meg_*, autosync_*) from a sync/import path
-            # before their Stripe webhook fired. Real records (numeric Apple,
-            # ym_google_*, other sub_*) are NEVER touched here.
-            if email and status in ("active", "trialing", "past_due") and event_type in (
-                "customer.subscription.created",
-                "customer.subscription.updated",
-            ):
-                await _deactivate_other_source_active(
-                    conn, email, sub_id,
-                    f"s31_webhook_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-                )
 
             # S26 Phase 2: Period-end cancellation semantics
             # Stripe model: cancel click sets cancel_at_period_end=true, status stays active.
@@ -1294,6 +1297,23 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
             print(f"[ymove] Apple event store error: {e}")
 
         # Upsert subscription â email + period dates are the key value from ymove
+        # S32: Dedup synthetic records BEFORE the INSERT, not after. The unique
+        # partial index idx_one_active_per_email rejects any second active row
+        # for the same email. If a synthetic placeholder exists when the real
+        # Apple transaction arrives, the INSERT below would fail with
+        # UniqueViolationError (ON CONFLICT only handles stripe_subscription_id
+        # collisions, not email collisions). Cancelling synthetics first
+        # removes them from the partial index so the real INSERT lands cleanly.
+        # Replaces the original S18 logic which only caught meg_apple_* records.
+        # Catches any synthetic ID (ymove_new_*, import_*, meg_*, autosync_*) for
+        # the same email. Real records (sub_*, numeric, ym_google_*) are NEVER
+        # touched here. See _deactivate_other_source_active for the full pattern.
+        if email:
+            await _deactivate_other_source_active(
+                conn, email, transaction_id,
+                f"s31_webhook_apple_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            )
+
         try:
             await conn.execute("""
                 INSERT INTO subscriptions (
@@ -1328,18 +1348,6 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                 )
             except Exception as e:
                 print(f"[ymove] Apple name store error: {e}")
-
-        # S31: Dedup synthetic records when a real Apple transaction arrives.
-        # Replaces the original S18 logic which only caught meg_apple_* records.
-        # Now catches any synthetic ID (ymove_new_*, import_*, meg_*, autosync_*)
-        # for the same email. Real records (sub_*, numeric, ym_google_*) are
-        # NEVER touched here — those are owned by their own webhook pipelines.
-        # See _deactivate_other_source_active for the full pattern list.
-        if email:
-            await _deactivate_other_source_active(
-                conn, email, transaction_id,
-                f"s31_webhook_apple_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-            )
 
         # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
         # S30: Added reactivated_at IS NULL guard. Reactivated subs cannot be "newly
@@ -1416,6 +1424,20 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
         except Exception as e:
             print(f"[ymove] Google event store error: {e}")
 
+        # S32: Dedup synthetic records BEFORE the INSERT, not after. The unique
+        # partial index idx_one_active_per_email rejects any second active row
+        # for the same email. If a synthetic placeholder exists when the real
+        # Google transaction arrives, the INSERT below would fail with
+        # UniqueViolationError (ON CONFLICT only handles stripe_subscription_id
+        # collisions, not email collisions). Cancelling synthetics first
+        # removes them from the partial index so the real INSERT lands cleanly.
+        # Same expansion as Apple handler. See _deactivate_other_source_active.
+        if email:
+            await _deactivate_other_source_active(
+                conn, email, external_id,
+                f"s31_webhook_google_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            )
+
         try:
             await conn.execute("""
                 INSERT INTO subscriptions (
@@ -1445,14 +1467,6 @@ async def _ymove_handle_created(conn, event_data: dict, email: str, ymove_user_i
                 )
             except Exception as e:
                 print(f"[ymove] Google name store error: {e}")
-
-        # S31: Dedup synthetic records when a real Google transaction arrives.
-        # Same expansion as Apple handler — see _deactivate_other_source_active.
-        if email:
-            await _deactivate_other_source_active(
-                conn, email, external_id,
-                f"s31_webhook_google_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-            )
 
         # S18: Detect trial-to-paid conversion (trial expired + still active + no cancel).
         # S30: Added reactivated_at IS NULL guard (see Apple handler for full rationale).
@@ -5762,6 +5776,16 @@ async def backfill_stripe(request: Request):
                 real_created = _ts(sub.created) if hasattr(sub, 'created') else None
 
                 async with db_pool.acquire() as conn:
+                    # S32: dedup synthetics BEFORE the INSERT, not after.
+                    # The unique partial index idx_one_active_per_email rejects any
+                    # second active row for the same email. If a synthetic
+                    # placeholder exists when this backfill runs, the INSERT below
+                    # would fail with UniqueViolationError.
+                    if email and status in ("active", "trialing", "past_due"):
+                        await _deactivate_other_source_active(
+                            conn, email, sub_id,
+                            f"s31_backfill_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                        )
                     await conn.execute("""
                         INSERT INTO subscriptions (
                             stripe_customer_id, stripe_subscription_id, email, status,
@@ -5790,12 +5814,6 @@ async def backfill_stripe(request: Request):
                         _ts(sub.current_period_start), _ts(sub.current_period_end),
                         _ts(sub.canceled_at), real_created
                     )
-                    # S31: dedup synthetics for this email when backfilling a real Stripe sub
-                    if email and status in ("active", "trialing", "past_due"):
-                        await _deactivate_other_source_active(
-                            conn, email, sub_id,
-                            f"s31_backfill_stripe_dedup_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-                        )
                 count += 1
             except Exception as e:
                 print(f"Backfill sub error: {e}")
