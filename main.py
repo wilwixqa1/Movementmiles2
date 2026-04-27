@@ -7232,6 +7232,88 @@ async def admin_stats(request: Request):
             "SELECT COUNT(*) FROM subscriptions WHERE utm_source IS NOT NULL AND utm_source != ''"
         )
 
+        # S32: UTM trend over time (cohort view).
+        # For each week in the last 12 weeks, group new subscribers by UTM
+        # dimension (source / medium / campaign) and report two measures:
+        #   - signups: any subscription created in that week
+        #   - paid_conversions: signups that have converted_at set (paid trial)
+        # NULL/empty UTM values bucket as 'direct' for source, 'none' for
+        # medium/campaign (matches existing rolling-window labels).
+        # Excludes incomplete_expired (failed checkouts that never became real subs).
+        utm_trend_source_weekly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
+                COALESCE(NULLIF(s.utm_source, ''), 'direct') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_medium_weekly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
+                COALESCE(NULLIF(s.utm_medium, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_campaign_weekly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
+                COALESCE(NULLIF(s.utm_campaign, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        # Monthly variants for the longer-range view (12 months back).
+        utm_trend_source_monthly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
+                COALESCE(NULLIF(s.utm_source, ''), 'direct') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_medium_monthly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
+                COALESCE(NULLIF(s.utm_medium, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_campaign_monthly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
+                COALESCE(NULLIF(s.utm_campaign, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+
         # S30: MRR trend uses effective_canceled_at, not canceled_at. A sub contributes
         # to MRR at week w if: (a) created before w, AND (b) still active today, OR
         # cancelled with effective_canceled_at > w. Batch cleanup records with NULL
@@ -7524,6 +7606,34 @@ async def admin_stats(request: Request):
             "by_source": [{"channel": r["channel"], "count": r["count"]} for r in subs_by_utm_source],
             "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
             "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
+            "trend_weekly": {
+                "source": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_source_weekly
+                ],
+                "medium": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_medium_weekly
+                ],
+                "campaign": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_campaign_weekly
+                ],
+            },
+            "trend_monthly": {
+                "source": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_source_monthly
+                ],
+                "medium": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_medium_monthly
+                ],
+                "campaign": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_campaign_monthly
+                ],
+            },
         },
         "last_sync": last_sync,
     }

@@ -564,6 +564,35 @@
     </div>
 
     <!-- Attribution Charts (S22: rewired from leads to subscription UTM data) -->
+
+    <!-- S32: UTM Trend over time (cohort view) -->
+    <div class="card" style="margin-bottom:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+        <div class="section-title" style="margin-bottom:0" id="utm-trend-title">Subscriber Trend by UTM Source (12 Weeks)</div>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <div style="display:flex;gap:4px">
+            <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Group:</span>
+            <button class="quick-btn active" id="utm-trend-btn-source" onclick="setUtmTrendDim('source')" style="padding:4px 12px;font-size:.72rem">Source</button>
+            <button class="quick-btn" id="utm-trend-btn-medium" onclick="setUtmTrendDim('medium')" style="padding:4px 12px;font-size:.72rem">Medium</button>
+            <button class="quick-btn" id="utm-trend-btn-campaign" onclick="setUtmTrendDim('campaign')" style="padding:4px 12px;font-size:.72rem">Campaign</button>
+          </div>
+          <div style="display:flex;gap:4px">
+            <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Range:</span>
+            <button class="quick-btn active" id="utm-trend-btn-week" onclick="setUtmTrendGran('week')" style="padding:4px 12px;font-size:.72rem">Weeks</button>
+            <button class="quick-btn" id="utm-trend-btn-month" onclick="setUtmTrendGran('month')" style="padding:4px 12px;font-size:.72rem">Months</button>
+          </div>
+          <div style="display:flex;gap:4px">
+            <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Measure:</span>
+            <button class="quick-btn active" id="utm-trend-btn-signups" onclick="setUtmTrendMeasure('signups')" style="padding:4px 12px;font-size:.72rem">Signups</button>
+            <button class="quick-btn" id="utm-trend-btn-conversions" onclick="setUtmTrendMeasure('paid_conversions')" style="padding:4px 12px;font-size:.72rem">Paid Conversions</button>
+          </div>
+        </div>
+      </div>
+      <div id="chart-utm-trend" style="width:100%;height:320px"></div>
+      <div id="utm-trend-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:.78rem"></div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">Each line is a UTM value. Top 8 shown; the rest are bucketed as "other". Hover a line for the period total.</div>
+    </div>
+
     <div class="views-grid">
       <div class="card">
         <div class="section-title">Subscribers by UTM Source</div>
@@ -1298,6 +1327,14 @@ function loadStats() {
       }).join('');
     }
 
+    // S32: UTM trend chart - stash data globally and render initial state.
+    window._utmTrendWeekly = sutm.trend_weekly || {source: [], medium: [], campaign: []};
+    window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: []};
+    if (typeof window._utmTrendDim === 'undefined') window._utmTrendDim = 'source';
+    if (typeof window._utmTrendGran === 'undefined') window._utmTrendGran = 'week';
+    if (typeof window._utmTrendMeasure === 'undefined') window._utmTrendMeasure = 'signups';
+    renderUtmTrendChart();
+
     // Leads table
     // --- Ad Spend table ---
     renderAdSpendTable(d.ad_spend || []);
@@ -1461,6 +1498,152 @@ function setMrrView(view) {
   document.getElementById('mrr-trend-title').textContent = view === 'month' ? 'MRR Trend (12 Months)' : 'MRR Trend (12 Weeks)';
   var data = view === 'month' ? window._mrrTrendMonthly : window._mrrTrendWeekly;
   if (data) renderBarChart('chart-mrr-trend', data);
+}
+
+// S32: UTM trend chart controls.
+function setUtmTrendDim(dim) {
+  window._utmTrendDim = dim;
+  ['source','medium','campaign'].forEach(function(d){
+    document.getElementById('utm-trend-btn-' + d).className = 'quick-btn' + (d === dim ? ' active' : '');
+  });
+  renderUtmTrendChart();
+}
+function setUtmTrendGran(gran) {
+  window._utmTrendGran = gran;
+  document.getElementById('utm-trend-btn-week').className = 'quick-btn' + (gran === 'week' ? ' active' : '');
+  document.getElementById('utm-trend-btn-month').className = 'quick-btn' + (gran === 'month' ? ' active' : '');
+  renderUtmTrendChart();
+}
+function setUtmTrendMeasure(m) {
+  window._utmTrendMeasure = m;
+  document.getElementById('utm-trend-btn-signups').className = 'quick-btn' + (m === 'signups' ? ' active' : '');
+  document.getElementById('utm-trend-btn-conversions').className = 'quick-btn' + (m === 'paid_conversions' ? ' active' : '');
+  renderUtmTrendChart();
+}
+
+function renderUtmTrendChart() {
+  var dim = window._utmTrendDim || 'source';
+  var gran = window._utmTrendGran || 'week';
+  var measure = window._utmTrendMeasure || 'signups';
+  var bucket = gran === 'month' ? (window._utmTrendMonthly || {}) : (window._utmTrendWeekly || {});
+  var rows = bucket[dim] || [];
+
+  // Update title
+  var dimLabel = dim.charAt(0).toUpperCase() + dim.slice(1);
+  var granLabel = gran === 'month' ? '12 Months' : '12 Weeks';
+  document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by UTM ' + dimLabel + ' (' + granLabel + ')';
+
+  var container = document.getElementById('chart-utm-trend');
+  var legend = document.getElementById('utm-trend-legend');
+
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">No UTM trend data yet for this dimension.</div>';
+    legend.innerHTML = '';
+    return;
+  }
+
+  // Pivot rows into {period -> {dimValue -> measureValue}} and collect all periods + dim values.
+  var periodsSet = {};
+  var dimTotals = {}; // total measure across all periods per dim value, for top-N selection
+  rows.forEach(function(r){
+    periodsSet[r.period] = true;
+    var v = (measure === 'paid_conversions') ? (r.paid_conversions || 0) : (r.signups || 0);
+    dimTotals[r.dimension] = (dimTotals[r.dimension] || 0) + v;
+  });
+  var periods = Object.keys(periodsSet).sort();
+
+  // Top-8 dimensions; collapse the rest into 'other'.
+  var ranked = Object.keys(dimTotals).sort(function(a,b){ return dimTotals[b] - dimTotals[a]; });
+  var topN = 8;
+  var topDims = ranked.slice(0, topN);
+  var hasOther = ranked.length > topN;
+  var pivot = {}; // period -> dimValue -> measureValue
+  periods.forEach(function(p){ pivot[p] = {}; topDims.forEach(function(d){ pivot[p][d] = 0; }); if (hasOther) pivot[p]['other'] = 0; });
+  rows.forEach(function(r){
+    var v = (measure === 'paid_conversions') ? (r.paid_conversions || 0) : (r.signups || 0);
+    var key = topDims.indexOf(r.dimension) >= 0 ? r.dimension : (hasOther ? 'other' : null);
+    if (key !== null && pivot[r.period]) pivot[r.period][key] = (pivot[r.period][key] || 0) + v;
+  });
+
+  var seriesNames = topDims.slice();
+  if (hasOther) seriesNames.push('other');
+
+  // Compute Y max for scale
+  var maxY = 0;
+  periods.forEach(function(p){ seriesNames.forEach(function(s){ if (pivot[p][s] > maxY) maxY = pivot[p][s]; }); });
+  if (maxY === 0) maxY = 1;
+  // Round up to a friendly number
+  var step = maxY <= 5 ? 1 : maxY <= 20 ? 5 : maxY <= 50 ? 10 : maxY <= 200 ? 25 : 50;
+  var yMax = Math.ceil(maxY / step) * step;
+
+  // SVG dimensions
+  var W = container.clientWidth || 800;
+  var H = 320;
+  var pad = {l: 40, r: 16, t: 12, b: 40};
+  var plotW = W - pad.l - pad.r;
+  var plotH = H - pad.t - pad.b;
+  var n = periods.length;
+  var stepX = n > 1 ? plotW / (n - 1) : 0;
+  var xAt = function(i){ return pad.l + (n > 1 ? i * stepX : plotW / 2); };
+  var yAt = function(v){ return pad.t + plotH - (v / yMax) * plotH; };
+
+  // Color palette (matches existing srcColors pattern, expanded)
+  var palette = ['#1a2748','#1c8c5a','#d97a17','#5a6d8c','#c2452a','#7b3fa3','#2a8aa8','#a88a2a','#9b9b9b'];
+
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:100%;display:block">';
+
+  // Y gridlines + labels
+  var gridSteps = Math.min(5, Math.max(2, Math.round(yMax / step)));
+  for (var g = 0; g <= gridSteps; g++) {
+    var gv = (yMax / gridSteps) * g;
+    var gy = yAt(gv);
+    svg += '<line x1="' + pad.l + '" y1="' + gy + '" x2="' + (W - pad.r) + '" y2="' + gy + '" stroke="#e8eaef" stroke-width="1"/>';
+    svg += '<text x="' + (pad.l - 6) + '" y="' + (gy + 4) + '" text-anchor="end" font-size="10" fill="#5a6d8c">' + Math.round(gv) + '</text>';
+  }
+
+  // X labels (rotate if many)
+  var labelEvery = n <= 8 ? 1 : Math.ceil(n / 8);
+  periods.forEach(function(p, i){
+    if (i % labelEvery !== 0 && i !== n - 1) return;
+    var lx = xAt(i);
+    // Compact labels: trim YYYY- prefix for weekly, keep monthly as-is
+    var label = p.length === 10 ? p.slice(5) : p; // MM-DD for weekly
+    svg += '<text x="' + lx + '" y="' + (H - pad.b + 14) + '" text-anchor="middle" font-size="10" fill="#5a6d8c">' + label + '</text>';
+  });
+
+  // Draw lines per series
+  seriesNames.forEach(function(s, sIdx){
+    var color = palette[sIdx % palette.length];
+    var pathD = '';
+    periods.forEach(function(p, i){
+      var v = pivot[p][s] || 0;
+      var x = xAt(i);
+      var y = yAt(v);
+      pathD += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    });
+    svg += '<path d="' + pathD + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round"/>';
+    // Dots + tooltips
+    periods.forEach(function(p, i){
+      var v = pivot[p][s] || 0;
+      if (v === 0) return; // skip zero markers to reduce noise
+      var x = xAt(i);
+      var y = yAt(v);
+      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3" fill="' + color + '">';
+      svg += '<title>' + s + ' \u2014 ' + p + ': ' + v + '</title>';
+      svg += '</circle>';
+    });
+  });
+
+  svg += '</svg>';
+  container.innerHTML = svg;
+
+  // Legend
+  legend.innerHTML = seriesNames.map(function(s, i){
+    var color = palette[i % palette.length];
+    var total = 0;
+    periods.forEach(function(p){ total += pivot[p][s] || 0; });
+    return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;background:' + color + ';border-radius:2px"></span>' + s + ' (' + total + ')</span>';
+  }).join('');
 }
 
 function renderBarChart(containerId, data) {
