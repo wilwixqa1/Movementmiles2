@@ -1393,8 +1393,9 @@ function loadStats() {
     }
 
     // S32: UTM trend chart - stash data globally and render initial state.
-    window._utmTrendWeekly = sutm.trend_weekly || {source: [], medium: [], campaign: []};
-    window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: []};
+    window._utmTrendWeekly = sutm.trend_weekly || {source: [], medium: [], campaign: [], content: []};
+    window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: [], content: []};
+    window._untaggedBySource = sutm.untagged_by_source || {weekly: [], monthly: []};
     if (typeof window._utmTrendDim === 'undefined') window._utmTrendDim = 'source';
     if (typeof window._utmTrendGran === 'undefined') window._utmTrendGran = 'week';
     if (typeof window._utmTrendMeasure === 'undefined') window._utmTrendMeasure = 'signups';
@@ -1728,12 +1729,24 @@ function renderUtmTrendChart() {
     return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;background:' + color + ';border-radius:2px"></span>' + s + ' (' + total + ')</span>';
   }).join('');
 
-  // S32: untagged-count surface
+  // S33: untagged breakdown by payment source
   var untaggedEl = document.getElementById('utm-trend-untagged');
   if (untaggedEl) {
     var measureLabel = measure === 'paid_conversions' ? 'paid conversions' : 'signups';
-    if (untaggedTotal > 0) {
-      var pluralN = untaggedTotal === 1 ? '' : 's';
+    var untaggedData = (window._untaggedBySource || {})[gran === 'month' ? 'monthly' : 'weekly'] || [];
+    if (untaggedTotal > 0 && untaggedData.length > 0) {
+      var parts = untaggedData.map(function(r) {
+        var count = measure === 'paid_conversions' ? (r.paid_conversions || 0) : (r.total || 0);
+        if (count === 0) return null;
+        var label = r.source === 'apple' ? 'Apple (app store)'
+                  : r.source === 'google' ? 'Google (app store)'
+                  : r.source === 'stripe' ? 'Stripe (web, no UTM)'
+                  : r.source;
+        return '<strong>' + count + '</strong> ' + label;
+      }).filter(function(p) { return p !== null; });
+      untaggedEl.innerHTML = '<strong>' + untaggedTotal + '</strong> untagged ' + measureLabel + ' not shown on chart: ' + parts.join(', ') + '.' +
+        '<br><span style="font-size:.72rem;color:var(--navy-mid)">Apple and Google subscribers come through app store checkout which strips UTM parameters. Stripe (no UTM) are likely organic or pre-tracking.</span>';
+    } else if (untaggedTotal > 0) {
       untaggedEl.innerHTML = '<strong>' + untaggedTotal + '</strong> untagged ' + measureLabel + ' in this window (not shown on chart).';
     } else {
       untaggedEl.textContent = '';

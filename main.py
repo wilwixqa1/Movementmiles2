@@ -7436,6 +7436,40 @@ async def admin_stats(request: Request):
                ORDER BY period, signups DESC"""
         )
 
+        # S33: Untagged subscribers breakdown by payment source.
+        # Counts subs with no UTM source (or empty) grouped by payment source,
+        # for both the 12-week and 12-month windows matching the trend chart.
+        untagged_by_source_weekly = await conn.fetch(
+            """SELECT
+                COALESCE(source, 'unknown') as source,
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
+                COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions,
+                COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled
+               FROM subscriptions
+               WHERE (utm_source IS NULL OR utm_source = '')
+                 AND created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND created_at <= NOW()
+                 AND status != 'incomplete_expired'
+               GROUP BY source
+               ORDER BY total DESC"""
+        )
+        untagged_by_source_monthly = await conn.fetch(
+            """SELECT
+                COALESCE(source, 'unknown') as source,
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
+                COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions,
+                COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled
+               FROM subscriptions
+               WHERE (utm_source IS NULL OR utm_source = '')
+                 AND created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND created_at <= NOW()
+                 AND status != 'incomplete_expired'
+               GROUP BY source
+               ORDER BY total DESC"""
+        )
+
         # S30: MRR trend uses effective_canceled_at, not canceled_at. A sub contributes
         # to MRR at week w if: (a) created before w, AND (b) still active today, OR
         # cancelled with effective_canceled_at > w. Batch cleanup records with NULL
@@ -7782,6 +7816,16 @@ async def admin_stats(request: Request):
                 "content": [
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
                     for r in utm_trend_content_monthly
+                ],
+            },
+            "untagged_by_source": {
+                "weekly": [
+                    {"source": r["source"], "total": r["total"], "still_trialing": r["still_trialing"], "paid_conversions": r["paid_conversions"], "trial_canceled": r["trial_canceled"]}
+                    for r in untagged_by_source_weekly
+                ],
+                "monthly": [
+                    {"source": r["source"], "total": r["total"], "still_trialing": r["still_trialing"], "paid_conversions": r["paid_conversions"], "trial_canceled": r["trial_canceled"]}
+                    for r in untagged_by_source_monthly
                 ],
             },
         },
