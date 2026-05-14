@@ -90,6 +90,10 @@
   .date-bar .quick-btn{background:var(--white);color:var(--navy);border:1px solid var(--border);padding:6px 14px;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer}
   .date-bar .quick-btn:hover{border-color:var(--navy-mid);background:var(--bg)}
   .date-bar .quick-btn.active{background:var(--navy);color:var(--white);border-color:var(--navy)}
+  /* S33: Standalone quick-btn for trend chart toggles */
+  .quick-btn{background:var(--white);color:var(--navy);border:1px solid var(--border);padding:6px 14px;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer;transition:all .15s}
+  .quick-btn:hover{border-color:var(--navy-mid);background:var(--bg)}
+  .quick-btn.active{background:var(--navy);color:var(--white);border-color:var(--navy);font-weight:600}
   .date-range-label{font-size:.78rem;color:var(--navy-mid);font-weight:500;margin-left:8px}
 
   .divider{border:none;border-top:1px solid var(--border);margin:32px 0 20px}
@@ -580,7 +584,7 @@
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_source')">Source</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_medium')">Medium</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_campaign')">Campaign</th>
-              <th style="cursor:pointer" onclick="sortChannelPerf('utm_content')">Content</th>
+              <th style="cursor:pointer" onclick="sortChannelPerf('utm_content')">Ad-Level</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views')">Views</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Trial Starts</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('still_trialing')">Still Trialing</th>
@@ -611,7 +615,7 @@
             <button class="quick-btn active" id="utm-trend-btn-source" onclick="setUtmTrendDim('source')" style="padding:4px 12px;font-size:.72rem">Source</button>
             <button class="quick-btn" id="utm-trend-btn-medium" onclick="setUtmTrendDim('medium')" style="padding:4px 12px;font-size:.72rem">Medium</button>
             <button class="quick-btn" id="utm-trend-btn-campaign" onclick="setUtmTrendDim('campaign')" style="padding:4px 12px;font-size:.72rem">Campaign</button>
-            <button class="quick-btn" id="utm-trend-btn-content" onclick="setUtmTrendDim('content')" style="padding:4px 12px;font-size:.72rem">Content</button>
+            <button class="quick-btn" id="utm-trend-btn-content" onclick="setUtmTrendDim('content')" style="padding:4px 12px;font-size:.72rem">Ad-Level</button>
           </div>
           <div style="display:flex;gap:4px">
             <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Range:</span>
@@ -1596,9 +1600,10 @@ function renderUtmTrendChart() {
   var rows = bucket[dim] || [];
 
   // Update title
-  var dimLabel = dim.charAt(0).toUpperCase() + dim.slice(1);
+  var dimLabels = {source: 'Source', medium: 'Medium', campaign: 'Campaign', content: 'Ad-Level'};
+  var dimLabel = dimLabels[dim] || dim;
   var granLabel = gran === 'month' ? '12 Months' : '12 Weeks';
-  document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by UTM ' + dimLabel + ' (' + granLabel + ')';
+  document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by ' + dimLabel + ' (' + granLabel + ')';
 
   var container = document.getElementById('chart-utm-trend');
   var legend = document.getElementById('utm-trend-legend');
