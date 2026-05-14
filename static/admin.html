@@ -570,8 +570,8 @@
          views, signups, paid conversions, CVR, and source-level CPA. -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
-        <div class="section-title" style="margin-bottom:0">Channel Performance (last 30 days)</div>
-        <div style="font-size:.72rem;color:var(--navy-mid)">Sorted by signups; click a column header to re-sort.</div>
+        <div class="section-title" style="margin-bottom:0">Channel Performance (last 90 days)</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)">Sorted by trial starts; click a column header to re-sort.</div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
         <table id="channel-perf-table" style="width:100%;font-size:.84rem">
@@ -581,20 +581,22 @@
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_medium')">Medium</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_campaign')">Campaign</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views')">Views</th>
-              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Signups</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Trial Starts</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('still_trialing')">Still Trialing</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('trial_canceled')">Trial Canceled</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('paid_conversions')">Paid Conv</th>
-              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('cvr')">CVR</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('cvr')">Conv Rate</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('cpa')">CPA</th>
             </tr>
           </thead>
           <tbody id="channel-perf-tbody">
-            <tr><td colspan="8" class="empty-msg">Loading...</td></tr>
+            <tr><td colspan="10" class="empty-msg">Loading...</td></tr>
           </tbody>
         </table>
       </div>
       <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
-        CVR = Paid Conversions ÷ Views. CPA = Ad Spend ÷ Paid Conversions, computed at the Source level only (ad_spend is recorded per source per month, not per medium/campaign).
-        Untagged subs (Apple/Google checkout strips UTMs) appear under Source = "direct".
+        Conv Rate = Paid Conv &divide; (Paid Conv + Trial Canceled). CPA = Ad Spend &divide; Paid Conversions, computed at the Source level only.
+        Views window is 30 days; subscription data window is 90 days. Untagged subs appear under Source = &ldquo;direct&rdquo;.
       </div>
     </div>
 
@@ -1733,6 +1735,7 @@ function renderUtmTrendChart() {
 }
 
 // S32: Channel Performance Table renderer + sort handler.
+// S33: Added still_trialing, trial_canceled columns. CVR now = paid / (paid + trial_canceled).
 function renderChannelPerfTable() {
   var perf = window._channelPerf || {rows: [], ad_spend_by_source_cents: {}};
   var rows = (perf.rows || []).slice();
@@ -1744,7 +1747,8 @@ function renderChannelPerfTable() {
   rows.forEach(function(r){ paidBySrc[r.utm_source] = (paidBySrc[r.utm_source] || 0) + (r.paid_conversions || 0); });
   // Annotate each row with derived fields used for sort + display.
   rows.forEach(function(r){
-    r.cvr = (r.views > 0) ? (r.paid_conversions / r.views) : null;
+    var decided = (r.paid_conversions || 0) + (r.trial_canceled || 0);
+    r.cvr = decided > 0 ? ((r.paid_conversions || 0) / decided) : null;
     var srcSpendCents = spendBySrc[r.utm_source];
     var srcPaid = paidBySrc[r.utm_source] || 0;
     if (srcSpendCents != null && srcPaid > 0) {
@@ -1773,7 +1777,7 @@ function renderChannelPerfTable() {
 
   var tbody = document.getElementById('channel-perf-tbody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">No traffic or signups in the last 30 days yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-msg">No traffic or signups in the last 90 days yet.</td></tr>';
     return;
   }
 
@@ -1791,6 +1795,8 @@ function renderChannelPerfTable() {
       '<td>' + campCell + '</td>' +
       '<td style="text-align:right">' + (r.views || 0) + '</td>' +
       '<td style="text-align:right">' + (r.signups || 0) + '</td>' +
+      '<td style="text-align:right">' + (r.still_trialing || 0) + '</td>' +
+      '<td style="text-align:right">' + (r.trial_canceled || 0) + '</td>' +
       '<td style="text-align:right">' + (r.paid_conversions || 0) + '</td>' +
       '<td style="text-align:right">' + cvrDisplay + '</td>' +
       '<td style="text-align:right">' + cpaDisplay + '</td>' +
@@ -1805,7 +1811,7 @@ function sortChannelPerf(key) {
   } else {
     window._channelPerfSortKey = key;
     // Numeric columns default desc (largest first); text columns default asc.
-    var numericKeys = ['views','signups','paid_conversions','cvr','cpa'];
+    var numericKeys = ['views','signups','still_trialing','trial_canceled','paid_conversions','cvr','cpa'];
     window._channelPerfSortDir = numericKeys.indexOf(key) >= 0 ? 'desc' : 'asc';
   }
   renderChannelPerfTable();

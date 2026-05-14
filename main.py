@@ -7248,12 +7248,10 @@ async def admin_stats(request: Request):
         )
 
         # S32: Channel Performance Table - one row per distinct (source, medium, campaign)
-        # combination present in either page_views or subscriptions over the last 30 days.
-        # Combines views, signups, paid conversions, CVR. Ad spend is keyed on
-        # (month, channel=utm_source) only - we leave CPA unfilled at the
-        # full-granularity row level and compute it client-side at the source level.
-        # NULL/empty UTM values bucket as 'direct' for source, 'none' for medium/campaign
-        # so the rollup from each side aligns on the same keys.
+        # combination present in either page_views or subscriptions.
+        # S33: Widened sub window to 90 days so cohorts that have matured past their
+        # ~30-day trial show conversion data. Page views stay at 30 days for recency.
+        # Added still_trialing, trial_canceled, avg_trial_days, avg_paid_lifetime_days.
         channel_perf_rows = await conn.fetch(
             """WITH pv AS (
                  SELECT
@@ -7271,9 +7269,15 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
                    COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
                    COUNT(*) as signups,
-                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions
+                   COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
+                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
+                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions,
+                   AVG(EXTRACT(EPOCH FROM (converted_at - created_at)) / 86400)
+                     FILTER (WHERE converted_at IS NOT NULL) as avg_trial_days,
+                   AVG(EXTRACT(EPOCH FROM (COALESCE(effective_canceled_at, NOW()) - converted_at)) / 86400)
+                     FILTER (WHERE converted_at IS NOT NULL) as avg_paid_lifetime_days
                  FROM subscriptions
-                 WHERE created_at > NOW() - INTERVAL '30 days'
+                 WHERE created_at > NOW() - INTERVAL '90 days'
                    AND status != 'incomplete_expired'
                  GROUP BY 1, 2, 3
                )
@@ -7283,7 +7287,11 @@ async def admin_stats(request: Request):
                  COALESCE(pv.utm_campaign, sub.utm_campaign) as utm_campaign,
                  COALESCE(pv.views, 0) as views,
                  COALESCE(sub.signups, 0) as signups,
-                 COALESCE(sub.paid_conversions, 0) as paid_conversions
+                 COALESCE(sub.still_trialing, 0) as still_trialing,
+                 COALESCE(sub.trial_canceled, 0) as trial_canceled,
+                 COALESCE(sub.paid_conversions, 0) as paid_conversions,
+                 sub.avg_trial_days,
+                 sub.avg_paid_lifetime_days
                FROM pv
                FULL OUTER JOIN sub
                  ON pv.utm_source = sub.utm_source
@@ -7687,7 +7695,7 @@ async def admin_stats(request: Request):
             "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
             "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
             "channel_performance": {
-                "window_days": 30,
+                "window_days": 90,
                 "rows": [
                     {
                         "utm_source": r["utm_source"],
@@ -7695,7 +7703,11 @@ async def admin_stats(request: Request):
                         "utm_campaign": r["utm_campaign"],
                         "views": r["views"],
                         "signups": r["signups"],
+                        "still_trialing": r["still_trialing"],
+                        "trial_canceled": r["trial_canceled"],
                         "paid_conversions": r["paid_conversions"],
+                        "avg_trial_days": round(float(r["avg_trial_days"]), 1) if r["avg_trial_days"] is not None else None,
+                        "avg_paid_lifetime_days": round(float(r["avg_paid_lifetime_days"]), 1) if r["avg_paid_lifetime_days"] is not None else None,
                     }
                     for r in channel_perf_rows
                 ],
