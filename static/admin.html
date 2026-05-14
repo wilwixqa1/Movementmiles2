@@ -186,8 +186,8 @@
 <!-- Login -->
 <div class="login-wrap" id="login-screen">
   <div class="login-box">
-    <h1>M&M Admin</h1>
-    <p>Enter the admin password to access the dashboard.</p>
+    <h1>M&amp;M Analytics</h1>
+    <p>Enter your password to access the dashboard.</p>
     <div class="login-error" id="login-error">Invalid password. Try again.</div>
     <input type="password" id="admin-pw" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()"/>
     <button onclick="doLogin()">Sign In</button>
@@ -197,10 +197,10 @@
 <!-- Dashboard -->
 <div class="dash" id="dashboard">
   <div class="dash-nav">
-    <h1>Movement &amp; Miles -- Admin</h1>
+    <h1>Movement &amp; Miles <span id="role-badge" style="font-size:.6em;padding:3px 10px;border-radius:6px;margin-left:8px;vertical-align:middle;font-weight:600;letter-spacing:.05em"></span></h1>
     <div class="dash-nav-right">
       <a onclick="loadStats()">Refresh</a>
-      <a onclick="exportCSV()">Export Leads CSV</a>
+      <a onclick="exportCSV()" class="admin-only">Export Leads CSV</a>
       <a href="/">Back to Site</a>
     </div>
   </div>
@@ -310,7 +310,7 @@
     <div class="section-label">Subscribers</div>
 
     <!-- Session 11: Export buttons -->
-    <div class="export-btn-row">
+    <div class="export-btn-row admin-only">
       <button class="export-btn" onclick="exportSubsCSV()">Export Subscriptions CSV</button>
       <button class="export-btn" onclick="exportSubsXLSX()" style="background:var(--green)">Export Subscribers XLSX</button>
       <button class="export-btn" onclick="exportJourneyCSV()">Export User Journey CSV</button>
@@ -318,7 +318,7 @@
     </div>
 
     <!-- Session 11: Manual Email Attach -->
-    <div class="card" style="margin-bottom:24px">
+    <div class="card admin-only" style="margin-bottom:24px">
       <div class="section-title" style="margin-bottom:4px">Attach Email to Apple/Google Subscriber</div>
       <p style="font-size:.8rem;color:var(--navy-mid);margin-bottom:16px">Look up a subscriber in ymove, then enter their ID and email here. This permanently links their subscription to their lead data for full attribution.</p>
       <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end">
@@ -434,7 +434,7 @@
     <div class="section-label">Marketing &amp; Attribution</div>
 
     <!-- UTM Link Generator -->
-    <div class="utm-gen">
+    <div class="utm-gen admin-only">
       <h3>UTM Link Generator</h3>
       <div class="utm-sub">Build tracked links for your campaigns. Results show in the charts below.</div>
       <div class="utm-row">
@@ -525,7 +525,7 @@
     </div>
 
     <!-- Session 11: Ad Spend Input -->
-    <div class="adspend-box">
+    <div class="adspend-box admin-only">
       <h3>Ad Spend Tracker</h3>
       <div class="adspend-sub">Enter monthly ad spend by channel. Used for CAC and ROI calculations.</div>
       <div class="adspend-form">
@@ -702,12 +702,12 @@
     <!-- SECTION 5: ADMIN TOOLS (collapsed)           -->
     <!-- ============================================ -->
     <!-- Data Health & Verification (Session 17) -->
-    <div class="section-toggle" onclick="toggleSection('health')">
+    <div class="section-toggle admin-only" onclick="toggleSection('health')">
       <div class="section-label">Data Health &amp; Verification</div>
       <span class="chevron" id="chevron-health">&#9654;</span>
       <span class="toggle-hint">(6 tools)</span>
     </div>
-    <div class="collapsible" id="body-health">
+    <div class="collapsible admin-only" id="body-health">
       <div class="tools-grid">
         <div class="tool-card">
           <h3>Data Audit</h3>
@@ -749,12 +749,12 @@
       </div>
     </div>
 
-    <div class="section-toggle" onclick="toggleSection('tools')">
+    <div class="section-toggle admin-only" onclick="toggleSection('tools')">
       <div class="section-label">Admin Tools</div>
       <span class="chevron" id="chevron-tools">&#9654;</span>
       <span class="toggle-hint">(8 tools)</span>
     </div>
-    <div class="collapsible" id="body-tools">
+    <div class="collapsible admin-only" id="body-tools">
       <div class="tools-grid">
         <div class="tool-card">
           <h3>Backfill Stripe</h3>
@@ -892,6 +892,7 @@
 <script>
 
 var adminPw = '';
+var userRole = '';
 
 function doLogin() {
   var pw = document.getElementById('admin-pw').value;
@@ -901,13 +902,38 @@ function doLogin() {
     body: JSON.stringify({password: pw})
   }).then(function(res) {
     if (!res.ok) throw new Error('bad');
+    return res.json();
+  }).then(function(data) {
     adminPw = pw;
+    userRole = data.role || 'viewer';
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('dashboard').classList.add('active');
+
+    // Role badge
+    var badge = document.getElementById('role-badge');
+    if (userRole === 'admin') {
+      badge.textContent = 'ADMIN';
+      badge.style.background = '#1c8c5a';
+      badge.style.color = '#fff';
+    } else {
+      badge.textContent = 'VIEWER';
+      badge.style.background = '#e8eaef';
+      badge.style.color = '#5a6d8c';
+    }
+
+    // Hide admin-only elements for viewers
+    if (userRole !== 'admin') {
+      var els = document.querySelectorAll('.admin-only');
+      for (var i = 0; i < els.length; i++) {
+        els[i].style.display = 'none';
+      }
+    }
+
     // Set default month for ad spend to current month
     var now = new Date();
     var monthStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
-    document.getElementById('adspend-month').value = monthStr;
+    var adspendMonth = document.getElementById('adspend-month');
+    if (adspendMonth) adspendMonth.value = monthStr;
     loadStats();
     loadUtmLinks();
   }).catch(function() {

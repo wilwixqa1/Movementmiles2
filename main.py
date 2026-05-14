@@ -38,6 +38,7 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "mmadmin2026")
+VIEWER_PASSWORD = os.environ.get("VIEWER_PASSWORD", "MMTeam262")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
@@ -547,6 +548,12 @@ async def call_anthropic_raw(system_prompt: str, messages: list, max_tokens: int
 
 def require_admin(password: str):
     if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_viewer(password: str):
+    """Accept either admin or viewer password for read-only endpoints."""
+    if password != ADMIN_PASSWORD and password != VIEWER_PASSWORD:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -2144,9 +2151,12 @@ async def run_daily_digest():
 
 @app.post("/api/admin/login")
 async def admin_login(req: LoginRequest):
-    if req.password != ADMIN_PASSWORD:
+    if req.password == ADMIN_PASSWORD:
+        return {"status": "ok", "role": "admin"}
+    elif req.password == VIEWER_PASSWORD:
+        return {"status": "ok", "role": "viewer"}
+    else:
         raise HTTPException(status_code=401, detail="Invalid password")
-    return {"status": "ok"}
 
 
 @app.post("/api/admin/fix-future-dates")
@@ -6235,7 +6245,7 @@ async def admin_subscriptions_csv(request: Request):
     """Export all subscribers (Stripe + Apple + Google) as CSV with lead attribution."""
 
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
 
@@ -6560,7 +6570,7 @@ async def admin_subscriptions_meg_xlsx(request: Request):
     Tab 5: Cancelled Subscription (no headers) - first, last, email"""
 
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
 
@@ -6709,7 +6719,7 @@ async def admin_user_journey_csv(request: Request):
     """Export lead-to-subscriber journey: joins leads + subscriptions by email."""
 
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
 
@@ -6898,7 +6908,7 @@ async def save_utm_link(request: Request):
 async def get_utm_links(request: Request):
     """List all saved UTM links."""
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
     async with db_pool.acquire() as conn:
@@ -7014,7 +7024,7 @@ async def search_subscriptions(request: Request):
 @app.get("/api/admin/stats")
 async def admin_stats(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
 
     if not db_pool:
         return {"error": "No database connected"}
@@ -7727,7 +7737,7 @@ async def admin_stats(request: Request):
 @app.get("/api/admin/leads-csv")
 async def admin_leads_csv(request: Request):
     pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
+    require_viewer(pw)
 
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
