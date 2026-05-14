@@ -629,7 +629,10 @@
           </div>
         </div>
       </div>
-      <div id="chart-utm-trend" style="width:100%;height:320px"></div>
+      <div style="position:relative">
+        <div id="chart-utm-trend" style="width:100%;height:320px"></div>
+        <div id="utm-trend-tooltip" style="display:none;position:absolute;pointer-events:none;background:#1a2748;color:#fff;padding:8px 12px;border-radius:6px;font-size:.78rem;white-space:nowrap;z-index:10;box-shadow:0 2px 8px rgba(0,0,0,.2)"></div>
+      </div>
       <div id="utm-trend-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:.78rem"></div>
       <div id="utm-trend-untagged" style="font-size:.78rem;color:var(--navy-mid);margin-top:8px"></div>
       <div style="font-size:.72rem;color:var(--navy-mid);margin-top:4px">Untagged subscribers (Apple/Google checkout strips UTMs, plus pre-tracking historical data) are excluded from the lines. Top 8 tagged values shown; the rest are bucketed as "other".</div>
@@ -1696,6 +1699,7 @@ function renderUtmTrendChart() {
   });
 
   // Draw lines per series
+  var measureLabel = measure === 'paid_conversions' ? 'Paid Conversions' : 'Signups';
   seriesNames.forEach(function(s, sIdx){
     var color = palette[sIdx % palette.length];
     var pathD = '';
@@ -1706,20 +1710,46 @@ function renderUtmTrendChart() {
       pathD += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
     });
     svg += '<path d="' + pathD + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round"/>';
-    // Dots + tooltips
+    // Dots with hover data attributes
     periods.forEach(function(p, i){
       var v = pivot[p][s] || 0;
-      if (v === 0) return; // skip zero markers to reduce noise
+      if (v === 0) return;
       var x = xAt(i);
       var y = yAt(v);
-      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3" fill="' + color + '">';
-      svg += '<title>' + s + ' \u2014 ' + p + ': ' + v + '</title>';
-      svg += '</circle>';
+      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="5" fill="' + color + '" stroke="#fff" stroke-width="1.5" style="cursor:pointer" data-tt-source="' + s + '" data-tt-period="' + p + '" data-tt-value="' + v + '" data-tt-measure="' + measureLabel + '" data-tt-color="' + color + '"/>';
     });
   });
 
   svg += '</svg>';
   container.innerHTML = svg;
+
+  // Attach hover events to dots
+  var tooltip = document.getElementById('utm-trend-tooltip');
+  container.querySelectorAll('circle[data-tt-source]').forEach(function(dot) {
+    dot.addEventListener('mouseenter', function(e) {
+      var src = dot.getAttribute('data-tt-source');
+      var period = dot.getAttribute('data-tt-period');
+      var val = dot.getAttribute('data-tt-value');
+      var meas = dot.getAttribute('data-tt-measure');
+      var col = dot.getAttribute('data-tt-color');
+      tooltip.innerHTML = '<span style="display:inline-block;width:8px;height:8px;background:' + col + ';border-radius:2px;margin-right:6px"></span><strong>' + src + '</strong><br>' + period + '<br>' + meas + ': <strong>' + val + '</strong>';
+      tooltip.style.display = 'block';
+      var rect = container.getBoundingClientRect();
+      var cx = parseFloat(dot.getAttribute('cx'));
+      var cy = parseFloat(dot.getAttribute('cy'));
+      var svgEl = container.querySelector('svg');
+      var svgRect = svgEl.getBoundingClientRect();
+      var scaleX = svgRect.width / W;
+      var scaleY = svgRect.height / H;
+      var tipX = cx * scaleX;
+      var tipY = cy * scaleY;
+      tooltip.style.left = (tipX + 12) + 'px';
+      tooltip.style.top = (tipY - 10) + 'px';
+    });
+    dot.addEventListener('mouseleave', function() {
+      tooltip.style.display = 'none';
+    });
+  });
 
   // Legend
   legend.innerHTML = seriesNames.map(function(s, i){
