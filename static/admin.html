@@ -1720,11 +1720,16 @@ function renderUtmTrendChart() {
 
   // X labels (rotate if many)
   var labelEvery = n <= 8 ? 1 : Math.ceil(n / 8);
+  var todayStr = new Date().toISOString().slice(0, 10);
   periods.forEach(function(p, i){
     if (i % labelEvery !== 0 && i !== n - 1) return;
     var lx = xAt(i);
     // Compact labels: trim YYYY- prefix for weekly, keep monthly as-is
     var label = p.length === 10 ? p.slice(5) : p; // MM-DD for weekly
+    // S34: For the last weekly period, show "today" label if it's the current partial week
+    if (gran === 'week' && i === n - 1 && p.length === 10) {
+      label = todayStr.slice(5) + '*';
+    }
     svg += '<text x="' + lx + '" y="' + (H - pad.b + 14) + '" text-anchor="middle" font-size="10" fill="#5a6d8c">' + label + '</text>';
   });
 
