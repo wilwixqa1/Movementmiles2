@@ -444,12 +444,14 @@
       <div class="utm-row">
         <div class="utm-field">
           <label>Base URL</label>
-          <select id="utm-base" onchange="updateUtmPreview()">
+          <select id="utm-base" onchange="handleUtmSelect(this,'utm-base-custom');updateUtmPreview()">
             <option value="https://go.movementandmiles.com/lp1a">go.movementandmiles.com/lp1a (landing page A)</option>
             <option value="https://go.movementandmiles.com/lp2a">go.movementandmiles.com/lp2a (landing page B)</option>
             <option value="https://movementandmiles.com">movementandmiles.com (marketing site)</option>
             <option value="https://ymove.app/join/movementandmiles">ymove.app direct signup</option>
+            <option value="__custom__">Custom...</option>
           </select>
+          <input type="text" id="utm-base-custom" placeholder="https://yoursite.com/page" style="margin-top:6px;display:none" oninput="updateUtmPreview()" />
         </div>
         <div class="utm-field">
           <label>Source (where)</label>
@@ -1002,7 +1004,8 @@ function getUtmValue(selectId, customId) {
 }
 
 function updateUtmPreview() {
-  var base = document.getElementById('utm-base').value;
+  var baseSelect = document.getElementById('utm-base');
+  var base = baseSelect.value === '__custom__' ? document.getElementById('utm-base-custom').value.trim() : baseSelect.value;
   var source = getUtmValue('utm-source', 'utm-source-custom');
   var medium = getUtmValue('utm-medium', 'utm-medium-custom');
   var campaign = document.getElementById('utm-campaign').value.trim().toLowerCase().replace(/\s+/g, '_');
@@ -1045,7 +1048,8 @@ function updateUtmPreview() {
 }
 
 function copyUtmUrl() {
-  var base = document.getElementById('utm-base').value;
+  var baseSelect = document.getElementById('utm-base');
+  var base = baseSelect.value === '__custom__' ? document.getElementById('utm-base-custom').value.trim() : baseSelect.value;
   var source = getUtmValue('utm-source', 'utm-source-custom');
   var medium = getUtmValue('utm-medium', 'utm-medium-custom');
   var campaign = document.getElementById('utm-campaign').value.trim().toLowerCase().replace(/\s+/g, '_');
