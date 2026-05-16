@@ -109,7 +109,8 @@ async def startup():
                     await conn.execute(f"ALTER TABLE leads ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
                 # S22: UTM tracking columns on page_views
                 # S33: Added utm_content for ad creative tracking
-                for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content']:
+                # S34: Added utm_term for audience-level tracking
+                for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term']:
                     await conn.execute(f"ALTER TABLE page_views ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
             print("[Startup] Block 1: Core tables ready")
 
@@ -697,6 +698,7 @@ class PageViewRequest(BaseModel):
     utm_medium: str = ""
     utm_campaign: str = ""
     utm_content: str = ""
+    utm_term: str = ""
 
 class LoginRequest(BaseModel):
     password: str
@@ -761,8 +763,8 @@ async def track_page_view(pv: PageViewRequest, request: Request):
             ua = request.headers.get("user-agent", "")
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO page_views (page, path, referrer, user_agent, utm_source, utm_medium, utm_campaign, utm_content) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                    pv.page, pv.path, pv.referrer, ua, pv.utm_source, pv.utm_medium, pv.utm_campaign, pv.utm_content
+                    "INSERT INTO page_views (page, path, referrer, user_agent, utm_source, utm_medium, utm_campaign, utm_content, utm_term) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    pv.page, pv.path, pv.referrer, ua, pv.utm_source, pv.utm_medium, pv.utm_campaign, pv.utm_content, pv.utm_term
                 )
         except Exception as e:
             print(f"Page view error: {e}")
@@ -6933,6 +6935,68 @@ async def delete_utm_link(request: Request):
     return {"status": "ok", "deleted": int(link_id)}
 
 
+@app.post("/api/admin/utm-links/backfill-content")
+async def backfill_utm_content(request: Request):
+    """S34: Batch-update existing UTM links -- derive utm_content from label and regenerate full_url.
+
+    Finds all utm_links where utm_content is empty but label is not empty,
+    slugifies the label, rebuilds the full_url with the new utm_content param,
+    and updates both columns. Dry-run by default (pass {"apply": true} to commit).
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, label, base_url, utm_source, utm_medium, utm_campaign, utm_term, ym_source, utm_content, full_url "
+            "FROM utm_links WHERE COALESCE(utm_content, '') = '' AND COALESCE(label, '') != '' "
+            "ORDER BY id"
+        )
+        updates = []
+        import re as _re
+        for r in rows:
+            label_slug = _re.sub(r'\s+', '_', r["label"].strip().lower())
+            # Rebuild full_url: start from base_url + all UTM params
+            params = []
+            if r["utm_source"]:
+                params.append("utm_source=" + r["utm_source"])
+            if r["utm_medium"]:
+                params.append("utm_medium=" + r["utm_medium"])
+            if r["utm_campaign"]:
+                params.append("utm_campaign=" + r["utm_campaign"])
+            if r["utm_term"]:
+                params.append("utm_term=" + r["utm_term"])
+            params.append("utm_content=" + label_slug)
+            if r["ym_source"]:
+                params.append("ym_source=" + r["ym_source"])
+            sep = "&" if "?" in r["base_url"] else "?"
+            new_url = r["base_url"] + sep + "&".join(params)
+            updates.append({
+                "id": r["id"],
+                "label": r["label"],
+                "slug": label_slug,
+                "old_url": r["full_url"],
+                "new_url": new_url,
+            })
+
+        if apply and updates:
+            for u in updates:
+                await conn.execute(
+                    "UPDATE utm_links SET utm_content = $1, full_url = $2 WHERE id = $3",
+                    u["slug"], u["new_url"], u["id"]
+                )
+
+    return {
+        "status": "applied" if apply else "dry_run",
+        "count": len(updates),
+        "updates": updates,
+    }
+
+
 # --- Session 11: Attach Email + Search (consolidated) ---
 
 @app.post("/api/admin/attach-email")
@@ -7254,6 +7318,7 @@ async def admin_stats(request: Request):
         # S33: Widened sub window to 90 days so cohorts that have matured past their
         # ~30-day trial show conversion data. Page views stay at 30 days for recency.
         # Added still_trialing, trial_canceled, avg_trial_days, avg_paid_lifetime_days.
+        # S34: Added utm_term as 5th grouping dimension for ad-audience granularity
         channel_perf_rows = await conn.fetch(
             """WITH pv AS (
                  SELECT
@@ -7261,10 +7326,11 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
                    COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
                    COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
+                   COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COUNT(*) as views
                  FROM page_views
                  WHERE created_at > NOW() - INTERVAL '30 days'
-                 GROUP BY 1, 2, 3, 4
+                 GROUP BY 1, 2, 3, 4, 5
                ),
                sub AS (
                  SELECT
@@ -7272,6 +7338,7 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
                    COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
                    COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
+                   COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COUNT(*) as signups,
                    COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
                    COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
@@ -7283,13 +7350,14 @@ async def admin_stats(request: Request):
                  FROM subscriptions
                  WHERE created_at > NOW() - INTERVAL '90 days'
                    AND status != 'incomplete_expired'
-                 GROUP BY 1, 2, 3, 4
+                 GROUP BY 1, 2, 3, 4, 5
                )
                SELECT
                  COALESCE(pv.utm_source, sub.utm_source) as utm_source,
                  COALESCE(pv.utm_medium, sub.utm_medium) as utm_medium,
                  COALESCE(pv.utm_campaign, sub.utm_campaign) as utm_campaign,
                  COALESCE(pv.utm_content, sub.utm_content) as utm_content,
+                 COALESCE(pv.utm_term, sub.utm_term) as utm_term,
                  COALESCE(pv.views, 0) as views,
                  COALESCE(sub.signups, 0) as signups,
                  COALESCE(sub.still_trialing, 0) as still_trialing,
@@ -7303,6 +7371,7 @@ async def admin_stats(request: Request):
                  AND pv.utm_medium = sub.utm_medium
                  AND pv.utm_campaign = sub.utm_campaign
                  AND pv.utm_content = sub.utm_content
+                 AND pv.utm_term = sub.utm_term
                ORDER BY signups DESC, views DESC"""
         )
 
@@ -7426,6 +7495,34 @@ async def admin_stats(request: Request):
             """SELECT
                 to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
                 COALESCE(NULLIF(s.utm_content, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.created_at <= NOW()
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+
+        # S34: utm_term trend queries for audience-level tracking
+        utm_trend_term_weekly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
+                COALESCE(NULLIF(s.utm_term, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.created_at <= NOW()
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_term_monthly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
+                COALESCE(NULLIF(s.utm_term, ''), 'none') as dimension,
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
@@ -7770,6 +7867,7 @@ async def admin_stats(request: Request):
                         "utm_medium": r["utm_medium"],
                         "utm_campaign": r["utm_campaign"],
                         "utm_content": r["utm_content"],
+                        "utm_term": r["utm_term"],
                         "views": r["views"],
                         "signups": r["signups"],
                         "still_trialing": r["still_trialing"],
@@ -7799,6 +7897,10 @@ async def admin_stats(request: Request):
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
                     for r in utm_trend_content_weekly
                 ],
+                "term": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_term_weekly
+                ],
             },
             "trend_monthly": {
                 "source": [
@@ -7816,6 +7918,10 @@ async def admin_stats(request: Request):
                 "content": [
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
                     for r in utm_trend_content_monthly
+                ],
+                "term": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_term_monthly
                 ],
             },
             "untagged_by_source": {
