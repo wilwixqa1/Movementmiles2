@@ -6935,6 +6935,36 @@ async def delete_utm_link(request: Request):
     return {"status": "ok", "deleted": int(link_id)}
 
 
+@app.get("/api/admin/debug/ymove-meta")
+async def debug_ymove_meta(request: Request):
+    """S34: Inspect raw ymove meta stored on subscriptions to check what fields ymove captures."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT email, utm_source, utm_content, utm_term, utm_meta_raw
+               FROM subscriptions
+               WHERE utm_meta_raw IS NOT NULL
+               ORDER BY created_at DESC
+               LIMIT 10"""
+        )
+    return {
+        "count": len(rows),
+        "samples": [
+            {
+                "email": r["email"],
+                "utm_source": r["utm_source"],
+                "utm_content": r["utm_content"],
+                "utm_term": r["utm_term"],
+                "raw_meta": json.loads(r["utm_meta_raw"]) if isinstance(r["utm_meta_raw"], str) else r["utm_meta_raw"],
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.post("/api/admin/utm-links/backfill-content")
 async def backfill_utm_content(request: Request):
     """S34: Batch-update existing UTM links -- derive utm_content from label and regenerate full_url.
