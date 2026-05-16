@@ -1835,12 +1835,17 @@ function renderChannelPerfTable() {
   var dir = window._channelPerfSortDir || 'desc';
 
   if (key === '_default') {
-    // S34: Default sort -- direct first, then everything else by trial starts desc
+    // S34: Default sort -- direct first, then meta/paid (Ahmed's ads), then everything else by trial starts desc
     rows.sort(function(a, b) {
-      var aIsDirect = a.utm_source === 'direct' ? 0 : 1;
-      var bIsDirect = b.utm_source === 'direct' ? 0 : 1;
-      if (aIsDirect !== bIsDirect) return aIsDirect - bIsDirect;
-      // After direct, sort by trial starts descending
+      // Priority tiers: 0 = direct, 1 = meta/paid, 2 = everything else
+      function tier(r) {
+        if (r.utm_source === 'direct' && r.utm_medium === 'none') return 0;
+        if (r.utm_source === 'meta' && r.utm_medium === 'paid') return 1;
+        return 2;
+      }
+      var ta = tier(a), tb = tier(b);
+      if (ta !== tb) return ta - tb;
+      // Within same tier, sort by trial starts descending
       return (b.signups || 0) - (a.signups || 0);
     });
   } else {
