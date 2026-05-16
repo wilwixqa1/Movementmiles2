@@ -7438,6 +7438,7 @@ async def admin_stats(request: Request):
                  FROM subscriptions
                  WHERE created_at > NOW() - INTERVAL '90 days'
                    AND status != 'incomplete_expired'
+                   AND trial_start IS NOT NULL
                  GROUP BY 1, 2, 3, 4, 5, 6
                )
                SELECT
