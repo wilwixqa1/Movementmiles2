@@ -150,6 +150,8 @@ async def startup():
                 for col in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source']:
                     await conn.execute(f"ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS utm_meta_raw JSONB")
+                # S34: Landing page tracking from ymove meta
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS landing_page TEXT DEFAULT ''")
                 # S30: effective_canceled_at separates "when user actually stopped paying"
                 # from "when our DB recorded the cancel". Batch cleanups (S28 stale sweeps,
                 # shadow sync deactivations, dedup cleanups) write canceled_at = NOW() even
@@ -1123,7 +1125,7 @@ async def _ymove_lookup_utm(email: str, ymove_user_id: str = "") -> dict:
         return result
 
     UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'ym_source',
-                'utm_id', 'gclid', 'fbclid', 'ttclid', 'msclkid', 'twclid', 'ref', 'referrer']
+                'utm_id', 'gclid', 'fbclid', 'ttclid', 'msclkid', 'twclid', 'ref', 'referrer', 'mm_lp']
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -1180,7 +1182,8 @@ async def _ymove_lookup_utm(email: str, ymove_user_id: str = "") -> dict:
 
 
 async def _store_utm_on_subscription(conn, stripe_sub_id: str, utm_result: dict):
-    """S21: Store UTM attribution data on a subscription record."""
+    """S21: Store UTM attribution data on a subscription record.
+    S34: Also stores landing_page from mm_lp param."""
     utm = utm_result.get("utm", {})
     raw_meta = utm_result.get("raw_meta")
 
@@ -1196,9 +1199,10 @@ async def _store_utm_on_subscription(conn, stripe_sub_id: str, utm_result: dict)
                 utm_term = COALESCE(NULLIF($4, ''), utm_term),
                 utm_content = COALESCE(NULLIF($5, ''), utm_content),
                 ym_source = COALESCE(NULLIF($6, ''), ym_source),
-                utm_meta_raw = $7,
+                landing_page = COALESCE(NULLIF($7, ''), landing_page),
+                utm_meta_raw = $8,
                 updated_at = NOW()
-            WHERE stripe_subscription_id = $8
+            WHERE stripe_subscription_id = $9
         """,
             utm.get("utm_source", ""),
             utm.get("utm_medium", ""),
@@ -1206,6 +1210,7 @@ async def _store_utm_on_subscription(conn, stripe_sub_id: str, utm_result: dict)
             utm.get("utm_term", ""),
             utm.get("utm_content", ""),
             utm.get("ym_source", ""),
+            utm.get("mm_lp", ""),
             json.dumps(raw_meta, default=str) if raw_meta else None,
             stripe_sub_id
         )
@@ -7348,7 +7353,7 @@ async def admin_stats(request: Request):
         # S33: Widened sub window to 90 days so cohorts that have matured past their
         # ~30-day trial show conversion data. Page views stay at 30 days for recency.
         # Added still_trialing, trial_canceled, avg_trial_days, avg_paid_lifetime_days.
-        # S34: Added utm_term as 5th grouping dimension for ad-audience granularity
+        # S34: Added utm_term + landing_page as grouping dimensions
         channel_perf_rows = await conn.fetch(
             """WITH pv AS (
                  SELECT
@@ -7369,6 +7374,7 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
                    COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
+                   COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
                    COUNT(*) as signups,
                    COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
                    COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
@@ -7380,7 +7386,7 @@ async def admin_stats(request: Request):
                  FROM subscriptions
                  WHERE created_at > NOW() - INTERVAL '90 days'
                    AND status != 'incomplete_expired'
-                 GROUP BY 1, 2, 3, 4, 5
+                 GROUP BY 1, 2, 3, 4, 5, 6
                )
                SELECT
                  COALESCE(pv.utm_source, sub.utm_source) as utm_source,
@@ -7388,6 +7394,7 @@ async def admin_stats(request: Request):
                  COALESCE(pv.utm_campaign, sub.utm_campaign) as utm_campaign,
                  COALESCE(pv.utm_content, sub.utm_content) as utm_content,
                  COALESCE(pv.utm_term, sub.utm_term) as utm_term,
+                 COALESCE(sub.landing_page, 'none') as landing_page,
                  COALESCE(pv.views, 0) as views,
                  COALESCE(sub.signups, 0) as signups,
                  COALESCE(sub.still_trialing, 0) as still_trialing,
@@ -7553,6 +7560,34 @@ async def admin_stats(request: Request):
             """SELECT
                 to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
                 COALESCE(NULLIF(s.utm_term, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND s.created_at <= NOW()
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+
+        # S34: landing_page trend queries
+        utm_trend_lp_weekly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('week', s.created_at), 'YYYY-MM-DD') as period,
+                COALESCE(NULLIF(s.landing_page, ''), 'none') as dimension,
+                COUNT(*) as signups,
+                COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+               FROM subscriptions s
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND s.created_at <= NOW()
+                 AND s.status != 'incomplete_expired'
+               GROUP BY period, dimension
+               ORDER BY period, signups DESC"""
+        )
+        utm_trend_lp_monthly = await conn.fetch(
+            """SELECT
+                to_char(date_trunc('month', s.created_at), 'YYYY-MM') as period,
+                COALESCE(NULLIF(s.landing_page, ''), 'none') as dimension,
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
@@ -7898,6 +7933,7 @@ async def admin_stats(request: Request):
                         "utm_campaign": r["utm_campaign"],
                         "utm_content": r["utm_content"],
                         "utm_term": r["utm_term"],
+                        "landing_page": r["landing_page"],
                         "views": r["views"],
                         "signups": r["signups"],
                         "still_trialing": r["still_trialing"],
@@ -7931,6 +7967,10 @@ async def admin_stats(request: Request):
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
                     for r in utm_trend_term_weekly
                 ],
+                "landing_page": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_lp_weekly
+                ],
             },
             "trend_monthly": {
                 "source": [
@@ -7952,6 +7992,10 @@ async def admin_stats(request: Request):
                 "term": [
                     {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
                     for r in utm_trend_term_monthly
+                ],
+                "landing_page": [
+                    {"period": r["period"], "dimension": r["dimension"], "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                    for r in utm_trend_lp_monthly
                 ],
             },
             "untagged_by_source": {

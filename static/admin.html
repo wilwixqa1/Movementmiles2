@@ -586,6 +586,7 @@
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_campaign')">Campaign</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_content')">Ad-Level</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_term')">Term</th>
+              <th style="cursor:pointer" onclick="sortChannelPerf('landing_page')">Landing Page</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views')">Views</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Trial Starts</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('still_trialing')">Still Trialing</th>
@@ -596,7 +597,7 @@
             </tr>
           </thead>
           <tbody id="channel-perf-tbody">
-            <tr><td colspan="12" class="empty-msg">Loading...</td></tr>
+            <tr><td colspan="13" class="empty-msg">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -618,6 +619,7 @@
             <button class="quick-btn" id="utm-trend-btn-campaign" onclick="setUtmTrendDim('campaign')" style="padding:4px 12px;font-size:.72rem">Campaign</button>
             <button class="quick-btn" id="utm-trend-btn-content" onclick="setUtmTrendDim('content')" style="padding:4px 12px;font-size:.72rem">Ad-Level</button>
             <button class="quick-btn" id="utm-trend-btn-term" onclick="setUtmTrendDim('term')" style="padding:4px 12px;font-size:.72rem">Term</button>
+            <button class="quick-btn" id="utm-trend-btn-landing_page" onclick="setUtmTrendDim('landing_page')" style="padding:4px 12px;font-size:.72rem">Landing Page</button>
           </div>
           <div style="display:flex;gap:4px">
             <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Range:</span>
@@ -1398,8 +1400,8 @@ function loadStats() {
     }
 
     // S32: UTM trend chart - stash data globally and render initial state.
-    window._utmTrendWeekly = sutm.trend_weekly || {source: [], medium: [], campaign: [], content: [], term: []};
-    window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: [], content: [], term: []};
+    window._utmTrendWeekly = sutm.trend_weekly || {source: [], medium: [], campaign: [], content: [], term: [], landing_page: []};
+    window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: [], content: [], term: [], landing_page: []};
     window._untaggedBySource = sutm.untagged_by_source || {weekly: [], monthly: []};
     if (typeof window._utmTrendDim === 'undefined') window._utmTrendDim = 'source';
     if (typeof window._utmTrendGran === 'undefined') window._utmTrendGran = 'week';
@@ -1580,7 +1582,7 @@ function setMrrView(view) {
 // S32: UTM trend chart controls.
 function setUtmTrendDim(dim) {
   window._utmTrendDim = dim;
-  ['source','medium','campaign','content','term'].forEach(function(d){
+  ['source','medium','campaign','content','term','landing_page'].forEach(function(d){
     document.getElementById('utm-trend-btn-' + d).className = 'quick-btn' + (d === dim ? ' active' : '');
   });
   renderUtmTrendChart();
@@ -1606,7 +1608,7 @@ function renderUtmTrendChart() {
   var rows = bucket[dim] || [];
 
   // Update title
-  var dimLabels = {source: 'Source', medium: 'Medium', campaign: 'Campaign', content: 'Ad-Level', term: 'Term'};
+  var dimLabels = {source: 'Source', medium: 'Medium', campaign: 'Campaign', content: 'Ad-Level', term: 'Term', landing_page: 'Landing Page'};
   var dimLabel = dimLabels[dim] || dim;
   var granLabel = gran === 'month' ? '12 Months' : '12 Weeks';
   document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by ' + dimLabel + ' (' + granLabel + ')';
@@ -1835,7 +1837,7 @@ function renderChannelPerfTable() {
 
   var tbody = document.getElementById('channel-perf-tbody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty-msg">No traffic or signups in the last 90 days yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty-msg">No traffic or signups in the last 90 days yet.</td></tr>';
     return;
   }
 
@@ -1851,12 +1853,16 @@ function renderChannelPerfTable() {
     var termCell = (r.utm_term || 'none') === 'none'
       ? '<span style="color:var(--navy-mid)">none</span>'
       : r.utm_term;
+    var lpCell = (r.landing_page || 'none') === 'none'
+      ? '<span style="color:var(--navy-mid)">none</span>'
+      : r.landing_page;
     return '<tr>' +
       '<td><strong>' + r.utm_source + '</strong></td>' +
       '<td>' + r.utm_medium + '</td>' +
       '<td>' + campCell + '</td>' +
       '<td>' + contentCell + '</td>' +
       '<td>' + termCell + '</td>' +
+      '<td>' + lpCell + '</td>' +
       '<td style="text-align:right">' + (r.views || 0) + '</td>' +
       '<td style="text-align:right">' + (r.signups || 0) + '</td>' +
       '<td style="text-align:right">' + (r.still_trialing || 0) + '</td>' +
