@@ -582,7 +582,10 @@
             <button class="quick-btn" id="cp-window-365" onclick="setChannelPerfWindow(365)" style="padding:4px 12px;font-size:.72rem">1yr</button>
           </div>
         </div>
-        <div style="font-size:.72rem;color:var(--navy-mid)">Direct first, then by trial starts. Click a column header to re-sort.</div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <div style="font-size:.72rem;color:var(--navy-mid)">Direct first, then by trial starts. Click a column header to re-sort.</div>
+          <button class="quick-btn admin-only" onclick="exportChannelPerfCsv()" style="padding:4px 12px;font-size:.72rem">Export CSV</button>
+        </div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
         <table id="channel-perf-table" style="width:100%;font-size:.84rem">
@@ -1955,6 +1958,23 @@ function setChannelPerfWindow(days) {
   document.getElementById('channel-perf-title').textContent = 'Channel Performance (last ' + label + ')';
   // Re-fetch stats with new window
   loadStats();
+}
+
+function exportChannelPerfCsv() {
+  var days = window._channelPerfDays || 90;
+  var url = '/api/admin/channel-perf-csv?cp_days=' + days;
+  // Use fetch with auth header, then trigger download
+  fetch(url, {headers: {'X-Admin-Password': adminPw}})
+    .then(function(r) { return r.blob(); })
+    .then(function(blob) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      var label = days === 365 ? '1yr' : days + 'd';
+      a.download = 'mm-channel-performance-' + label + '.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function(e) { console.error('CSV export error:', e); });
 }
 
 function renderBarChart(containerId, data) {

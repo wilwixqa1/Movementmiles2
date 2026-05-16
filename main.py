@@ -8132,6 +8132,69 @@ async def admin_leads_csv(request: Request):
     )
 
 
+@app.get("/api/admin/channel-perf-csv")
+async def admin_channel_perf_csv(request: Request):
+    """S34: Export Channel Performance table as CSV."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    cp_days = int(request.query_params.get("cp_days", "90"))
+    if cp_days not in (30, 90, 365):
+        cp_days = 90
+    cp_interval = f"{cp_days} days"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""WITH sub AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
+                   COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
+                   COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
+                   COUNT(*) as trial_starts,
+                   COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
+                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
+                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions
+                 FROM subscriptions
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
+                   AND status != 'incomplete_expired'
+                   AND trial_start IS NOT NULL
+                 GROUP BY 1, 2, 3, 4, 5, 6
+               )
+               SELECT *, 
+                 CASE WHEN (paid_conversions + trial_canceled) > 0
+                   THEN ROUND(paid_conversions::numeric / (paid_conversions + trial_canceled) * 100, 1)
+                   ELSE NULL END as conv_rate
+               FROM sub
+               ORDER BY trial_starts DESC"""
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Source", "Medium", "Campaign", "Ad-Level", "Term", "Landing Page",
+                     "Trial Starts", "Still Trialing", "Trial Canceled", "Paid Conversions", "Conv Rate %"])
+    for r in rows:
+        writer.writerow([
+            r["utm_source"], r["utm_medium"], r["utm_campaign"],
+            r["utm_content"], r["utm_term"], r["landing_page"],
+            r["trial_starts"], r["still_trialing"], r["trial_canceled"],
+            r["paid_conversions"],
+            f"{r['conv_rate']}%" if r["conv_rate"] is not None else ""
+        ])
+
+    label = "1yr" if cp_days == 365 else f"{cp_days}d"
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=mm-channel-performance-{label}.csv"}
+    )
+
+
 @app.get("/api/health")
 async def health():
     db_status = "connected" if db_pool else "not connected"
