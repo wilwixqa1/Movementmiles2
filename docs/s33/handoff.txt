@@ -1,0 +1,191 @@
+MOVEMENT & MILES -- SESSION 33 HANDOFF
+=======================================
+Date: May 15, 2026
+Repo: github.com/wilwixqa1/Movementmiles2
+Stack: Python FastAPI + asyncpg (PostgreSQL) + vanilla JS dashboard
+Hosted: Railway (auto-deploys on push to main)
+Files: main.py (12,831 lines), static/admin.html (3,286 lines)
+
+KEY STAKEHOLDERS
+================
+- Meg (MTFit LLC): Client, owns the fitness subscription product
+- Ahmed Abdelrehim: Marketing lead, runs Meta ad campaigns, owns UTM strategy
+- Ashraf Zaky (ashraf@marketingwizusa.com): Project Manager at Marketing Wiz (Ahmed's agency), new point of contact as of this session
+- Tosh Koevoets: ymove platform developer, handles Apple/Google in-app purchase routing
+- Will: Partnership/tech lead, maintains dashboard and data pipeline
+
+
+WHAT WE CHANGED THIS SESSION (6 COMMITS)
+==========================================
+
+1. VIEWER ROLE (Item 1)
+   Commit: 54e1f1e
+   - Added VIEWER_PASSWORD env var (default: MMTeam262, not yet added to Railway env vars)
+   - ADMIN_PASSWORD unchanged (default: mmadmin2026, also not in Railway env vars -- uses code default)
+   - Login endpoint (/api/admin/login) returns {role: "admin"} or {role: "viewer"}
+   - Added require_viewer() function that accepts either password
+   - 6 read-only endpoints changed to require_viewer: stats, subscriptions-csv, subscriptions-meg-xlsx, user-journey-csv, utm-links GET, leads-csv
+   - All write endpoints remain require_admin only
+   - Frontend: login page title changed from "M&M Admin" to "M&M Analytics"
+   - Dashboard nav shows role badge (green "ADMIN" or gray "VIEWER")
+   - Elements with class="admin-only" are hidden via display:none for viewers
+   - Hidden for viewers: export buttons, email attach, ad spend tracker, UTM link generator, Data Health tools, Admin Tools section
+
+2. CHANNEL PERFORMANCE TABLE -- FUNNEL COLUMNS + 90-DAY WINDOW (Item 2)
+   Commit: eb0446b
+   - Subscription query window widened from 30 to 90 days (page views still 30d)
+   - Added columns: Still Trialing, Trial Canceled
+   - Conv Rate formula changed from Paid/Views to Paid/(Paid + Trial Canceled)
+   - Backend also computes avg_trial_days and avg_paid_lifetime_days (in API response, not displayed in UI yet)
+   - Rename: "Signups" column is now "Trial Starts"
+
+3. UTM_CONTENT TRACKING -- AD-LEVEL GRANULARITY (Item 2 continued)
+   Commit: 28a2a75
+   - Core problem: all Meta ads share source=meta, medium=paid, campaign=may26_warm so they collapse into one row
+   - Solution: Link Label field now auto-populates utm_content in the URL
+   - When creating a UTM link, if utm_content is empty but label is set, the label (slugified) becomes utm_content
+   - Example: label "A3 FB Sys5 LPB" -> utm_content=a3_fb_sys5_lpb in the URL
+   - page_views table got new utm_content column (ALTER TABLE, added at startup)
+   - PageViewRequest model got utm_content field
+   - page view INSERT now includes utm_content
+   - Channel Performance query groups by utm_content (4th dimension)
+   - Channel Performance table has new "Ad-Level" column
+   - Subscriber Trend chart has new "Ad-Level" toggle button
+   - Backend: content weekly/monthly trend queries added to stats endpoint
+   - Squarespace UTM script already captures utm_content -- no change needed there
+   - IMPORTANT: existing links need to be recreated to pick up utm_content. Old subscribers won't have ad-level attribution.
+
+4. UI POLISH -- RENAME + TOGGLE VISIBILITY (Item 3)
+   Commit: 475e19e
+   - "Content" renamed to "Ad-Level" in trend chart button, Channel Performance column header, and chart title
+   - Added standalone .quick-btn CSS so active state (dark navy background) is visible outside .date-bar context
+   - Trend chart title now uses a lookup map for dimension labels
+
+5. UNTAGGED SUBSCRIBER BREAKDOWN (Item 4)
+   Commit: 834688b
+   - Backend: new query counts untagged subs (no UTM source) grouped by payment source (apple/google/stripe/undetermined/manual)
+   - Returns totals, still_trialing, paid_conversions, trial_canceled per source
+   - Both weekly and monthly windows (matching trend chart)
+   - Frontend: replaces "987 untagged signups" with full breakdown
+   - Shows: "1011 untagged signups not shown on chart: 456 Apple (app store), 409 Stripe (web, no UTM), 127 Google (app store), 10 undetermined, 9 manual"
+   - Explanatory note about app store checkout stripping UTMs
+   - Breakdown updates when switching signups/paid conversions and weeks/months
+
+6. HOVER TOOLTIPS ON TREND CHART (UX improvement)
+   Commit: 34ddd84
+   - Dots enlarged from r=3 to r=5 with white stroke for easier targeting
+   - SVG <title> tooltips replaced with styled HTML tooltip div
+   - Shows source name, date period, and count on hover
+   - Tooltip positioned next to the dot, dark navy background
+
+
+ARCHITECTURE NOTES FOR NEXT SESSION
+=====================================
+
+DATA FLOW: UTM -> SUBSCRIBER
+  1. User clicks UTM link -> lands on Squarespace site
+  2. squarespace_utm_script.html captures UTMs from URL, stores in sessionStorage
+  3. When user clicks ymove checkout link, script appends stored UTMs to the ymove URL
+  4. User subscribes through ymove -> Stripe subscription created
+  5. Stripe fires customer.subscription.created webhook -> main.py stores sub with UTMs
+  6. For trials: Stripe fires customer.subscription.updated when trialing->active -> main.py stamps converted_at
+  7. For Apple/Google: ymove fires webhooks -> main.py stores sub (but no UTMs since app store strips them)
+
+CONVERSION TRACKING
+  - Stripe: converted_at stamped on trialing->active transition (customer.subscription.updated webhook, line ~980)
+  - Apple/Google: converted_at stamped via smart-backfill-conversions endpoint (line ~2184)
+  - Trial period is ~1 month free trial
+  - Current 90-day channel perf window means cohorts from 60+ days ago should show conversion data
+  - Subs created in last 30 days are likely still trialing, which is expected
+
+AUTH SYSTEM
+  - Simple password-based, no tokens or sessions
+  - Frontend stores password in JS var (adminPw), sends as X-Admin-Password header on every request
+  - No JWT, no cookies, no session management
+  - Future: Will mentioned possibly adding Google SSO. Would need a real auth system with JWT tokens.
+
+DATABASE TABLES (key ones)
+  - subscriptions: main table. Has utm_source, utm_medium, utm_campaign, utm_term, utm_content, source (apple/google/stripe), status, converted_at, effective_canceled_at, readable_id
+  - page_views: utm_source, utm_medium, utm_campaign, utm_content (added S33)
+  - leads: signup form submissions with UTM data
+  - utm_links: saved UTM link configurations (label, base_url, all UTM fields, full_url)
+  - ad_spend: monthly spend by channel for CPA calculations
+  - reconciliation_snapshots: daily snapshot data for monitoring
+
+STATS ENDPOINT (/api/admin/stats)
+  - Single massive endpoint that returns ALL dashboard data
+  - ~700 lines of queries
+  - Returns: subscriber counts, conversion counts, churn, MRR, channel_performance, conversion_funnel, trend_weekly, trend_monthly, untagged_by_source, leads data, AI insights
+  - This is the bottleneck endpoint -- every dashboard load hits it
+
+FRONTEND (admin.html)
+  - Single-file vanilla JS dashboard, no framework
+  - All charts are hand-built SVG (no Chart.js or D3)
+  - Quick-btn class used for toggle buttons -- needs both .date-bar scoped and standalone CSS
+  - renderChannelPerfTable(), renderUtmTrendChart(), renderConvFunnel() are the main chart functions
+  - Window globals: _channelPerf, _utmTrendWeekly, _utmTrendMonthly, _untaggedBySource, etc.
+
+
+NEXT SESSION TODO LIST (FROM AHMED'S LOOM + ASHRAF'S EMAIL + CALL NOTES)
+==========================================================================
+
+PRIORITY 1: REPORTING WINDOW EXTENSION
+  - Ahmed wants reporting windows extended to 24 weeks or 52 weeks (not just 12 weeks)
+  - The trend chart currently only supports 12 weeks / 12 months
+  - Need to add UI controls for longer date ranges
+  - Also extend Channel Performance table to configurable windows
+
+PRIORITY 2: CSV EXPORT FOR CHANNEL PERFORMANCE
+  - Ahmed wants to export the Channel Performance table data as CSV
+  - Should include all new columns (Trial Starts, Still Trialing, Trial Canceled, Paid Conv, Conv Rate, Ad-Level)
+  - Extended timeframe coverage needed
+  - There are already CSV exports for subscribers and leads, but not for channel performance
+
+PRIORITY 3: SIGNUP DATA FEED FIX
+  - Ahmed reported signups data stops updating after May 11
+  - Will suspects a recent fix attempt broke something
+  - Need to investigate and fix
+
+PRIORITY 4: UTM TERM VISIBILITY
+  - Ahmed wants utm_term visible in reporting (not just utm_source/medium/campaign/content)
+  - utm_term is already stored on leads and subscriptions, just not displayed or grouped by
+  - Could add as another toggle dimension on the trend chart
+
+PRIORITY 5: EXISTING LINKS RECREATION
+  - Ahmed's team needs to recreate all existing UTM links using the updated generator
+  - The new links will have utm_content populated from the label
+  - Old links won't have ad-level tracking
+  - Could potentially batch-update existing utm_links records to add utm_content from their labels and regenerate URLs
+
+PRIORITY 6: UNDETERMINED SUBSCRIBERS
+  - 10 "undetermined" source records exist in the untagged breakdown
+  - These are from ymove shadow sync where provider couldn't be identified
+  - Low priority but worth cleaning up when time allows
+  - There's already a /api/admin/reclassify-undetermined endpoint (line 2523)
+
+PRIORITY 7: META CONVERSION DISCREPANCY
+  - Meta reports 4 conversions but dashboard shows 21 actual conversions
+  - This is expected because Meta only tracks clicks->conversions within its attribution window
+  - Many users see an ad, then convert later via direct or other channel
+  - Ahmed wants the M&M dashboard to be source of truth, not Meta
+  - The ad-level tracking (utm_content) will help close this gap going forward
+
+LOWER PRIORITY:
+  - Google SSO for viewer access (future)
+  - Avg Trial Days and Avg Paid Lifetime columns (data computed in API, not shown in UI yet -- ready to add)
+  - SEO/YouTube shorts tracking (future phase)
+
+
+EMAIL STATUS
+============
+Draft response to Ashraf ready to send. Covers all 4 items. Includes viewer credentials (MMTeam262).
+Uses "ad-level tracking" terminology (not "creative-level attribution").
+Mentions Meta Ads Manager as best source for historical per-ad data.
+Item 4 (untagged breakdown) is now done, not a question -- email should reflect that.
+
+
+ENV VARS (RAILWAY)
+==================
+Currently set in Railway: ANTHROPIC_API_KEY, APPLE_ISSUER_ID, APPLE_KEY_CONTENT, APPLE_KEY_ID, APPLE_VENDOR_NUMBER, DATABASE_URL, DIGEST_FROM_EMAIL, DIGEST_RECIPIENTS, RESEND_API_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+NOT in Railway (using code defaults): ADMIN_PASSWORD (mmadmin2026), VIEWER_PASSWORD (MMTeam262)
+Consider adding both to Railway for easy rotation without redeploy.
