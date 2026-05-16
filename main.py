@@ -6970,6 +6970,42 @@ async def debug_ymove_meta(request: Request):
     }
 
 
+@app.get("/api/admin/debug/sub-timeline")
+async def debug_sub_timeline(request: Request):
+    """S34: Check subscription creation counts by day to diagnose data gaps."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        daily = await conn.fetch(
+            """SELECT to_char(created_at::date, 'YYYY-MM-DD') as day,
+                      COUNT(*) as total,
+                      COUNT(*) FILTER (WHERE status != 'incomplete_expired') as excl_incomplete,
+                      COUNT(*) FILTER (WHERE trial_start IS NOT NULL) as with_trial,
+                      COUNT(*) FILTER (WHERE source = 'stripe') as stripe,
+                      COUNT(*) FILTER (WHERE source = 'apple') as apple,
+                      COUNT(*) FILTER (WHERE source = 'google') as google
+               FROM subscriptions
+               WHERE created_at >= NOW() - INTERVAL '30 days'
+               GROUP BY 1 ORDER BY 1"""
+        )
+    return {
+        "days": [
+            {
+                "day": r["day"],
+                "total": r["total"],
+                "excl_incomplete": r["excl_incomplete"],
+                "with_trial": r["with_trial"],
+                "stripe": r["stripe"],
+                "apple": r["apple"],
+                "google": r["google"],
+            }
+            for r in daily
+        ],
+    }
+
+
 @app.post("/api/admin/cleanup-test-data")
 async def cleanup_test_data(request: Request):
     """S34: Remove test subscriptions and page views from the database.
