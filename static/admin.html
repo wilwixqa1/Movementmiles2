@@ -575,7 +575,7 @@
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
         <div class="section-title" style="margin-bottom:0">Channel Performance (last 90 days)</div>
-        <div style="font-size:.72rem;color:var(--navy-mid)">Grouped by source (direct first); click a column header to re-sort.</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)">Direct first, then by trial starts. Click a column header to re-sort.</div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
         <table id="channel-perf-table" style="width:100%;font-size:.84rem">
@@ -1835,15 +1835,12 @@ function renderChannelPerfTable() {
   var dir = window._channelPerfSortDir || 'desc';
 
   if (key === '_default') {
-    // S34: Default sort -- direct first, then grouped by source (alpha), then trial starts desc within group
+    // S34: Default sort -- direct first, then everything else by trial starts desc
     rows.sort(function(a, b) {
       var aIsDirect = a.utm_source === 'direct' ? 0 : 1;
       var bIsDirect = b.utm_source === 'direct' ? 0 : 1;
       if (aIsDirect !== bIsDirect) return aIsDirect - bIsDirect;
-      // Group by source alphabetically
-      var srcCmp = a.utm_source.localeCompare(b.utm_source);
-      if (srcCmp !== 0) return srcCmp;
-      // Within same source, sort by trial starts descending
+      // After direct, sort by trial starts descending
       return (b.signups || 0) - (a.signups || 0);
     });
   } else {
