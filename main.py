@@ -7406,8 +7406,13 @@ async def admin_stats(request: Request):
         # ~30-day trial show conversion data. Page views stay at 30 days for recency.
         # Added still_trialing, trial_canceled, avg_trial_days, avg_paid_lifetime_days.
         # S34: Added utm_term + landing_page as grouping dimensions
+        # S34: channel_perf_days param controls window (default 90, frontend can pass 30/90/365)
+        cp_days = int(request.query_params.get("cp_days", "90")) if hasattr(request, 'query_params') else 90
+        if cp_days not in (30, 90, 365):
+            cp_days = 90
+        cp_interval = f"{cp_days} days"
         channel_perf_rows = await conn.fetch(
-            """WITH pv AS (
+            f"""WITH pv AS (
                  SELECT
                    COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
@@ -7416,7 +7421,7 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COUNT(*) as views
                  FROM page_views
-                 WHERE created_at > NOW() - INTERVAL '30 days'
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
                  GROUP BY 1, 2, 3, 4, 5
                ),
                sub AS (
@@ -7436,7 +7441,7 @@ async def admin_stats(request: Request):
                    AVG(EXTRACT(EPOCH FROM (COALESCE(effective_canceled_at, NOW()) - converted_at)) / 86400)
                      FILTER (WHERE converted_at IS NOT NULL) as avg_paid_lifetime_days
                  FROM subscriptions
-                 WHERE created_at > NOW() - INTERVAL '90 days'
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
                    AND status != 'incomplete_expired'
                    AND trial_start IS NOT NULL
                  GROUP BY 1, 2, 3, 4, 5, 6
@@ -7494,7 +7499,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7507,7 +7512,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7520,7 +7525,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7534,7 +7539,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7547,7 +7552,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7560,7 +7565,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7575,7 +7580,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7588,7 +7593,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7603,7 +7608,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7616,7 +7621,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7631,7 +7636,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+               WHERE s.created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7644,7 +7649,7 @@ async def admin_stats(request: Request):
                 COUNT(*) as signups,
                 COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
                FROM subscriptions s
-               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+               WHERE s.created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND s.created_at <= NOW()
                  AND s.status != 'incomplete_expired'
                GROUP BY period, dimension
@@ -7663,7 +7668,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled
                FROM subscriptions
                WHERE (utm_source IS NULL OR utm_source = '')
-                 AND created_at >= date_trunc('week', NOW() - INTERVAL '12 weeks')
+                 AND created_at >= date_trunc('week', NOW() - INTERVAL '52 weeks')
                  AND created_at <= NOW()
                  AND status != 'incomplete_expired'
                GROUP BY source
@@ -7678,7 +7683,7 @@ async def admin_stats(request: Request):
                 COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled
                FROM subscriptions
                WHERE (utm_source IS NULL OR utm_source = '')
-                 AND created_at >= date_trunc('month', NOW() - INTERVAL '12 months')
+                 AND created_at >= date_trunc('month', NOW() - INTERVAL '24 months')
                  AND created_at <= NOW()
                  AND status != 'incomplete_expired'
                GROUP BY source
@@ -7696,7 +7701,7 @@ async def admin_stats(request: Request):
                 COALESCE(SUM(CASE WHEN s.plan_interval='month' THEN s.plan_amount ELSE 0 END), 0) as monthly_total,
                 COALESCE(SUM(CASE WHEN s.plan_interval='year' THEN s.plan_amount/12 ELSE 0 END), 0) as annual_total
                FROM generate_series(
-                   date_trunc('week', NOW() - INTERVAL '12 weeks'),
+                   date_trunc('week', NOW() - INTERVAL '52 weeks'),
                    date_trunc('week', NOW()),
                    '1 week'::interval
                ) AS w
@@ -7711,7 +7716,7 @@ async def admin_stats(request: Request):
                 COALESCE(SUM(CASE WHEN s.plan_interval='month' THEN s.plan_amount ELSE 0 END), 0) as monthly_total,
                 COALESCE(SUM(CASE WHEN s.plan_interval='year' THEN s.plan_amount/12 ELSE 0 END), 0) as annual_total
                FROM generate_series(
-                   date_trunc('month', NOW() - INTERVAL '12 months'),
+                   date_trunc('month', NOW() - INTERVAL '24 months'),
                    date_trunc('month', NOW()),
                    '1 month'::interval
                ) AS w
@@ -7978,7 +7983,7 @@ async def admin_stats(request: Request):
             "by_medium": [{"medium": r["medium"], "count": r["count"]} for r in subs_by_utm_medium],
             "by_campaign": [{"campaign": r["campaign"], "count": r["count"]} for r in subs_by_utm_campaign],
             "channel_performance": {
-                "window_days": 90,
+                "window_days": cp_days,
                 "rows": [
                     {
                         "utm_source": r["utm_source"],

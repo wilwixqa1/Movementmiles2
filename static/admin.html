@@ -574,7 +574,14 @@
          views, signups, paid conversions, CVR, and source-level CPA. -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
-        <div class="section-title" style="margin-bottom:0">Channel Performance (last 90 days)</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <div class="section-title" style="margin-bottom:0" id="channel-perf-title">Channel Performance (last 90 days)</div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn" id="cp-window-30" onclick="setChannelPerfWindow(30)" style="padding:4px 12px;font-size:.72rem">30d</button>
+            <button class="quick-btn active" id="cp-window-90" onclick="setChannelPerfWindow(90)" style="padding:4px 12px;font-size:.72rem">90d</button>
+            <button class="quick-btn" id="cp-window-365" onclick="setChannelPerfWindow(365)" style="padding:4px 12px;font-size:.72rem">1yr</button>
+          </div>
+        </div>
         <div style="font-size:.72rem;color:var(--navy-mid)">Direct first, then by trial starts. Click a column header to re-sort.</div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
@@ -623,8 +630,11 @@
           </div>
           <div style="display:flex;gap:4px">
             <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Range:</span>
-            <button class="quick-btn active" id="utm-trend-btn-week" onclick="setUtmTrendGran('week')" style="padding:4px 12px;font-size:.72rem">Weeks</button>
-            <button class="quick-btn" id="utm-trend-btn-month" onclick="setUtmTrendGran('month')" style="padding:4px 12px;font-size:.72rem">Months</button>
+            <button class="quick-btn active" id="utm-trend-btn-12w" onclick="setUtmTrendRange('12w')" style="padding:4px 12px;font-size:.72rem">12 Weeks</button>
+            <button class="quick-btn" id="utm-trend-btn-24w" onclick="setUtmTrendRange('24w')" style="padding:4px 12px;font-size:.72rem">24 Weeks</button>
+            <button class="quick-btn" id="utm-trend-btn-52w" onclick="setUtmTrendRange('52w')" style="padding:4px 12px;font-size:.72rem">52 Weeks</button>
+            <button class="quick-btn" id="utm-trend-btn-12m" onclick="setUtmTrendRange('12m')" style="padding:4px 12px;font-size:.72rem">12 Months</button>
+            <button class="quick-btn" id="utm-trend-btn-24m" onclick="setUtmTrendRange('24m')" style="padding:4px 12px;font-size:.72rem">24 Months</button>
           </div>
           <div style="display:flex;gap:4px">
             <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Measure:</span>
@@ -1192,6 +1202,8 @@ function loadStats() {
   var qp = [];
   if (activeFrom) qp.push('from=' + activeFrom);
   if (activeTo) qp.push('to=' + activeTo);
+  var cpDays = window._channelPerfDays || 90;
+  qp.push('cp_days=' + cpDays);
   if (qp.length) statsUrl += '?' + qp.join('&');
   fetch(statsUrl, {
     headers: {'X-Admin-Password': adminPw}
@@ -1404,7 +1416,7 @@ function loadStats() {
     window._utmTrendMonthly = sutm.trend_monthly || {source: [], medium: [], campaign: [], content: [], term: [], landing_page: []};
     window._untaggedBySource = sutm.untagged_by_source || {weekly: [], monthly: []};
     if (typeof window._utmTrendDim === 'undefined') window._utmTrendDim = 'source';
-    if (typeof window._utmTrendGran === 'undefined') window._utmTrendGran = 'week';
+    if (typeof window._utmTrendRange === 'undefined') window._utmTrendRange = '12w';
     if (typeof window._utmTrendMeasure === 'undefined') window._utmTrendMeasure = 'signups';
     renderUtmTrendChart();
 
@@ -1587,10 +1599,11 @@ function setUtmTrendDim(dim) {
   });
   renderUtmTrendChart();
 }
-function setUtmTrendGran(gran) {
-  window._utmTrendGran = gran;
-  document.getElementById('utm-trend-btn-week').className = 'quick-btn' + (gran === 'week' ? ' active' : '');
-  document.getElementById('utm-trend-btn-month').className = 'quick-btn' + (gran === 'month' ? ' active' : '');
+function setUtmTrendRange(range) {
+  window._utmTrendRange = range;
+  ['12w','24w','52w','12m','24m'].forEach(function(r){
+    document.getElementById('utm-trend-btn-' + r).className = 'quick-btn' + (r === range ? ' active' : '');
+  });
   renderUtmTrendChart();
 }
 function setUtmTrendMeasure(m) {
@@ -1602,16 +1615,28 @@ function setUtmTrendMeasure(m) {
 
 function renderUtmTrendChart() {
   var dim = window._utmTrendDim || 'source';
-  var gran = window._utmTrendGran || 'week';
+  var range = window._utmTrendRange || '12w';
   var measure = window._utmTrendMeasure || 'signups';
+  // Determine granularity and period count from range
+  var gran = range.endsWith('m') ? 'month' : 'week';
+  var periodCount = parseInt(range);
   var bucket = gran === 'month' ? (window._utmTrendMonthly || {}) : (window._utmTrendWeekly || {});
-  var rows = bucket[dim] || [];
+  var allRows = bucket[dim] || [];
+
+  // Filter to only the most recent N periods
+  var allPeriods = {};
+  allRows.forEach(function(r){ allPeriods[r.period] = true; });
+  var sortedPeriods = Object.keys(allPeriods).sort();
+  var visiblePeriods = sortedPeriods.slice(-periodCount);
+  var visibleSet = {};
+  visiblePeriods.forEach(function(p){ visibleSet[p] = true; });
+  var rows = allRows.filter(function(r){ return visibleSet[r.period]; });
 
   // Update title
   var dimLabels = {source: 'Source', medium: 'Medium', campaign: 'Campaign', content: 'Ad-Level', term: 'Term', landing_page: 'Landing Page'};
   var dimLabel = dimLabels[dim] || dim;
-  var granLabel = gran === 'month' ? '12 Months' : '12 Weeks';
-  document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by ' + dimLabel + ' (' + granLabel + ')';
+  var rangeLabel = range === '12w' ? '12 Weeks' : range === '24w' ? '24 Weeks' : range === '52w' ? '52 Weeks' : range === '12m' ? '12 Months' : '24 Months';
+  document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by ' + dimLabel + ' (' + rangeLabel + ')';
 
   var container = document.getElementById('chart-utm-trend');
   var legend = document.getElementById('utm-trend-legend');
@@ -1913,6 +1938,17 @@ function sortChannelPerf(key) {
     window._channelPerfSortDir = numericKeys.indexOf(key) >= 0 ? 'desc' : 'asc';
   }
   renderChannelPerfTable();
+}
+
+function setChannelPerfWindow(days) {
+  window._channelPerfDays = days;
+  [30, 90, 365].forEach(function(d){
+    document.getElementById('cp-window-' + d).className = 'quick-btn' + (d === days ? ' active' : '');
+  });
+  var label = days === 365 ? '1 year' : days + ' days';
+  document.getElementById('channel-perf-title').textContent = 'Channel Performance (last ' + label + ')';
+  // Re-fetch stats with new window
+  loadStats();
 }
 
 function renderBarChart(containerId, data) {
