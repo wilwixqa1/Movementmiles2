@@ -575,7 +575,7 @@
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
         <div class="section-title" style="margin-bottom:0">Channel Performance (last 90 days)</div>
-        <div style="font-size:.72rem;color:var(--navy-mid)">Sorted by trial starts; click a column header to re-sort.</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)">Grouped by source (direct first); click a column header to re-sort.</div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
         <table id="channel-perf-table" style="width:100%;font-size:.84rem">
@@ -1410,7 +1410,7 @@ function loadStats() {
 
     // S32: Channel Performance Table - stash + render.
     window._channelPerf = sutm.channel_performance || {window_days: 30, rows: [], ad_spend_by_source_cents: {}};
-    if (typeof window._channelPerfSortKey === 'undefined') window._channelPerfSortKey = 'signups';
+    if (typeof window._channelPerfSortKey === 'undefined') window._channelPerfSortKey = '_default';
     if (typeof window._channelPerfSortDir === 'undefined') window._channelPerfSortDir = 'desc';
     renderChannelPerfTable();
 
@@ -1820,20 +1820,46 @@ function renderChannelPerfTable() {
     r.cpa = r._srcCpaCents;
   });
 
-  var key = window._channelPerfSortKey || 'signups';
-  var dir = window._channelPerfSortDir || 'desc';
-  rows.sort(function(a, b){
-    var av = a[key];
-    var bv = b[key];
-    // Push nulls to the bottom regardless of direction.
-    if (av == null && bv == null) return 0;
-    if (av == null) return 1;
-    if (bv == null) return -1;
-    if (typeof av === 'string') {
-      return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
-    }
-    return dir === 'asc' ? av - bv : bv - av;
+  // S34: Filter out test rows (test_will/debug, test/test, etc.)
+  rows = rows.filter(function(r) {
+    var src = (r.utm_source || '').toLowerCase();
+    var med = (r.utm_medium || '').toLowerCase();
+    var camp = (r.utm_campaign || '').toLowerCase();
+    if (src === 'test_will' || src === 'test') return false;
+    if (med === 'debug' || med === 'test') return false;
+    if (camp.indexOf('test') > -1 && camp.indexOf('install') > -1) return false;
+    return true;
   });
+
+  var key = window._channelPerfSortKey || '_default';
+  var dir = window._channelPerfSortDir || 'desc';
+
+  if (key === '_default') {
+    // S34: Default sort -- direct first, then grouped by source (alpha), then trial starts desc within group
+    rows.sort(function(a, b) {
+      var aIsDirect = a.utm_source === 'direct' ? 0 : 1;
+      var bIsDirect = b.utm_source === 'direct' ? 0 : 1;
+      if (aIsDirect !== bIsDirect) return aIsDirect - bIsDirect;
+      // Group by source alphabetically
+      var srcCmp = a.utm_source.localeCompare(b.utm_source);
+      if (srcCmp !== 0) return srcCmp;
+      // Within same source, sort by trial starts descending
+      return (b.signups || 0) - (a.signups || 0);
+    });
+  } else {
+    rows.sort(function(a, b){
+      var av = a[key];
+      var bv = b[key];
+      // Push nulls to the bottom regardless of direction.
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === 'string') {
+        return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      }
+      return dir === 'asc' ? av - bv : bv - av;
+    });
+  }
 
   var tbody = document.getElementById('channel-perf-tbody');
   if (!rows.length) {

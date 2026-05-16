@@ -6970,7 +6970,59 @@ async def debug_ymove_meta(request: Request):
     }
 
 
-@app.post("/api/admin/utm-links/backfill-content")
+@app.post("/api/admin/cleanup-test-data")
+async def cleanup_test_data(request: Request):
+    """S34: Remove test subscriptions and page views from the database.
+    Dry-run by default (pass {"apply": true} to commit)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+
+    async with db_pool.acquire() as conn:
+        # Count what would be deleted
+        test_subs = await conn.fetchval(
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE LOWER(COALESCE(utm_source, '')) IN ('test', 'test_will')
+                  OR LOWER(COALESCE(utm_medium, '')) IN ('debug', 'test')
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%test%install%'
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s23_test%'
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s32_install%'"""
+        )
+        test_pvs = await conn.fetchval(
+            """SELECT COUNT(*) FROM page_views
+               WHERE LOWER(COALESCE(utm_source, '')) IN ('test', 'test_will')
+                  OR LOWER(COALESCE(utm_medium, '')) IN ('debug', 'test')
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%test%install%'
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s23_test%'
+                  OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s32_install%'"""
+        )
+
+        if apply:
+            del_subs = await conn.execute(
+                """DELETE FROM subscriptions
+                   WHERE LOWER(COALESCE(utm_source, '')) IN ('test', 'test_will')
+                      OR LOWER(COALESCE(utm_medium, '')) IN ('debug', 'test')
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%test%install%'
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s23_test%'
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s32_install%'"""
+            )
+            del_pvs = await conn.execute(
+                """DELETE FROM page_views
+                   WHERE LOWER(COALESCE(utm_source, '')) IN ('test', 'test_will')
+                      OR LOWER(COALESCE(utm_medium, '')) IN ('debug', 'test')
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%test%install%'
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s23_test%'
+                      OR LOWER(COALESCE(utm_campaign, '')) LIKE '%s32_install%'"""
+            )
+
+    return {
+        "status": "applied" if apply else "dry_run",
+        "test_subscriptions": test_subs,
+        "test_page_views": test_pvs,
+    }
 async def backfill_utm_content(request: Request):
     """S34: Batch-update existing UTM links -- derive utm_content from label and regenerate full_url.
 
