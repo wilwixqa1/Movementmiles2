@@ -1626,7 +1626,8 @@ function renderUtmTrendChart() {
   // Filter to only the most recent N periods
   var allPeriods = {};
   allRows.forEach(function(r){ allPeriods[r.period] = true; });
-  var sortedPeriods = Object.keys(allPeriods).sort();
+  var today = new Date().toISOString().slice(0, 10);
+  var sortedPeriods = Object.keys(allPeriods).sort().filter(function(p){ return p <= today; });
   var visiblePeriods = sortedPeriods.slice(-periodCount);
   var visibleSet = {};
   visiblePeriods.forEach(function(p){ visibleSet[p] = true; });
