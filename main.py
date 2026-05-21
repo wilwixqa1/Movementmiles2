@@ -8709,14 +8709,15 @@ async def admin_compare_date(date_str: str, request: Request):
         # -- HISTORICAL: MRR by source as-of target date --
         hist_mrr_rows = await conn.fetch("""
             SELECT
-              COALESCE(source, 'stripe') as source,
+              source,
               COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
               COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
             FROM subscriptions
             WHERE created_at <= $1
               AND status != 'incomplete_expired'
-              AND (status IN ('active', 'trialing')
-                   OR (status = 'canceled' AND effective_canceled_at > $1))
+              AND (status = 'active'
+                   OR (status = 'canceled' AND effective_canceled_at > $1
+                       AND converted_at IS NOT NULL))
             GROUP BY source
         """, target_ts)
 
@@ -8761,11 +8762,11 @@ async def admin_compare_date(date_str: str, request: Request):
 
         today_mrr_rows = await conn.fetch("""
             SELECT
-              COALESCE(source, 'stripe') as source,
+              source,
               COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
               COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
             FROM subscriptions
-            WHERE status IN ('active', 'trialing')
+            WHERE status = 'active'
             GROUP BY source
         """)
 
