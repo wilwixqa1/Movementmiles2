@@ -664,17 +664,35 @@
 
     <div class="views-grid">
       <div class="card">
-        <div class="section-title">Subscribers by UTM Source</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <div class="section-title" style="margin-bottom:0">Subscribers by UTM Source</div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn active" id="utm-src-bar-btn" onclick="setUtmChartMode('source','bar')" style="padding:3px 10px;font-size:.68rem">Bar</button>
+            <button class="quick-btn" id="utm-src-pie-btn" onclick="setUtmChartMode('source','pie')" style="padding:3px 10px;font-size:.68rem">Pie</button>
+          </div>
+        </div>
         <div id="chart-leads-source" class="bar-chart"></div>
       </div>
       <div class="card">
-        <div class="section-title">Subscribers by UTM Medium</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <div class="section-title" style="margin-bottom:0">Subscribers by UTM Medium</div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn active" id="utm-med-bar-btn" onclick="setUtmChartMode('medium','bar')" style="padding:3px 10px;font-size:.68rem">Bar</button>
+            <button class="quick-btn" id="utm-med-pie-btn" onclick="setUtmChartMode('medium','pie')" style="padding:3px 10px;font-size:.68rem">Pie</button>
+          </div>
+        </div>
         <div id="chart-leads-medium" class="bar-chart"></div>
       </div>
     </div>
     <div class="views-grid">
       <div class="card">
-        <div class="section-title">Subscribers by UTM Campaign (Top 10)</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <div class="section-title" style="margin-bottom:0">Subscribers by UTM Campaign (Top 10)</div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn active" id="utm-camp-bar-btn" onclick="setUtmChartMode('campaign','bar')" style="padding:3px 10px;font-size:.68rem">Bar</button>
+            <button class="quick-btn" id="utm-camp-pie-btn" onclick="setUtmChartMode('campaign','pie')" style="padding:3px 10px;font-size:.68rem">Pie</button>
+          </div>
+        </div>
         <div id="chart-leads-campaign" class="bar-chart"></div>
       </div>
       <div class="card">
@@ -1403,16 +1421,23 @@ function loadStats() {
     // --- Attribution charts (S22: rewired from leads to subscription UTM data) ---
     var srcColors = ['navy','green','orange','mid','red'];
     var sutm = d.subscription_utm || {};
-    renderBarChart('chart-leads-source', (sutm.by_source || []).map(function(r, i) {
-      return {label: r.channel, value: r.count, color: srcColors[i % srcColors.length]};
-    }));
-    renderBarChart('chart-leads-medium', (sutm.by_medium || []).map(function(r, i) {
-      return {label: r.medium, value: r.count, color: srcColors[i % srcColors.length]};
-    }));
-    renderBarChart('chart-leads-campaign', (sutm.by_campaign || []).map(function(r, i) {
-      var lbl = r.campaign.length > 20 ? r.campaign.slice(0,18) + '...' : r.campaign;
-      return {label: lbl, value: r.count, color: srcColors[i % srcColors.length]};
-    }));
+    // S35: Store chart data for bar/pie toggle
+    window._utmChartData = {
+      source: (sutm.by_source || []).map(function(r, i) {
+        return {label: r.channel, value: r.count, color: srcColors[i % srcColors.length]};
+      }),
+      medium: (sutm.by_medium || []).map(function(r, i) {
+        return {label: r.medium, value: r.count, color: srcColors[i % srcColors.length]};
+      }),
+      campaign: (sutm.by_campaign || []).map(function(r, i) {
+        var lbl = r.campaign.length > 20 ? r.campaign.slice(0,18) + '...' : r.campaign;
+        return {label: lbl, value: r.count, color: srcColors[i % srcColors.length]};
+      })
+    };
+    window._utmChartModes = window._utmChartModes || {source:'bar', medium:'bar', campaign:'bar'};
+    renderUtmChart('source');
+    renderUtmChart('medium');
+    renderUtmChart('campaign');
     var attrBody = document.getElementById('attribution-tbody');
     var bySrc = sutm.by_source || [];
     var totalUtm = sutm.total_with_utm || 1;
@@ -2047,6 +2072,64 @@ function renderBarChart(containerId, data) {
     var display = d.displayValue || d.value;
     return '<div class="bar-col"><div class="bar-value">'+display+'</div><div class="bar '+colorClass+'" style="height:'+h+'px"></div><div class="bar-label">'+d.label+'</div></div>';
   }).join('');
+}
+
+// S35: Pie chart renderer for UTM charts
+function renderPieChart(containerId, data) {
+  var el = document.getElementById(containerId);
+  if (!data || data.length === 0) {
+    el.innerHTML = '<div class="empty-msg" style="width:100%">No data yet</div>';
+    return;
+  }
+  var total = data.reduce(function(s, d){ return s + d.value; }, 0) || 1;
+  var colorHex = {
+    navy: '#182241', green: '#2d6a2d', orange: '#b35a00',
+    mid: '#536c7c', red: '#c0392b'
+  };
+  var size = 180, cx = size/2, cy = size/2, r = 70;
+  var angle = -Math.PI / 2;
+  var paths = '';
+  var legend = '';
+  data.forEach(function(d) {
+    var pct = d.value / total;
+    var sweep = pct * Math.PI * 2;
+    var x1 = cx + r * Math.cos(angle);
+    var y1 = cy + r * Math.sin(angle);
+    var x2 = cx + r * Math.cos(angle + sweep);
+    var y2 = cy + r * Math.sin(angle + sweep);
+    var large = sweep > Math.PI ? 1 : 0;
+    var fill = colorHex[d.color] || colorHex.navy;
+    paths += '<path d="M'+cx+','+cy+' L'+x1+','+y1+' A'+r+','+r+' 0 '+large+' 1 '+x2+','+y2+' Z" fill="'+fill+'" stroke="#fff" stroke-width="1.5"><title>'+d.label+': '+d.value+' ('+(pct*100).toFixed(1)+'%)</title></path>';
+    legend += '<div style="display:flex;align-items:center;gap:4px;font-size:.72rem"><div style="width:10px;height:10px;border-radius:2px;background:'+fill+';flex-shrink:0"></div><span style="color:#182241">'+d.label+' <strong>'+d.value+'</strong> <span style="color:#536c7c">('+( pct*100).toFixed(1)+'%)</span></span></div>';
+    angle += sweep;
+  });
+  el.innerHTML = '<div style="display:flex;align-items:center;gap:16px;justify-content:center;flex-wrap:wrap">' +
+    '<svg viewBox="0 0 '+size+' '+size+'" width="'+size+'" height="'+size+'" style="flex-shrink:0">' + paths + '</svg>' +
+    '<div style="display:flex;flex-direction:column;gap:4px">' + legend + '</div></div>';
+}
+
+// S35: Toggle between bar and pie for UTM charts
+var utmChartIds = {source: 'chart-leads-source', medium: 'chart-leads-medium', campaign: 'chart-leads-campaign'};
+var utmBtnPrefixes = {source: 'utm-src', medium: 'utm-med', campaign: 'utm-camp'};
+
+function renderUtmChart(dim) {
+  var mode = (window._utmChartModes || {})[dim] || 'bar';
+  var data = (window._utmChartData || {})[dim] || [];
+  var id = utmChartIds[dim];
+  if (mode === 'pie') {
+    renderPieChart(id, data);
+  } else {
+    renderBarChart(id, data);
+  }
+}
+
+function setUtmChartMode(dim, mode) {
+  window._utmChartModes = window._utmChartModes || {};
+  window._utmChartModes[dim] = mode;
+  var prefix = utmBtnPrefixes[dim];
+  document.getElementById(prefix + '-bar-btn').className = 'quick-btn' + (mode === 'bar' ? ' active' : '');
+  document.getElementById(prefix + '-pie-btn').className = 'quick-btn' + (mode === 'pie' ? ' active' : '');
+  renderUtmChart(dim);
 }
 
 // --- Session 11: Attach Email to Apple/Google subscriber ---
