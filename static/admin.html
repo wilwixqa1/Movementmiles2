@@ -1244,7 +1244,7 @@ function renderComparison(data) {
     {label: 'Gross MRR', old: hist.gross_mrr_cents, now: curr.gross_mrr_cents, fmt: 'dollars'},
     {label: 'Net MRR', old: hist.net_mrr_cents, now: curr.net_mrr_cents, fmt: 'dollars'},
     {label: 'Active Subs', old: hist.active_subs, now: curr.active_subs, fmt: 'number'},
-    {label: 'Platform Fees', old: hist.total_fees_cents, now: curr.total_fees_cents, fmt: 'dollars'},
+    {label: 'Platform Fees', old: hist.total_fees_cents, now: curr.total_fees_cents, fmt: 'dollars', invertColor: true},
   ];
 
   // Add MRR by source
@@ -1258,40 +1258,51 @@ function renderComparison(data) {
     metrics.push({label: src.charAt(0).toUpperCase() + src.slice(1) + ' MRR', old: oldVal, now: newVal, fmt: 'dollars'});
   });
 
-  // Add snapshot-only metrics if available
-  if (hist.churn_rate_30d != null) {
-    metrics.push({label: 'Churn Rate (30d)', old: hist.churn_rate_30d, now: null, fmt: 'percent', noCompare: true});
-  }
-  if (hist.conversions_30d != null) {
-    metrics.push({label: 'Conversions (30d)', old: hist.conversions_30d, now: null, fmt: 'number', noCompare: true});
-  }
+  // Snapshot-only metrics (always show, N/A if not available)
+  metrics.push({label: 'Churn Rate (30d)', old: hist.churn_rate_30d, now: curr.churn_rate_30d, fmt: 'percent'});
+  metrics.push({label: 'Conversions (30d)', old: hist.conversions_30d, now: curr.conversions_30d, fmt: 'number'});
+  metrics.push({label: 'Page Views (7d)', old: hist.page_views_7d, now: curr.page_views_7d, fmt: 'number'});
 
   var html = '';
   metrics.forEach(function(m) {
     var oldDisplay, nowDisplay, deltaDisplay, deltaColor;
+    var oldIsNull = (m.old === null || m.old === undefined);
+    var nowIsNull = (m.now === null || m.now === undefined);
+
     if (m.fmt === 'dollars') {
-      oldDisplay = '$' + (m.old / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-      nowDisplay = '$' + (m.now / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-      var delta = m.now - m.old;
-      var pct = m.old > 0 ? ((delta / m.old) * 100).toFixed(1) : '---';
-      deltaDisplay = (delta >= 0 ? '+' : '') + '$' + (Math.abs(delta) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' (' + (delta >= 0 ? '+' : '') + pct + '%)';
-      deltaColor = delta >= 0 ? 'var(--green)' : 'var(--red)';
-      if (m.label === 'Platform Fees') deltaColor = delta <= 0 ? 'var(--green)' : 'var(--orange)';
+      oldDisplay = oldIsNull ? 'N/A' : '$' + (m.old / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      nowDisplay = nowIsNull ? 'N/A' : '$' + (m.now / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      if (!oldIsNull && !nowIsNull) {
+        var delta = m.now - m.old;
+        var pct = m.old > 0 ? ((delta / m.old) * 100).toFixed(1) : '---';
+        deltaDisplay = (delta >= 0 ? '+' : '-') + '$' + (Math.abs(delta) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' (' + (delta >= 0 ? '+' : '') + pct + '%)';
+        deltaColor = delta >= 0 ? 'var(--green)' : 'var(--red)';
+        if (m.invertColor) deltaColor = delta <= 0 ? 'var(--green)' : 'var(--orange)';
+      } else {
+        deltaDisplay = 'Available after snapshots begin';
+        deltaColor = 'var(--navy-mid)';
+      }
     } else if (m.fmt === 'percent') {
-      oldDisplay = m.old + '%';
-      nowDisplay = m.noCompare ? '---' : '';
-      deltaDisplay = m.noCompare ? 'snapshot only' : '';
-      deltaColor = 'var(--navy-mid)';
+      oldDisplay = oldIsNull ? 'N/A' : m.old + '%';
+      nowDisplay = nowIsNull ? 'N/A' : m.now + '%';
+      if (!oldIsNull && !nowIsNull) {
+        var pd = m.now - m.old;
+        deltaDisplay = (pd >= 0 ? '+' : '') + pd.toFixed(1) + ' pts';
+        deltaColor = pd <= 0 ? 'var(--green)' : 'var(--red)';
+      } else {
+        deltaDisplay = 'Available after snapshots begin';
+        deltaColor = 'var(--navy-mid)';
+      }
     } else {
-      oldDisplay = m.old.toLocaleString();
-      nowDisplay = m.noCompare ? '---' : m.now.toLocaleString();
-      if (!m.noCompare) {
+      oldDisplay = oldIsNull ? 'N/A' : m.old.toLocaleString();
+      nowDisplay = nowIsNull ? 'N/A' : m.now.toLocaleString();
+      if (!oldIsNull && !nowIsNull) {
         var nd = m.now - m.old;
         var np = m.old > 0 ? ((nd / m.old) * 100).toFixed(1) : '---';
         deltaDisplay = (nd >= 0 ? '+' : '') + nd.toLocaleString() + ' (' + (nd >= 0 ? '+' : '') + np + '%)';
         deltaColor = nd >= 0 ? 'var(--green)' : 'var(--red)';
       } else {
-        deltaDisplay = 'snapshot only';
+        deltaDisplay = 'Available after snapshots begin';
         deltaColor = 'var(--navy-mid)';
       }
     }
@@ -1300,9 +1311,9 @@ function renderComparison(data) {
       '<div style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--navy-mid);margin-bottom:6px">' + m.label + '</div>' +
       '<div style="display:flex;justify-content:space-between;align-items:baseline">' +
         '<div><span style="font-size:.72rem;color:var(--navy-mid)">' + hist.date + '</span><br><span style="font-size:1.1rem;font-weight:600;color:var(--navy)">' + oldDisplay + '</span></div>' +
-        (m.noCompare ? '' : '<div style="text-align:right"><span style="font-size:.72rem;color:var(--navy-mid)">Today</span><br><span style="font-size:1.1rem;font-weight:600;color:var(--navy)">' + nowDisplay + '</span></div>') +
+        '<div style="text-align:right"><span style="font-size:.72rem;color:var(--navy-mid)">Today</span><br><span style="font-size:1.1rem;font-weight:600;color:var(--navy)">' + nowDisplay + '</span>' +
+        '<div style="font-size:.78rem;font-weight:600;color:' + deltaColor + ';margin-top:2px">' + deltaDisplay + '</div></div>' +
       '</div>' +
-      '<div style="font-size:.78rem;font-weight:600;color:' + deltaColor + ';margin-top:4px">' + deltaDisplay + '</div>' +
     '</div>';
   });
 

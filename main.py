@@ -8751,32 +8751,26 @@ async def admin_compare_date(date_str: str, request: Request):
             GROUP BY source
         """, target_ts)
 
-        # -- TODAY: Live stats --
-        today_counts = await conn.fetchrow("""
-            SELECT
-              COUNT(*) FILTER (WHERE status IN ('active','trialing')) as active_total,
-              COUNT(*) FILTER (WHERE status = 'trialing') as trialing
-            FROM subscriptions
-            WHERE status != 'incomplete_expired'
-        """)
+        # -- TODAY: Use the same queries as the stats endpoint for exact match --
+        today_mrr_monthly = await conn.fetchval(
+            "SELECT COALESCE(SUM(plan_amount), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'month'"
+        )
+        today_mrr_annual = await conn.fetchval(
+            "SELECT COALESCE(SUM(plan_amount / 12), 0) FROM subscriptions WHERE status = 'active' AND plan_interval = 'year'"
+        )
+        today_total_mrr = (today_mrr_monthly or 0) + (today_mrr_annual or 0)
 
-        today_mrr_rows = await conn.fetch("""
-            SELECT
-              source,
-              COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
-              COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
-            FROM subscriptions
-            WHERE status = 'active'
-            GROUP BY source
-        """)
-
+        today_mrr_by_source_rows = await conn.fetch(
+            """SELECT source,
+                COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
+                COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
+               FROM subscriptions WHERE status = 'active'
+               GROUP BY source"""
+        )
         today_mrr_by_source = {}
-        today_total_mrr = 0
-        for r in today_mrr_rows:
+        for r in today_mrr_by_source_rows:
             src = r["source"] or "stripe"
-            mrr = (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)
-            today_mrr_by_source[src] = mrr
-            today_total_mrr += mrr
+            today_mrr_by_source[src] = (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)
 
         today_fees = {}
         today_total_fees = 0
@@ -8790,11 +8784,49 @@ async def admin_compare_date(date_str: str, request: Request):
             today_fees[src] = fee
             today_total_fees += fee
 
+        today_counts = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ('active','trialing')) as active_total,
+              COUNT(*) FILTER (WHERE status = 'trialing') as trialing
+            FROM subscriptions
+            WHERE status != 'incomplete_expired'
+        """)
+
         today_subs_by_source = await conn.fetch("""
             SELECT COALESCE(source, 'stripe') as source, COUNT(*) as count
             FROM subscriptions
             WHERE status IN ('active', 'trialing')
             GROUP BY source
+        """)
+
+        # Today's churn (same as stats endpoint)
+        today_churn_row = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'canceled'
+                AND effective_canceled_at IS NOT NULL
+                AND effective_canceled_at > NOW() - INTERVAL '30 days'
+                AND converted_at IS NOT NULL) as churned_paid,
+              COUNT(*) FILTER (WHERE status = 'canceled'
+                AND effective_canceled_at IS NOT NULL
+                AND effective_canceled_at > NOW() - INTERVAL '30 days'
+                AND converted_at IS NULL) as churned_trial
+            FROM subscriptions
+            WHERE status != 'incomplete_expired'
+        """)
+        today_churned = (today_churn_row["churned_paid"] or 0) + (today_churn_row["churned_trial"] or 0)
+        today_active_plus = (today_counts["active_total"] or 0) + today_churned
+        today_churn_rate = round(100 * today_churned / today_active_plus, 1) if today_active_plus > 0 else 0
+
+        today_conv_row = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '7 days') as conv_7d,
+              COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '30 days') as conv_30d
+            FROM subscriptions
+        """)
+
+        today_pv_row = await conn.fetchrow("""
+            SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') as pv_7d
+            FROM page_views
         """)
 
     historical = {
@@ -8827,6 +8859,10 @@ async def admin_compare_date(date_str: str, request: Request):
         "mrr_by_source": today_mrr_by_source,
         "subs_by_source": {r["source"] or "stripe": r["count"] for r in today_subs_by_source},
         "fees_by_source": today_fees,
+        "churn_rate_30d": today_churn_rate,
+        "conversions_7d": today_conv_row["conv_7d"] or 0,
+        "conversions_30d": today_conv_row["conv_30d"] or 0,
+        "page_views_7d": today_pv_row["pv_7d"] or 0,
     }
 
     return {"historical": historical, "current": current}
