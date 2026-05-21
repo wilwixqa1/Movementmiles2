@@ -8660,6 +8660,177 @@ async def admin_snapshot_now(request: Request):
     return {"status": "ok", "message": "Snapshot written for today"}
 
 
+@app.get("/api/admin/compare/{date_str}")
+async def admin_compare_date(date_str: str, request: Request):
+    """S35: Return reconstructed stats for a past date alongside today's live stats.
+    For dates with a snapshot, returns exact snapshot data. For older dates,
+    reconstructs MRR, subscriber counts, and fees from subscription timestamps.
+    Always returns today's live data for comparison."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    if target_date >= today:
+        raise HTTPException(status_code=400, detail="Comparison date must be in the past.")
+
+    # Check for an exact snapshot first
+    snapshot_data = None
+    async with db_pool.acquire() as conn:
+        snap_row = await conn.fetchrow(
+            "SELECT data FROM daily_stats_snapshots WHERE snapshot_date = $1", target_date
+        )
+        if snap_row:
+            snapshot_data = json.loads(snap_row["data"]) if isinstance(snap_row["data"], str) else snap_row["data"]
+
+    # Reconstruct from subscription data (works for any past date)
+    target_ts = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=ZoneInfo("UTC"))
+
+    async with db_pool.acquire() as conn:
+        # -- HISTORICAL: Subscribers active as-of target date --
+        hist_counts = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ('active','trialing')
+                OR (status = 'canceled' AND effective_canceled_at > $1)) as active_total,
+              COUNT(*) FILTER (WHERE (status IN ('active','trialing')
+                OR (status = 'canceled' AND effective_canceled_at > $1))
+                AND status = 'trialing' AND created_at <= $1) as trialing
+            FROM subscriptions
+            WHERE created_at <= $1
+              AND status != 'incomplete_expired'
+        """, target_ts)
+
+        # -- HISTORICAL: MRR by source as-of target date --
+        hist_mrr_rows = await conn.fetch("""
+            SELECT
+              COALESCE(source, 'stripe') as source,
+              COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
+              COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
+            FROM subscriptions
+            WHERE created_at <= $1
+              AND status != 'incomplete_expired'
+              AND (status IN ('active', 'trialing')
+                   OR (status = 'canceled' AND effective_canceled_at > $1))
+            GROUP BY source
+        """, target_ts)
+
+        hist_mrr_by_source = {}
+        hist_total_mrr = 0
+        for r in hist_mrr_rows:
+            src = r["source"] or "stripe"
+            mrr = (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)
+            hist_mrr_by_source[src] = mrr
+            hist_total_mrr += mrr
+
+        hist_fees = {}
+        hist_total_fees = 0
+        for src, mrr in hist_mrr_by_source.items():
+            if src == "apple":
+                fee = round(mrr * 0.15)
+            elif src == "google":
+                fee = round(mrr * 0.15)
+            else:
+                fee = round(mrr * 0.029)
+            hist_fees[src] = fee
+            hist_total_fees += fee
+
+        hist_subs_by_source = await conn.fetch("""
+            SELECT COALESCE(source, 'stripe') as source, COUNT(*) as count
+            FROM subscriptions
+            WHERE created_at <= $1
+              AND status != 'incomplete_expired'
+              AND (status IN ('active', 'trialing')
+                   OR (status = 'canceled' AND effective_canceled_at > $1))
+            GROUP BY source
+        """, target_ts)
+
+        # -- TODAY: Live stats --
+        today_counts = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ('active','trialing')) as active_total,
+              COUNT(*) FILTER (WHERE status = 'trialing') as trialing
+            FROM subscriptions
+            WHERE status != 'incomplete_expired'
+        """)
+
+        today_mrr_rows = await conn.fetch("""
+            SELECT
+              COALESCE(source, 'stripe') as source,
+              COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
+              COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            GROUP BY source
+        """)
+
+        today_mrr_by_source = {}
+        today_total_mrr = 0
+        for r in today_mrr_rows:
+            src = r["source"] or "stripe"
+            mrr = (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)
+            today_mrr_by_source[src] = mrr
+            today_total_mrr += mrr
+
+        today_fees = {}
+        today_total_fees = 0
+        for src, mrr in today_mrr_by_source.items():
+            if src == "apple":
+                fee = round(mrr * 0.15)
+            elif src == "google":
+                fee = round(mrr * 0.15)
+            else:
+                fee = round(mrr * 0.029)
+            today_fees[src] = fee
+            today_total_fees += fee
+
+        today_subs_by_source = await conn.fetch("""
+            SELECT COALESCE(source, 'stripe') as source, COUNT(*) as count
+            FROM subscriptions
+            WHERE status IN ('active', 'trialing')
+            GROUP BY source
+        """)
+
+    historical = {
+        "date": str(target_date),
+        "source": "snapshot" if snapshot_data else "reconstructed",
+        "gross_mrr_cents": snapshot_data["gross_mrr_cents"] if snapshot_data else hist_total_mrr,
+        "net_mrr_cents": (snapshot_data["net_mrr_cents"] if snapshot_data
+                          else hist_total_mrr - hist_total_fees),
+        "total_fees_cents": snapshot_data.get("total_fees_cents", hist_total_fees) if snapshot_data else hist_total_fees,
+        "active_subs": (snapshot_data["active_subs"] + snapshot_data.get("trialing_subs", 0)
+                        if snapshot_data else (hist_counts["active_total"] or 0)),
+        "mrr_by_source": snapshot_data.get("mrr_by_source", hist_mrr_by_source) if snapshot_data else hist_mrr_by_source,
+        "subs_by_source": (snapshot_data.get("subs_by_source")
+                           if snapshot_data
+                           else {r["source"] or "stripe": r["count"] for r in hist_subs_by_source}),
+        "fees_by_source": snapshot_data.get("fees_by_source", hist_fees) if snapshot_data else hist_fees,
+        # Only available from snapshots
+        "churn_rate_30d": snapshot_data.get("churn_rate_30d") if snapshot_data else None,
+        "conversions_7d": snapshot_data.get("conversions_7d") if snapshot_data else None,
+        "conversions_30d": snapshot_data.get("conversions_30d") if snapshot_data else None,
+        "page_views_7d": snapshot_data.get("page_views_7d") if snapshot_data else None,
+    }
+
+    current = {
+        "date": str(today),
+        "gross_mrr_cents": today_total_mrr,
+        "net_mrr_cents": today_total_mrr - today_total_fees,
+        "total_fees_cents": today_total_fees,
+        "active_subs": today_counts["active_total"] or 0,
+        "mrr_by_source": today_mrr_by_source,
+        "subs_by_source": {r["source"] or "stripe": r["count"] for r in today_subs_by_source},
+        "fees_by_source": today_fees,
+    }
+
+    return {"historical": historical, "current": current}
+
+
 @app.get("/api/health")
 async def health():
     db_status = "connected" if db_pool else "not connected"

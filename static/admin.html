@@ -212,16 +212,23 @@
 
     <!-- Date Range Filter -->
     <div class="date-bar">
-      <label>Date Range:</label>
-      <input type="date" id="date-from" />
-      <span style="color:var(--navy-mid);font-size:.84rem">to</span>
-      <input type="date" id="date-to" />
-      <button onclick="applyDateFilter()">Apply</button>
-      <button class="quick-btn" id="qb-7" onclick="setQuickRange(7)">7d</button>
-      <button class="quick-btn" id="qb-30" onclick="setQuickRange(30)">30d</button>
-      <button class="quick-btn" id="qb-90" onclick="setQuickRange(90)">90d</button>
-      <button class="quick-btn active" id="qb-all" onclick="clearDateFilter()">All Time</button>
-      <span class="date-range-label" id="range-label">Showing: All Time</span>
+      <label>Compare to:</label>
+      <input type="date" id="date-compare" />
+      <button onclick="applyComparison()">Compare</button>
+      <button class="quick-btn" id="qb-7" onclick="setQuickCompare(7)">7d ago</button>
+      <button class="quick-btn" id="qb-30" onclick="setQuickCompare(30)">30d ago</button>
+      <button class="quick-btn" id="qb-90" onclick="setQuickCompare(90)">90d ago</button>
+      <button class="quick-btn active" id="qb-clear" onclick="clearComparison()">Today Only</button>
+      <span class="date-range-label" id="range-label"></span>
+    </div>
+
+    <!-- S35: Comparison banner -->
+    <div id="comparison-banner" style="display:none;margin:0 40px 16px;padding:16px 24px;background:var(--white);border:2px solid var(--navy);border-radius:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="section-title" style="margin-bottom:0" id="comparison-title">Comparing to ...</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)" id="comparison-source"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px" id="comparison-cards"></div>
     </div>
 
     <!-- Sync Status Indicator -->
@@ -1187,39 +1194,131 @@ function highlightBtn(activeId, labelText) {
     if (el) el.classList.add('active');
   }
   var lbl = document.getElementById('range-label');
-  if (lbl) lbl.textContent = 'Showing: ' + (labelText || 'All Time');
+  if (lbl && labelText) lbl.textContent = labelText;
+}
+
+function applyComparison() {
+  var dateStr = document.getElementById('date-compare').value;
+  if (!dateStr) return;
+  highlightBtn(null, '');
+  document.getElementById('range-label').textContent = 'Loading comparison...';
+  fetch('/api/admin/compare/' + dateStr, {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r){ return r.json(); })
+  .then(function(d){
+    renderComparison(d);
+  })
+  .catch(function(e){
+    document.getElementById('range-label').textContent = 'Comparison failed';
+    console.error('Compare error:', e);
+  });
+}
+
+function setQuickCompare(days) {
+  var d = new Date();
+  d.setDate(d.getDate() - days);
+  document.getElementById('date-compare').value = d.toISOString().slice(0, 10);
+  highlightBtn('qb-' + days, '');
+  applyComparison();
+}
+
+function clearComparison() {
+  document.getElementById('date-compare').value = '';
+  document.getElementById('comparison-banner').style.display = 'none';
+  document.getElementById('range-label').textContent = '';
+  highlightBtn('qb-clear', '');
+}
+
+function renderComparison(data) {
+  var hist = data.historical;
+  var curr = data.current;
+  var banner = document.getElementById('comparison-banner');
+  banner.style.display = 'block';
+  document.getElementById('comparison-title').textContent = 'Comparing ' + hist.date + ' vs Today (' + curr.date + ')';
+  document.getElementById('comparison-source').textContent = hist.source === 'snapshot'
+    ? 'Source: exact snapshot'
+    : 'Source: reconstructed from subscription data (MRR, subs, fees are accurate)';
+  document.getElementById('range-label').textContent = 'Comparing to ' + hist.date;
+
+  var metrics = [
+    {label: 'Gross MRR', old: hist.gross_mrr_cents, now: curr.gross_mrr_cents, fmt: 'dollars'},
+    {label: 'Net MRR', old: hist.net_mrr_cents, now: curr.net_mrr_cents, fmt: 'dollars'},
+    {label: 'Active Subs', old: hist.active_subs, now: curr.active_subs, fmt: 'number'},
+    {label: 'Platform Fees', old: hist.total_fees_cents, now: curr.total_fees_cents, fmt: 'dollars'},
+  ];
+
+  // Add MRR by source
+  var allSources = {};
+  if (hist.mrr_by_source) Object.keys(hist.mrr_by_source).forEach(function(s){ allSources[s] = true; });
+  if (curr.mrr_by_source) Object.keys(curr.mrr_by_source).forEach(function(s){ allSources[s] = true; });
+  Object.keys(allSources).sort().forEach(function(src) {
+    if (src === 'undetermined') return;
+    var oldVal = (hist.mrr_by_source || {})[src] || 0;
+    var newVal = (curr.mrr_by_source || {})[src] || 0;
+    metrics.push({label: src.charAt(0).toUpperCase() + src.slice(1) + ' MRR', old: oldVal, now: newVal, fmt: 'dollars'});
+  });
+
+  // Add snapshot-only metrics if available
+  if (hist.churn_rate_30d != null) {
+    metrics.push({label: 'Churn Rate (30d)', old: hist.churn_rate_30d, now: null, fmt: 'percent', noCompare: true});
+  }
+  if (hist.conversions_30d != null) {
+    metrics.push({label: 'Conversions (30d)', old: hist.conversions_30d, now: null, fmt: 'number', noCompare: true});
+  }
+
+  var html = '';
+  metrics.forEach(function(m) {
+    var oldDisplay, nowDisplay, deltaDisplay, deltaColor;
+    if (m.fmt === 'dollars') {
+      oldDisplay = '$' + (m.old / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      nowDisplay = '$' + (m.now / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      var delta = m.now - m.old;
+      var pct = m.old > 0 ? ((delta / m.old) * 100).toFixed(1) : '---';
+      deltaDisplay = (delta >= 0 ? '+' : '') + '$' + (Math.abs(delta) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' (' + (delta >= 0 ? '+' : '') + pct + '%)';
+      deltaColor = delta >= 0 ? 'var(--green)' : 'var(--red)';
+      if (m.label === 'Platform Fees') deltaColor = delta <= 0 ? 'var(--green)' : 'var(--orange)';
+    } else if (m.fmt === 'percent') {
+      oldDisplay = m.old + '%';
+      nowDisplay = m.noCompare ? '---' : '';
+      deltaDisplay = m.noCompare ? 'snapshot only' : '';
+      deltaColor = 'var(--navy-mid)';
+    } else {
+      oldDisplay = m.old.toLocaleString();
+      nowDisplay = m.noCompare ? '---' : m.now.toLocaleString();
+      if (!m.noCompare) {
+        var nd = m.now - m.old;
+        var np = m.old > 0 ? ((nd / m.old) * 100).toFixed(1) : '---';
+        deltaDisplay = (nd >= 0 ? '+' : '') + nd.toLocaleString() + ' (' + (nd >= 0 ? '+' : '') + np + '%)';
+        deltaColor = nd >= 0 ? 'var(--green)' : 'var(--red)';
+      } else {
+        deltaDisplay = 'snapshot only';
+        deltaColor = 'var(--navy-mid)';
+      }
+    }
+
+    html += '<div style="background:var(--bg);border-radius:8px;padding:12px">' +
+      '<div style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--navy-mid);margin-bottom:6px">' + m.label + '</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline">' +
+        '<div><span style="font-size:.72rem;color:var(--navy-mid)">' + hist.date + '</span><br><span style="font-size:1.1rem;font-weight:600;color:var(--navy)">' + oldDisplay + '</span></div>' +
+        (m.noCompare ? '' : '<div style="text-align:right"><span style="font-size:.72rem;color:var(--navy-mid)">Today</span><br><span style="font-size:1.1rem;font-weight:600;color:var(--navy)">' + nowDisplay + '</span></div>') +
+      '</div>' +
+      '<div style="font-size:.78rem;font-weight:600;color:' + deltaColor + ';margin-top:4px">' + deltaDisplay + '</div>' +
+    '</div>';
+  });
+
+  document.getElementById('comparison-cards').innerHTML = html;
 }
 
 function applyDateFilter() {
-  activeFrom = document.getElementById('date-from').value;
-  activeTo = document.getElementById('date-to').value;
-  var label = 'Custom';
-  if (activeFrom && activeTo) label = activeFrom + ' to ' + activeTo;
-  else if (activeFrom) label = 'From ' + activeFrom;
-  else if (activeTo) label = 'Until ' + activeTo;
-  highlightBtn(null, label);
-  loadStats();
+  applyComparison();
 }
 
 function setQuickRange(days) {
-  var to = new Date();
-  var from = new Date();
-  from.setDate(from.getDate() - days);
-  document.getElementById('date-from').value = from.toISOString().slice(0, 10);
-  document.getElementById('date-to').value = to.toISOString().slice(0, 10);
-  activeFrom = document.getElementById('date-from').value;
-  activeTo = document.getElementById('date-to').value;
-  highlightBtn('qb-' + days, 'Last ' + days + ' days');
-  loadStats();
+  setQuickCompare(days);
 }
 
 function clearDateFilter() {
-  document.getElementById('date-from').value = '';
-  document.getElementById('date-to').value = '';
-  activeFrom = '';
-  activeTo = '';
-  highlightBtn('qb-all', 'All Time');
-  loadStats();
+  clearComparison();
 }
 
 // --- Dollar formatter ---
@@ -1230,8 +1329,6 @@ function fmtDollars(cents) {
 function loadStats() {
   var statsUrl = '/api/admin/stats';
   var qp = [];
-  if (activeFrom) qp.push('from=' + activeFrom);
-  if (activeTo) qp.push('to=' + activeTo);
   var cpDays = window._channelPerfDays || 90;
   qp.push('cp_days=' + cpDays);
   if (qp.length) statsUrl += '?' + qp.join('&');
