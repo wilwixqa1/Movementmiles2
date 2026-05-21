@@ -7165,6 +7165,80 @@ async def debug_sub_timeline(request: Request):
     }
 
 
+@app.post("/api/admin/s35-cleanup-known-bad")
+async def s35_cleanup_known_bad(request: Request):
+    """S35: Cancel 9 specific records identified as test accounts or orphaned
+    Apple/Google subs not found in ymove. Dry-run by default.
+
+    - 2 ymove.app test accounts (Ahmed's tests)
+    - 1 Markus test record (s25_test_cancel batch)
+    - 6 Apple/Google subs active in our DB but not found in ymove
+
+    These were identified via ymove diff on 2026-05-20. All are safe to cancel.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+
+    # The 9 specific record IDs from the ymove diff
+    target_emails = [
+        # 2 test accounts
+        "sdfsdfsf@ymove.app",
+        "sfdsfsfdskjsfakjsafsfa@ymove.app",
+        # 1 markus test
+        "markus.zwigart@gmx.dr",
+        # 6 Apple/Google orphans (not found in ymove)
+        "gregistfather@gmail.com",
+        "katie.l.mackenzie@gmail.com",
+        "laural5920@yahoo.com",
+        "nicky.young30@gmail.com",
+        "marie.humbert@ymail.com",
+        "paulina.swieton825@gmail.com",
+    ]
+
+    async with db_pool.acquire() as conn:
+        # Preview what we'd cancel
+        rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id, plan_amount, created_at
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+               ORDER BY email""",
+            [e.lower() for e in target_emails]
+        )
+
+        preview = [
+            {
+                "id": r["id"], "email": r["email"], "source": r["source"],
+                "status": r["status"], "sub_id": r["stripe_subscription_id"],
+                "plan_amount": r["plan_amount"],
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ]
+
+        if apply and rows:
+            ids = [r["id"] for r in rows]
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET status = 'canceled',
+                       effective_canceled_at = NOW(),
+                       updated_at = NOW(),
+                       import_batch = COALESCE(import_batch, '') || ' s35_cleanup_known_bad_20260520'
+                   WHERE id = ANY($1::int[])""",
+                ids
+            )
+
+    return {
+        "status": "applied" if apply else "dry_run",
+        "records_found": len(preview),
+        "records": preview,
+    }
+
+
 @app.post("/api/admin/cleanup-test-data")
 async def cleanup_test_data(request: Request):
     """S34: Remove test subscriptions and page views from the database.
