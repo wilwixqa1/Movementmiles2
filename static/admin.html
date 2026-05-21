@@ -1618,6 +1618,22 @@ function setUtmTrendRange(range) {
   ['7d','14d','4w','8w','12w','24w','52w','12m','24m'].forEach(function(r){
     document.getElementById('utm-trend-btn-' + r).className = 'quick-btn' + (r === range ? ' active' : '');
   });
+  // S35: Lazy-load daily data for day ranges
+  if (range.endsWith('d') && !window._utmTrendDaily) {
+    var container = document.getElementById('chart-utm-trend');
+    container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">Loading daily data...</div>';
+    fetch('/api/admin/trend-daily', {headers: {'X-Admin-Password': adminPw}})
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        window._utmTrendDaily = data;
+        renderUtmTrendChart();
+      })
+      .catch(function(e){
+        container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">Failed to load daily data.</div>';
+        console.error('Daily trend fetch error:', e);
+      });
+    return;
+  }
   renderUtmTrendChart();
 }
 function setUtmTrendMeasure(m) {
@@ -1632,15 +1648,25 @@ function renderUtmTrendChart() {
   var range = window._utmTrendRange || '12w';
   var measure = window._utmTrendMeasure || 'signups';
   // Determine granularity and period count from range
-  // 'd' ranges map to weeks: 7d=1 week, 14d=2 weeks
-  var gran = range.endsWith('m') ? 'month' : 'week';
-  var periodCount;
+  var gran, periodCount;
   if (range.endsWith('d')) {
-    periodCount = Math.ceil(parseInt(range) / 7);
+    gran = 'day';
+    periodCount = parseInt(range);
+  } else if (range.endsWith('m')) {
+    gran = 'month';
+    periodCount = parseInt(range);
   } else {
+    gran = 'week';
     periodCount = parseInt(range);
   }
-  var bucket = gran === 'month' ? (window._utmTrendMonthly || {}) : (window._utmTrendWeekly || {});
+  var bucket;
+  if (gran === 'day') {
+    bucket = window._utmTrendDaily || {};
+  } else if (gran === 'month') {
+    bucket = window._utmTrendMonthly || {};
+  } else {
+    bucket = window._utmTrendWeekly || {};
+  }
   var allRows = bucket[dim] || [];
 
   // Filter to only the most recent N periods

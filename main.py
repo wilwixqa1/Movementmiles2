@@ -8329,6 +8329,49 @@ async def admin_channel_perf_csv(request: Request):
     )
 
 
+# S35: Lazy-loaded daily trend data. Only fetched when user selects 7d/14d range.
+# Covers last 30 days of daily buckets for all 6 dimensions.
+@app.get("/api/admin/trend-daily")
+async def admin_trend_daily(request: Request):
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    dimensions = [
+        ("source", "COALESCE(NULLIF(s.utm_source, ''), 'direct')"),
+        ("medium", "COALESCE(NULLIF(s.utm_medium, ''), 'none')"),
+        ("campaign", "COALESCE(NULLIF(s.utm_campaign, ''), 'none')"),
+        ("content", "COALESCE(NULLIF(s.utm_content, ''), 'none')"),
+        ("term", "COALESCE(NULLIF(s.utm_term, ''), 'none')"),
+        ("landing_page", "COALESCE(NULLIF(s.landing_page, ''), 'none')"),
+    ]
+
+    result = {}
+    async with db_pool.acquire() as conn:
+        for dim_name, dim_expr in dimensions:
+            rows = await conn.fetch(
+                f"""SELECT
+                    to_char(date_trunc('day', s.created_at), 'YYYY-MM-DD') as period,
+                    {dim_expr} as dimension,
+                    COUNT(*) as signups,
+                    COUNT(*) FILTER (WHERE s.converted_at IS NOT NULL) as paid_conversions
+                   FROM subscriptions s
+                   WHERE s.created_at >= date_trunc('day', NOW() - INTERVAL '30 days')
+                     AND s.created_at <= NOW()
+                     AND s.status != 'incomplete_expired'
+                   GROUP BY period, dimension
+                   ORDER BY period, signups DESC"""
+            )
+            result[dim_name] = [
+                {"period": r["period"], "dimension": r["dimension"],
+                 "signups": r["signups"], "paid_conversions": r["paid_conversions"]}
+                for r in rows
+            ]
+
+    return result
+
+
 @app.get("/api/health")
 async def health():
     db_status = "connected" if db_pool else "not connected"
