@@ -636,6 +636,10 @@
           </div>
           <div style="display:flex;gap:4px">
             <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Range:</span>
+            <button class="quick-btn" id="utm-trend-btn-7d" onclick="setUtmTrendRange('7d')" style="padding:4px 12px;font-size:.72rem">7 Days</button>
+            <button class="quick-btn" id="utm-trend-btn-14d" onclick="setUtmTrendRange('14d')" style="padding:4px 12px;font-size:.72rem">14 Days</button>
+            <button class="quick-btn" id="utm-trend-btn-4w" onclick="setUtmTrendRange('4w')" style="padding:4px 12px;font-size:.72rem">4 Weeks</button>
+            <button class="quick-btn" id="utm-trend-btn-8w" onclick="setUtmTrendRange('8w')" style="padding:4px 12px;font-size:.72rem">8 Weeks</button>
             <button class="quick-btn active" id="utm-trend-btn-12w" onclick="setUtmTrendRange('12w')" style="padding:4px 12px;font-size:.72rem">12 Weeks</button>
             <button class="quick-btn" id="utm-trend-btn-24w" onclick="setUtmTrendRange('24w')" style="padding:4px 12px;font-size:.72rem">24 Weeks</button>
             <button class="quick-btn" id="utm-trend-btn-52w" onclick="setUtmTrendRange('52w')" style="padding:4px 12px;font-size:.72rem">52 Weeks</button>
@@ -1611,7 +1615,7 @@ function setUtmTrendDim(dim) {
 }
 function setUtmTrendRange(range) {
   window._utmTrendRange = range;
-  ['12w','24w','52w','12m','24m'].forEach(function(r){
+  ['7d','14d','4w','8w','12w','24w','52w','12m','24m'].forEach(function(r){
     document.getElementById('utm-trend-btn-' + r).className = 'quick-btn' + (r === range ? ' active' : '');
   });
   renderUtmTrendChart();
@@ -1628,8 +1632,14 @@ function renderUtmTrendChart() {
   var range = window._utmTrendRange || '12w';
   var measure = window._utmTrendMeasure || 'signups';
   // Determine granularity and period count from range
+  // 'd' ranges map to weeks: 7d=1 week, 14d=2 weeks
   var gran = range.endsWith('m') ? 'month' : 'week';
-  var periodCount = parseInt(range);
+  var periodCount;
+  if (range.endsWith('d')) {
+    periodCount = Math.ceil(parseInt(range) / 7);
+  } else {
+    periodCount = parseInt(range);
+  }
   var bucket = gran === 'month' ? (window._utmTrendMonthly || {}) : (window._utmTrendWeekly || {});
   var allRows = bucket[dim] || [];
 
@@ -1646,7 +1656,8 @@ function renderUtmTrendChart() {
   // Update title
   var dimLabels = {source: 'Source', medium: 'Medium', campaign: 'Campaign', content: 'Ad-Level', term: 'Term', landing_page: 'Landing Page'};
   var dimLabel = dimLabels[dim] || dim;
-  var rangeLabel = range === '12w' ? '12 Weeks' : range === '24w' ? '24 Weeks' : range === '52w' ? '52 Weeks' : range === '12m' ? '12 Months' : '24 Months';
+  var rangeLabels = {'7d':'7 Days','14d':'14 Days','4w':'4 Weeks','8w':'8 Weeks','12w':'12 Weeks','24w':'24 Weeks','52w':'52 Weeks','12m':'12 Months','24m':'24 Months'};
+  var rangeLabel = rangeLabels[range] || range;
   document.getElementById('utm-trend-title').textContent = 'Subscriber Trend by ' + dimLabel + ' (' + rangeLabel + ')';
 
   var container = document.getElementById('chart-utm-trend');
