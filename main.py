@@ -7447,8 +7447,22 @@ async def admin_stats(request: Request):
         if cp_days not in (30, 90, 365):
             cp_days = 90
         cp_interval = f"{cp_days} days"
+        # S35: Channel performance with historical view fallback.
+        # Page views before ~May 16 2026 lack utm_content/utm_term, so exact
+        # 5-dimension JOIN misses them. We compute both exact-match views AND
+        # campaign-level (3-dim) views, then distribute the unmatched remainder
+        # proportionally by trial starts. The fallback views are returned
+        # separately so the frontend can display them with an asterisk.
+        # TODO(S35): REMOVE THIS FALLBACK AFTER AUG 15 2026 (90 days from
+        # May 16 deployment). All page views after that date have full UTM
+        # params. After removal, revert to the simple 5-dim JOIN from S34.
+        # TODO(S35): CHECK BY JUNE 15 2026 that new UTM tracker is producing
+        # page_views with utm_content and utm_term populated. Run:
+        #   SELECT utm_content, utm_term, COUNT(*) FROM page_views
+        #   WHERE created_at > '2026-05-16' AND utm_source='meta'
+        #   GROUP BY 1,2 ORDER BY 3 DESC;
         channel_perf_rows = await conn.fetch(
-            f"""WITH pv AS (
+            f"""WITH pv_exact AS (
                  SELECT
                    COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
@@ -7459,6 +7473,24 @@ async def admin_stats(request: Request):
                  FROM page_views
                  WHERE created_at > NOW() - INTERVAL '{cp_interval}'
                  GROUP BY 1, 2, 3, 4, 5
+               ),
+               pv_broad AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COUNT(*) as views_total
+                 FROM page_views
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
+                 GROUP BY 1, 2, 3
+               ),
+               pv_exact_agg AS (
+                 SELECT
+                   utm_source, utm_medium, utm_campaign,
+                   SUM(views) as views_matched
+                 FROM pv_exact
+                 WHERE utm_content != 'none' OR utm_term != 'none'
+                 GROUP BY 1, 2, 3
                ),
                sub AS (
                  SELECT
@@ -7481,28 +7513,55 @@ async def admin_stats(request: Request):
                    AND status != 'incomplete_expired'
                    AND trial_start IS NOT NULL
                  GROUP BY 1, 2, 3, 4, 5, 6
+               ),
+               sub_campaign_totals AS (
+                 SELECT utm_source, utm_medium, utm_campaign,
+                        SUM(signups) as campaign_signups
+                 FROM sub
+                 GROUP BY 1, 2, 3
                )
                SELECT
-                 COALESCE(pv.utm_source, sub.utm_source) as utm_source,
-                 COALESCE(pv.utm_medium, sub.utm_medium) as utm_medium,
-                 COALESCE(pv.utm_campaign, sub.utm_campaign) as utm_campaign,
-                 COALESCE(pv.utm_content, sub.utm_content) as utm_content,
-                 COALESCE(pv.utm_term, sub.utm_term) as utm_term,
+                 COALESCE(pv_exact.utm_source, sub.utm_source) as utm_source,
+                 COALESCE(pv_exact.utm_medium, sub.utm_medium) as utm_medium,
+                 COALESCE(pv_exact.utm_campaign, sub.utm_campaign) as utm_campaign,
+                 COALESCE(pv_exact.utm_content, sub.utm_content) as utm_content,
+                 COALESCE(pv_exact.utm_term, sub.utm_term) as utm_term,
                  COALESCE(sub.landing_page, 'none') as landing_page,
-                 COALESCE(pv.views, 0) as views,
+                 COALESCE(pv_exact.views, 0) as views,
                  COALESCE(sub.signups, 0) as signups,
                  COALESCE(sub.still_trialing, 0) as still_trialing,
                  COALESCE(sub.trial_canceled, 0) as trial_canceled,
                  COALESCE(sub.paid_conversions, 0) as paid_conversions,
                  sub.avg_trial_days,
-                 sub.avg_paid_lifetime_days
-               FROM pv
+                 sub.avg_paid_lifetime_days,
+                 CASE
+                   WHEN sub.utm_content = 'none' AND sub.utm_term = 'none' THEN 0
+                   WHEN COALESCE(sct.campaign_signups, 0) = 0 THEN 0
+                   ELSE ROUND(
+                     GREATEST(COALESCE(pvb.views_total, 0) - COALESCE(pea.views_matched, 0), 0)
+                     * COALESCE(sub.signups, 0)::numeric
+                     / sct.campaign_signups
+                   )
+                 END as views_fallback
+               FROM pv_exact
                FULL OUTER JOIN sub
-                 ON pv.utm_source = sub.utm_source
-                 AND pv.utm_medium = sub.utm_medium
-                 AND pv.utm_campaign = sub.utm_campaign
-                 AND pv.utm_content = sub.utm_content
-                 AND pv.utm_term = sub.utm_term
+                 ON pv_exact.utm_source = sub.utm_source
+                 AND pv_exact.utm_medium = sub.utm_medium
+                 AND pv_exact.utm_campaign = sub.utm_campaign
+                 AND pv_exact.utm_content = sub.utm_content
+                 AND pv_exact.utm_term = sub.utm_term
+               LEFT JOIN pv_broad pvb
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = pvb.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = pvb.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = pvb.utm_campaign
+               LEFT JOIN pv_exact_agg pea
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = pea.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = pea.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = pea.utm_campaign
+               LEFT JOIN sub_campaign_totals sct
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = sct.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = sct.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = sct.utm_campaign
                ORDER BY signups DESC, views DESC"""
         )
 
@@ -8029,6 +8088,7 @@ async def admin_stats(request: Request):
                         "utm_term": r["utm_term"],
                         "landing_page": r["landing_page"],
                         "views": r["views"],
+                        "views_fallback": int(r["views_fallback"]),
                         "signups": r["signups"],
                         "still_trialing": r["still_trialing"],
                         "trial_canceled": r["trial_canceled"],
@@ -8134,7 +8194,7 @@ async def admin_leads_csv(request: Request):
 
 @app.get("/api/admin/channel-perf-csv")
 async def admin_channel_perf_csv(request: Request):
-    """S34: Export Channel Performance table as CSV."""
+    """S34: Export Channel Performance table as CSV. S35: added views with fallback."""
     pw = request.headers.get("X-Admin-Password", "")
     require_viewer(pw)
     if not db_pool:
@@ -8147,7 +8207,36 @@ async def admin_channel_perf_csv(request: Request):
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            f"""WITH sub AS (
+            f"""WITH pv_exact AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
+                   COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
+                   COUNT(*) as views
+                 FROM page_views
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
+                 GROUP BY 1, 2, 3, 4, 5
+               ),
+               pv_broad AS (
+                 SELECT
+                   COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
+                   COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') as utm_campaign,
+                   COUNT(*) as views_total
+                 FROM page_views
+                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
+                 GROUP BY 1, 2, 3
+               ),
+               pv_exact_agg AS (
+                 SELECT utm_source, utm_medium, utm_campaign,
+                        SUM(views) as views_matched
+                 FROM pv_exact
+                 WHERE utm_content != 'none' OR utm_term != 'none'
+                 GROUP BY 1, 2, 3
+               ),
+               sub AS (
                  SELECT
                    COALESCE(NULLIF(utm_source, ''), 'direct') as utm_source,
                    COALESCE(NULLIF(utm_medium, ''), 'none') as utm_medium,
@@ -8164,23 +8253,68 @@ async def admin_channel_perf_csv(request: Request):
                    AND status != 'incomplete_expired'
                    AND trial_start IS NOT NULL
                  GROUP BY 1, 2, 3, 4, 5, 6
+               ),
+               sub_campaign_totals AS (
+                 SELECT utm_source, utm_medium, utm_campaign,
+                        SUM(trial_starts) as campaign_signups
+                 FROM sub
+                 GROUP BY 1, 2, 3
                )
-               SELECT *, 
-                 CASE WHEN (paid_conversions + trial_canceled) > 0
-                   THEN ROUND(paid_conversions::numeric / (paid_conversions + trial_canceled) * 100, 1)
+               SELECT
+                 COALESCE(pv_exact.utm_source, sub.utm_source) as utm_source,
+                 COALESCE(pv_exact.utm_medium, sub.utm_medium) as utm_medium,
+                 COALESCE(pv_exact.utm_campaign, sub.utm_campaign) as utm_campaign,
+                 COALESCE(pv_exact.utm_content, sub.utm_content) as utm_content,
+                 COALESCE(pv_exact.utm_term, sub.utm_term) as utm_term,
+                 COALESCE(sub.landing_page, 'none') as landing_page,
+                 COALESCE(pv_exact.views, 0) as views_exact,
+                 CASE
+                   WHEN sub.utm_content = 'none' AND sub.utm_term = 'none' THEN 0
+                   WHEN COALESCE(sct.campaign_signups, 0) = 0 THEN 0
+                   ELSE ROUND(
+                     GREATEST(COALESCE(pvb.views_total, 0) - COALESCE(pea.views_matched, 0), 0)
+                     * COALESCE(sub.trial_starts, 0)::numeric / sct.campaign_signups
+                   )
+                 END as views_fallback,
+                 COALESCE(sub.trial_starts, 0) as trial_starts,
+                 COALESCE(sub.still_trialing, 0) as still_trialing,
+                 COALESCE(sub.trial_canceled, 0) as trial_canceled,
+                 COALESCE(sub.paid_conversions, 0) as paid_conversions,
+                 CASE WHEN (COALESCE(sub.paid_conversions,0) + COALESCE(sub.trial_canceled,0)) > 0
+                   THEN ROUND(COALESCE(sub.paid_conversions,0)::numeric / (COALESCE(sub.paid_conversions,0) + COALESCE(sub.trial_canceled,0)) * 100, 1)
                    ELSE NULL END as conv_rate
-               FROM sub
+               FROM pv_exact
+               FULL OUTER JOIN sub
+                 ON pv_exact.utm_source = sub.utm_source
+                 AND pv_exact.utm_medium = sub.utm_medium
+                 AND pv_exact.utm_campaign = sub.utm_campaign
+                 AND pv_exact.utm_content = sub.utm_content
+                 AND pv_exact.utm_term = sub.utm_term
+               LEFT JOIN pv_broad pvb
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = pvb.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = pvb.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = pvb.utm_campaign
+               LEFT JOIN pv_exact_agg pea
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = pea.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = pea.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = pea.utm_campaign
+               LEFT JOIN sub_campaign_totals sct
+                 ON COALESCE(sub.utm_source, pv_exact.utm_source) = sct.utm_source
+                 AND COALESCE(sub.utm_medium, pv_exact.utm_medium) = sct.utm_medium
+                 AND COALESCE(sub.utm_campaign, pv_exact.utm_campaign) = sct.utm_campaign
                ORDER BY trial_starts DESC"""
         )
 
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Source", "Medium", "Campaign", "Ad-Level", "Term", "Landing Page",
-                     "Trial Starts", "Still Trialing", "Trial Canceled", "Paid Conversions", "Conv Rate %"])
+                     "Views (exact)", "Views (est*)", "Trial Starts", "Still Trialing",
+                     "Trial Canceled", "Paid Conversions", "Conv Rate %"])
     for r in rows:
         writer.writerow([
             r["utm_source"], r["utm_medium"], r["utm_campaign"],
             r["utm_content"], r["utm_term"], r["landing_page"],
+            r["views_exact"], int(r["views_fallback"]),
             r["trial_starts"], r["still_trialing"], r["trial_canceled"],
             r["paid_conversions"],
             f"{r['conv_rate']}%" if r["conv_rate"] is not None else ""

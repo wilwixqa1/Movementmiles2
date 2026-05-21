@@ -599,7 +599,7 @@
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_content')">Ad-Level</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('utm_term')">Term</th>
               <th style="cursor:pointer" onclick="sortChannelPerf('landing_page')">Landing Page</th>
-              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views')">Views</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('views_total')">Views</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('signups')">Trial Starts</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('still_trialing')">Still Trialing</th>
               <th style="cursor:pointer;text-align:right" onclick="sortChannelPerf('trial_canceled')">Trial Canceled</th>
@@ -616,6 +616,7 @@
       <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
         Conv Rate = Paid Conv &divide; (Paid Conv + Trial Canceled). CPA = Ad Spend &divide; Paid Conversions, computed at the Source level only.
         Views window is 30 days; subscription data window is 90 days. Untagged subs appear under Source = &ldquo;direct&rdquo;.
+        <br>* = Historical views estimated from campaign-level data, distributed proportionally by trial starts. New views tracked with full ad-level precision.
       </div>
     </div>
 
@@ -1849,6 +1850,8 @@ function renderChannelPerfTable() {
   rows.forEach(function(r){
     var decided = (r.paid_conversions || 0) + (r.trial_canceled || 0);
     r.cvr = decided > 0 ? ((r.paid_conversions || 0) / decided) : null;
+    // S35: Combined views for sorting (exact + fallback)
+    r.views_total = (r.views || 0) + (r.views_fallback || 0);
     var srcSpendCents = spendBySrc[r.utm_source];
     var srcPaid = paidBySrc[r.utm_source] || 0;
     if (srcSpendCents != null && srcPaid > 0) {
@@ -1924,6 +1927,17 @@ function renderChannelPerfTable() {
     var lpCell = (r.landing_page || 'none') === 'none'
       ? '<span style="color:var(--navy-mid)">none</span>'
       : r.landing_page;
+    // S35: Build views display with historical fallback
+    var exactViews = r.views || 0;
+    var fallbackViews = r.views_fallback || 0;
+    var viewsCell;
+    if (fallbackViews > 0 && exactViews > 0) {
+      viewsCell = '<span title="Historical estimate based on campaign-level views, distributed by trial starts">' + fallbackViews + '*</span> + ' + exactViews;
+    } else if (fallbackViews > 0) {
+      viewsCell = '<span title="Historical estimate based on campaign-level views, distributed by trial starts">' + fallbackViews + '*</span>';
+    } else {
+      viewsCell = '' + exactViews;
+    }
     return '<tr>' +
       '<td><strong>' + r.utm_source + '</strong></td>' +
       '<td>' + r.utm_medium + '</td>' +
@@ -1931,7 +1945,7 @@ function renderChannelPerfTable() {
       '<td>' + contentCell + '</td>' +
       '<td>' + termCell + '</td>' +
       '<td>' + lpCell + '</td>' +
-      '<td style="text-align:right">' + (r.views || 0) + '</td>' +
+      '<td style="text-align:right">' + viewsCell + '</td>' +
       '<td style="text-align:right">' + (r.signups || 0) + '</td>' +
       '<td style="text-align:right">' + (r.still_trialing || 0) + '</td>' +
       '<td style="text-align:right">' + (r.trial_canceled || 0) + '</td>' +
@@ -1949,7 +1963,7 @@ function sortChannelPerf(key) {
   } else {
     window._channelPerfSortKey = key;
     // Numeric columns default desc (largest first); text columns default asc.
-    var numericKeys = ['views','signups','still_trialing','trial_canceled','paid_conversions','cvr','cpa'];
+    var numericKeys = ['views_total','signups','still_trialing','trial_canceled','paid_conversions','cvr','cpa'];
     window._channelPerfSortDir = numericKeys.indexOf(key) >= 0 ? 'desc' : 'asc';
   }
   renderChannelPerfTable();
