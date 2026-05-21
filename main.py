@@ -271,6 +271,17 @@ async def startup():
                 """)
             print("[Startup] Block 3: Analytics tables ready")
 
+            # Block 3a: Daily stats snapshots for date comparison feature (S35)
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_stats_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        snapshot_date DATE NOT NULL UNIQUE,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        data JSONB NOT NULL
+                    )
+                """)
+
             # Block 3b: UTM links table (S23)
             async with db_pool.acquire() as conn:
                 await conn.execute("""
@@ -354,9 +365,17 @@ async def startup():
                     id="daily_shadow_sync",
                     replace_existing=True,
                 )
+            # S35: Daily stats snapshot for date comparison feature.
+            # Runs at 9:15 AM ET, after the digest (9:00 AM) and shadow sync (8:00 AM).
+            scheduler.add_job(
+                write_daily_stats_snapshot,
+                CronTrigger(hour=9, minute=15, timezone=et),
+                id="daily_stats_snapshot",
+                replace_existing=True,
+            )
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
-            print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg})")
+            print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg} + stats snapshot 9:15 AM ET)")
         except Exception as e:
             print(f"Scheduler startup error: {e}")
     else:
@@ -4682,6 +4701,146 @@ async def _write_reconciliation_snapshot(run_id: int, res_data: dict):
         print(f"[Daily Sync] Snapshot write error: {e}")
 
 
+async def write_daily_stats_snapshot():
+    """S35: Capture a daily snapshot of key dashboard metrics for the date
+    comparison feature. Runs once daily after the digest. Stores MRR, subscriber
+    counts, fees, churn, conversions, and page view totals as a JSON blob keyed
+    by date. Idempotent: overwrites if same date already exists.
+
+    TODO(S35): REMOVE the historical view fallback in channel_perf query after
+    Aug 15 2026 (90 days from May 16 UTM script deployment).
+    TODO(S35): CHECK by Jun 15 2026 that page_views have utm_content/utm_term
+    populated for meta traffic.
+    """
+    if not db_pool:
+        return
+    try:
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        async with db_pool.acquire() as conn:
+            # Active/trialing/canceled counts
+            counts = await conn.fetchrow("""
+                SELECT
+                  COUNT(*) FILTER (WHERE status = 'active') as active,
+                  COUNT(*) FILTER (WHERE status = 'trialing') as trialing,
+                  COUNT(*) FILTER (WHERE status = 'canceled') as canceled,
+                  COUNT(*) as total
+                FROM subscriptions
+                WHERE status != 'incomplete_expired'
+            """)
+
+            # MRR by source
+            mrr_rows = await conn.fetch("""
+                SELECT
+                  COALESCE(source, 'stripe') as source,
+                  COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END), 0) as mrr_monthly,
+                  COALESCE(SUM(CASE WHEN plan_interval='year' THEN plan_amount/12 ELSE 0 END), 0) as mrr_annual
+                FROM subscriptions
+                WHERE status IN ('active', 'trialing')
+                GROUP BY source
+            """)
+            mrr_by_source = {}
+            total_mrr = 0
+            for r in mrr_rows:
+                src = r["source"] or "stripe"
+                mrr = (r["mrr_monthly"] or 0) + (r["mrr_annual"] or 0)
+                mrr_by_source[src] = mrr
+                total_mrr += mrr
+
+            # Fees
+            fees = {}
+            total_fees = 0
+            for src, mrr in mrr_by_source.items():
+                if src == "apple":
+                    fee = round(mrr * 0.15)
+                elif src == "google":
+                    fee = round(mrr * 0.15)
+                else:
+                    fee = round(mrr * 0.029)
+                fees[src] = fee
+                total_fees += fee
+
+            # Subscribers by source (active only)
+            by_source_rows = await conn.fetch("""
+                SELECT COALESCE(source, 'stripe') as source,
+                       COUNT(*) as count
+                FROM subscriptions
+                WHERE status IN ('active', 'trialing')
+                GROUP BY source
+            """)
+            subs_by_source = {r["source"] or "stripe": r["count"] for r in by_source_rows}
+
+            # Churn (30-day, same logic as stats endpoint)
+            churn_row = await conn.fetchrow("""
+                SELECT
+                  COUNT(*) FILTER (WHERE status = 'canceled'
+                    AND effective_canceled_at IS NOT NULL
+                    AND effective_canceled_at > NOW() - INTERVAL '30 days'
+                    AND converted_at IS NOT NULL) as churned_paid,
+                  COUNT(*) FILTER (WHERE status = 'canceled'
+                    AND effective_canceled_at IS NOT NULL
+                    AND effective_canceled_at > NOW() - INTERVAL '30 days'
+                    AND converted_at IS NULL) as churned_trial
+                FROM subscriptions
+                WHERE status != 'incomplete_expired'
+            """)
+            churned_paid = churn_row["churned_paid"] or 0
+            churned_trial = churn_row["churned_trial"] or 0
+            active_plus_churned = (counts["active"] or 0) + (counts["trialing"] or 0) + churned_paid + churned_trial
+            churn_rate = round(100 * (churned_paid + churned_trial) / active_plus_churned, 1) if active_plus_churned > 0 else 0
+
+            # Conversions (7d and 30d)
+            conv_row = await conn.fetchrow("""
+                SELECT
+                  COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '7 days') as conv_7d,
+                  COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '30 days') as conv_30d
+                FROM subscriptions
+            """)
+
+            # Page views
+            pv_row = await conn.fetchrow("""
+                SELECT
+                  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as pv_24h,
+                  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') as pv_7d,
+                  COUNT(*) as pv_total
+                FROM page_views
+            """)
+
+            snapshot = {
+                "gross_mrr_cents": total_mrr,
+                "net_mrr_cents": total_mrr - total_fees,
+                "arr_cents": total_mrr * 12,
+                "net_arr_cents": (total_mrr - total_fees) * 12,
+                "mrr_by_source": mrr_by_source,
+                "fees_by_source": fees,
+                "total_fees_cents": total_fees,
+                "active_subs": counts["active"] or 0,
+                "trialing_subs": counts["trialing"] or 0,
+                "canceled_subs": counts["canceled"] or 0,
+                "total_subs": counts["total"] or 0,
+                "subs_by_source": subs_by_source,
+                "churn_rate_30d": churn_rate,
+                "churned_paid_30d": churned_paid,
+                "churned_trial_30d": churned_trial,
+                "conversions_7d": conv_row["conv_7d"] or 0,
+                "conversions_30d": conv_row["conv_30d"] or 0,
+                "page_views_24h": pv_row["pv_24h"] or 0,
+                "page_views_7d": pv_row["pv_7d"] or 0,
+                "page_views_total": pv_row["pv_total"] or 0,
+            }
+
+            await conn.execute("""
+                INSERT INTO daily_stats_snapshots (snapshot_date, data)
+                VALUES ($1, $2)
+                ON CONFLICT (snapshot_date)
+                DO UPDATE SET data = $2, created_at = NOW()
+            """, today, json.dumps(snapshot))
+
+        print(f"[Stats Snapshot] Written for {today}: MRR=${total_mrr/100:,.2f}, "
+              f"active={counts['active']}, trialing={counts['trialing']}")
+    except Exception as e:
+        print(f"[Stats Snapshot] Write error: {e}")
+
+
 async def run_daily_shadow_sync():
     """Automated daily shadow sync: verify all Apple/Google against ymove, auto-apply safe changes."""
     print(f"[Daily Sync] Starting automated shadow sync at {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
@@ -8370,6 +8529,61 @@ async def admin_trend_daily(request: Request):
             ]
 
     return result
+
+
+# S35: Daily stats snapshot endpoints
+@app.get("/api/admin/snapshot/{date_str}")
+async def admin_get_snapshot(date_str: str, request: Request):
+    """Retrieve a daily stats snapshot for a specific date. Used by the
+    date comparison feature. Returns 404 if no snapshot exists for that date."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT snapshot_date, created_at, data FROM daily_stats_snapshots WHERE snapshot_date = $1",
+            target_date
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No snapshot for {date_str}")
+
+    return {
+        "snapshot_date": str(row["snapshot_date"]),
+        "created_at": str(row["created_at"]),
+        "data": json.loads(row["data"]) if isinstance(row["data"], str) else row["data"],
+    }
+
+
+@app.get("/api/admin/snapshots")
+async def admin_list_snapshots(request: Request):
+    """List all available snapshot dates, most recent first."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT snapshot_date, created_at FROM daily_stats_snapshots ORDER BY snapshot_date DESC LIMIT 365"
+        )
+    return {"snapshots": [{"date": str(r["snapshot_date"]), "created_at": str(r["created_at"])} for r in rows]}
+
+
+@app.post("/api/admin/snapshot-now")
+async def admin_snapshot_now(request: Request):
+    """Manually trigger a stats snapshot for today. Admin only."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+
+    await write_daily_stats_snapshot()
+    return {"status": "ok", "message": "Snapshot written for today"}
 
 
 @app.get("/api/health")
