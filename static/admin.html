@@ -292,10 +292,10 @@
     <div class="views-grid">
       <div class="card">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-          <div class="section-title" style="margin-bottom:0" id="mrr-trend-title">MRR Trend (12 Weeks)</div>
+          <div class="section-title" style="margin-bottom:0" id="mrr-trend-title">MRR Trend (12 Months)</div>
           <div style="display:flex;gap:4px">
-            <button class="quick-btn active" id="mrr-btn-week" onclick="setMrrView('week')" style="padding:4px 12px;font-size:.72rem">Weeks</button>
-            <button class="quick-btn" id="mrr-btn-month" onclick="setMrrView('month')" style="padding:4px 12px;font-size:.72rem">Months</button>
+            <button class="quick-btn" id="mrr-btn-week" onclick="setMrrView('week')" style="padding:4px 12px;font-size:.72rem">Weeks</button>
+            <button class="quick-btn active" id="mrr-btn-month" onclick="setMrrView('month')" style="padding:4px 12px;font-size:.72rem">Months</button>
           </div>
         </div>
         <div id="chart-mrr-trend" class="bar-chart"></div>
@@ -1340,8 +1340,10 @@ function loadStats() {
       var label = r.period.slice(2); // YY-MM
       return {label: label, value: r.mrr_cents, color: 'green', displayValue: '$' + dollars};
     });
-    var mrrView = window._mrrView || 'week';
-    renderBarChart('chart-mrr-trend', mrrView === 'month' ? window._mrrTrendMonthly : window._mrrTrendWeekly);
+    var mrrView = window._mrrView || 'month';
+    var mrrWeekCapped = window._mrrTrendWeekly.slice(-12);
+    var mrrMonthCapped = window._mrrTrendMonthly.slice(-12);
+    renderBarChart('chart-mrr-trend', mrrView === 'month' ? mrrMonthCapped : mrrWeekCapped);
 
     renderBarChart('chart-mrr-source', (subs.mrr_by_source || []).map(function(r) {
       var dollars = (r.mrr_cents / 100).toFixed(0);
@@ -1594,7 +1596,7 @@ function setMrrView(view) {
   document.getElementById('mrr-btn-week').className = 'quick-btn' + (view === 'week' ? ' active' : '');
   document.getElementById('mrr-btn-month').className = 'quick-btn' + (view === 'month' ? ' active' : '');
   document.getElementById('mrr-trend-title').textContent = view === 'month' ? 'MRR Trend (12 Months)' : 'MRR Trend (12 Weeks)';
-  var data = view === 'month' ? window._mrrTrendMonthly : window._mrrTrendWeekly;
+  var data = view === 'month' ? (window._mrrTrendMonthly || []).slice(-12) : (window._mrrTrendWeekly || []).slice(-12);
   if (data) renderBarChart('chart-mrr-trend', data);
 }
 
