@@ -9125,6 +9125,33 @@ async def data_audit(request: Request):
         if expired_active and expired_active > 20:
             audit["critical_issues"].append(f"{expired_active} subs are marked 'active' but their current_period_end is over 7 days ago. These are likely cancelled/expired and inflate MRR.")
 
+        # S35: Also fetch details for the expired-but-active records
+        expired_details = await conn.fetch("""
+            SELECT id, email, source, stripe_subscription_id, plan_amount, plan_interval,
+                   current_period_end, created_at, import_batch
+            FROM subscriptions
+            WHERE status = 'active'
+            AND current_period_end IS NOT NULL
+            AND current_period_end < NOW() - INTERVAL '7 days'
+            ORDER BY current_period_end ASC
+            LIMIT 100
+        """)
+        audit["checks"]["expired_but_active"]["by_source"] = {}
+        for r in expired_details:
+            src = r["source"] or "stripe"
+            audit["checks"]["expired_but_active"].setdefault("by_source", {})[src] = audit["checks"]["expired_but_active"].get("by_source", {}).get(src, 0) + 1
+        audit["checks"]["expired_but_active"]["records"] = [
+            {
+                "id": r["id"], "email": r["email"], "source": r["source"],
+                "sub_id": r["stripe_subscription_id"],
+                "plan_amount": r["plan_amount"], "plan_interval": r["plan_interval"],
+                "period_end": str(r["current_period_end"]),
+                "created_at": str(r["created_at"]),
+                "import_batch": r["import_batch"],
+            }
+            for r in expired_details
+        ]
+
         # ============================================================
         # CHECK 13: Leads vs Subs email match rate
         # ============================================================
