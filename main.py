@@ -7758,7 +7758,8 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
                    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '{cp_interval}') as signups,
-                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()) as still_trialing,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()
+                     AND created_at > NOW() - INTERVAL '{cp_interval}') as still_trialing,
                    COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL
                      AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}') as trial_canceled,
                    COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as paid_conversions,
@@ -7768,7 +7769,6 @@ async def admin_stats(request: Request):
                      FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as avg_paid_lifetime_days
                  FROM subscriptions
                  WHERE status != 'incomplete_expired'
-                   AND trial_start IS NOT NULL
                    AND (
                      created_at > NOW() - INTERVAL '{cp_interval}'
                      OR (status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}')
@@ -8508,13 +8508,13 @@ async def admin_channel_perf_csv(request: Request):
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
                    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '{cp_interval}') as trial_starts,
-                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()) as still_trialing,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()
+                     AND created_at > NOW() - INTERVAL '{cp_interval}') as still_trialing,
                    COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL
                      AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}') as trial_canceled,
                    COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as paid_conversions
                  FROM subscriptions
                  WHERE status != 'incomplete_expired'
-                   AND trial_start IS NOT NULL
                    AND (
                      created_at > NOW() - INTERVAL '{cp_interval}'
                      OR (status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}')
