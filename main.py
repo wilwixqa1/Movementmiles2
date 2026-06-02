@@ -4316,6 +4316,7 @@ async def _apply_shadow_sync(results: dict, preview: bool, run_id: int) -> dict:
                 if not handled_as_pending:
                     result = await conn.execute(
                         """UPDATE subscriptions SET status = 'canceled', canceled_at = NOW(),
+                           effective_canceled_at = NOW(),
                            cancel_state = 'expired',
                            updated_at = NOW(), import_batch = $1
                            WHERE id = $2 AND status IN ('active', 'trialing')""",
@@ -6354,6 +6355,77 @@ async def backfill_conversions(request: Request):
         "stripe_backfilled": stripe_count,
         "apple_google_backfilled": appgoogle_count,
         "total": stripe_count + appgoogle_count,
+    }
+
+
+@app.post("/api/admin/backfill-effective-canceled-at")
+async def backfill_effective_canceled_at(request: Request):
+    """S35: Backfill effective_canceled_at from canceled_at for subs where it's NULL.
+    Dry-run by default. Tags records with batch ID so we can revert.
+    Pass {"apply": true} to commit, {"revert": true} to undo."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+    revert = body.get("revert", False)
+    batch_id = "s35_backfill_eca_20260602"
+
+    async with db_pool.acquire() as conn:
+        if revert:
+            # Undo the backfill
+            reverted = await conn.execute(
+                """UPDATE subscriptions
+                   SET effective_canceled_at = NULL, updated_at = NOW()
+                   WHERE import_batch LIKE '%' || $1 || '%'""",
+                batch_id
+            )
+            count = int(reverted.split(" ")[-1]) if reverted else 0
+            return {"status": "reverted", "records_reverted": count}
+
+        # Preview what we'd backfill
+        rows = await conn.fetch(
+            """SELECT id, email, source, status, canceled_at, effective_canceled_at,
+                      cancel_state, created_at
+               FROM subscriptions
+               WHERE status = 'canceled'
+                 AND canceled_at IS NOT NULL
+                 AND effective_canceled_at IS NULL
+               ORDER BY canceled_at DESC"""
+        )
+
+        preview = [
+            {
+                "id": r["id"], "email": r["email"], "source": r["source"],
+                "canceled_at": str(r["canceled_at"]),
+                "cancel_state": r["cancel_state"],
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ]
+
+        if apply and rows:
+            ids = [r["id"] for r in rows]
+            result = await conn.execute(
+                """UPDATE subscriptions
+                   SET effective_canceled_at = canceled_at,
+                       updated_at = NOW(),
+                       import_batch = COALESCE(import_batch, '') || ' """ + batch_id + """'
+                   WHERE status = 'canceled'
+                     AND canceled_at IS NOT NULL
+                     AND effective_canceled_at IS NULL"""
+            )
+            count = int(result.split(" ")[-1]) if result else 0
+            return {"status": "applied", "records_updated": count, "batch_id": batch_id,
+                    "revert_instruction": "POST with {\"revert\": true} to undo"}
+
+    return {
+        "status": "dry_run",
+        "records_found": len(preview),
+        "records": preview[:20],
+        "note": "POST with {\"apply\": true} to commit. Revert with {\"revert\": true}."
     }
 
 
