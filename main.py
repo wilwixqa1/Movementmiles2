@@ -7757,18 +7757,24 @@ async def admin_stats(request: Request):
                    COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
-                   COUNT(*) as signups,
-                   COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
-                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
-                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions,
+                   COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '{cp_interval}') as signups,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()) as still_trialing,
+                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL
+                     AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}') as trial_canceled,
+                   COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as paid_conversions,
                    AVG(EXTRACT(EPOCH FROM (converted_at - created_at)) / 86400)
-                     FILTER (WHERE converted_at IS NOT NULL) as avg_trial_days,
+                     FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as avg_trial_days,
                    AVG(EXTRACT(EPOCH FROM (COALESCE(effective_canceled_at, NOW()) - converted_at)) / 86400)
-                     FILTER (WHERE converted_at IS NOT NULL) as avg_paid_lifetime_days
+                     FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as avg_paid_lifetime_days
                  FROM subscriptions
-                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
-                   AND status != 'incomplete_expired'
+                 WHERE status != 'incomplete_expired'
                    AND trial_start IS NOT NULL
+                   AND (
+                     created_at > NOW() - INTERVAL '{cp_interval}'
+                     OR (status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}')
+                     OR converted_at > NOW() - INTERVAL '{cp_interval}'
+                     OR (trial_end IS NOT NULL AND trial_end >= NOW())
+                   )
                  GROUP BY 1, 2, 3, 4, 5, 6
                ),
                sub_campaign_totals AS (
@@ -8501,14 +8507,20 @@ async def admin_channel_perf_csv(request: Request):
                    COALESCE(NULLIF(utm_content, ''), 'none') as utm_content,
                    COALESCE(NULLIF(utm_term, ''), 'none') as utm_term,
                    COALESCE(NULLIF(landing_page, ''), 'none') as landing_page,
-                   COUNT(*) as trial_starts,
-                   COUNT(*) FILTER (WHERE status = 'trialing') as still_trialing,
-                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL) as trial_canceled,
-                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_conversions
+                   COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '{cp_interval}') as trial_starts,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()) as still_trialing,
+                   COUNT(*) FILTER (WHERE status = 'canceled' AND converted_at IS NULL
+                     AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}') as trial_canceled,
+                   COUNT(*) FILTER (WHERE converted_at > NOW() - INTERVAL '{cp_interval}') as paid_conversions
                  FROM subscriptions
-                 WHERE created_at > NOW() - INTERVAL '{cp_interval}'
-                   AND status != 'incomplete_expired'
+                 WHERE status != 'incomplete_expired'
                    AND trial_start IS NOT NULL
+                   AND (
+                     created_at > NOW() - INTERVAL '{cp_interval}'
+                     OR (status = 'canceled' AND effective_canceled_at > NOW() - INTERVAL '{cp_interval}')
+                     OR converted_at > NOW() - INTERVAL '{cp_interval}'
+                     OR (trial_end IS NOT NULL AND trial_end >= NOW())
+                   )
                  GROUP BY 1, 2, 3, 4, 5, 6
                ),
                sub_campaign_totals AS (
