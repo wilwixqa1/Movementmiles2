@@ -7106,6 +7106,8 @@ async def debug_ymove_meta(request: Request):
     require_admin(pw)
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
+
+    # S35: Also include converted_at gap analysis
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT email, utm_source, utm_content, utm_term, utm_meta_raw
@@ -7114,6 +7116,20 @@ async def debug_ymove_meta(request: Request):
                ORDER BY created_at DESC
                LIMIT 10"""
         )
+
+        # converted_at gap analysis
+        gap = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'active' AND trial_end < NOW() AND converted_at IS NULL) as active_missing_converted_at,
+              COUNT(*) FILTER (WHERE status = 'active' AND converted_at IS NOT NULL) as active_has_converted_at,
+              COUNT(*) FILTER (WHERE status = 'active' AND trial_start IS NULL) as active_no_trial,
+              COUNT(*) FILTER (WHERE status = 'active' AND trial_end >= NOW()) as active_still_in_trial_period,
+              COUNT(*) FILTER (WHERE status = 'active' AND trial_end < NOW() AND converted_at IS NULL AND created_at > NOW() - INTERVAL '30 days') as missing_30d,
+              COUNT(*) FILTER (WHERE status = 'active' AND trial_end < NOW() AND converted_at IS NULL AND created_at > NOW() - INTERVAL '90 days') as missing_90d
+            FROM subscriptions
+            WHERE status = 'active' AND trial_start IS NOT NULL
+        """)
+
     return {
         "count": len(rows),
         "samples": [
@@ -7126,6 +7142,14 @@ async def debug_ymove_meta(request: Request):
             }
             for r in rows
         ],
+        "converted_at_gap": {
+            "active_past_trial_missing_converted_at": gap["active_missing_converted_at"],
+            "active_has_converted_at": gap["active_has_converted_at"],
+            "active_no_trial": gap["active_no_trial"],
+            "active_still_in_trial_period": gap["active_still_in_trial_period"],
+            "missing_created_last_30d": gap["missing_30d"],
+            "missing_created_last_90d": gap["missing_90d"],
+        }
     }
 
 
