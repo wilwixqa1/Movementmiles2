@@ -8735,6 +8735,35 @@ async def debug_ghost_subs(request: Request):
             ORDER BY created_at DESC
             LIMIT 20
         """)
+
+        # S35: Canceled subs effective_canceled_at analysis
+        cancel_analysis = await conn.fetchrow("""
+            SELECT
+              COUNT(*) as total_canceled_30d_cohort,
+              COUNT(*) FILTER (WHERE effective_canceled_at > NOW() - INTERVAL '30 days') as eca_in_window,
+              COUNT(*) FILTER (WHERE effective_canceled_at IS NULL) as eca_null,
+              COUNT(*) FILTER (WHERE effective_canceled_at <= NOW() - INTERVAL '30 days') as eca_outside_window,
+              COUNT(*) FILTER (WHERE effective_canceled_at > NOW()) as eca_future,
+              COUNT(*) FILTER (WHERE converted_at IS NULL) as trial_cancels,
+              COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as paid_cancels
+            FROM subscriptions
+            WHERE created_at > NOW() - INTERVAL '30 days'
+              AND status = 'canceled'
+              AND status != 'incomplete_expired'
+        """)
+
+        # Sample of canceled subs missing from dashboard churn
+        cancel_ghosts = await conn.fetch("""
+            SELECT id, email, source, created_at, effective_canceled_at, canceled_at,
+                   cancel_state, converted_at, trial_end
+            FROM subscriptions
+            WHERE created_at > NOW() - INTERVAL '30 days'
+              AND status = 'canceled'
+              AND (effective_canceled_at IS NULL OR effective_canceled_at <= NOW() - INTERVAL '30 days')
+            ORDER BY created_at DESC
+            LIMIT 10
+        """)
+
     return {
         "status_breakdown": [
             {
@@ -8754,6 +8783,26 @@ async def debug_ghost_subs(request: Request):
                 "effective_canceled_at": str(r["effective_canceled_at"]),
                 "created_at": str(r["created_at"]),
             } for r in ghosts
+        ],
+        "cancel_analysis": {
+            "total_canceled_30d_cohort": cancel_analysis["total_canceled_30d_cohort"],
+            "eca_in_30d_window": cancel_analysis["eca_in_window"],
+            "eca_null": cancel_analysis["eca_null"],
+            "eca_outside_window": cancel_analysis["eca_outside_window"],
+            "eca_future": cancel_analysis["eca_future"],
+            "trial_cancels": cancel_analysis["trial_cancels"],
+            "paid_cancels": cancel_analysis["paid_cancels"],
+        },
+        "cancel_ghost_samples": [
+            {
+                "id": r["id"], "email": r["email"], "source": r["source"],
+                "created_at": str(r["created_at"]),
+                "effective_canceled_at": str(r["effective_canceled_at"]),
+                "canceled_at": str(r["canceled_at"]),
+                "cancel_state": r["cancel_state"],
+                "converted_at": str(r["converted_at"]),
+                "trial_end": str(r["trial_end"]),
+            } for r in cancel_ghosts
         ],
     }
 
