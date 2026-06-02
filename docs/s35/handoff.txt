@@ -1,0 +1,355 @@
+MOVEMENT & MILES -- SESSION 35 HANDOFF
+=======================================
+Date: June 2, 2026
+Repo: github.com/wilwixqa1/Movementmiles2
+Stack: Python FastAPI + asyncpg (PostgreSQL) + vanilla JS dashboard
+Hosted: Railway (auto-deploys on push to main)
+Database: PostgreSQL on Railway (raw asyncpg, NOT Supabase)
+Files: main.py (~14,087 lines), static/admin.html (~3,638 lines)
+Total commits: 296
+
+KEY STAKEHOLDERS
+================
+- Meg Takacs (MTFit LLC): Client, owns the fitness subscription product
+- Ahmed Abdelrehim (ashraf@marketingwizusa.com): Marketing lead, runs Meta ad campaigns, owns UTM strategy
+- Ashraf Zaky: PM at Marketing Wiz (Ahmed's agency)
+- Tosh Koevoets (tosh.koevoets@ymove.app): ymove platform developer, handles Apple/Google in-app purchase routing
+- Will: Partnership/tech lead, maintains dashboard and data pipeline
+
+CRITICAL BUSINESS CONTEXT
+==========================
+- ALL subscribers start with a 30-day free trial. No exceptions.
+- Trials last exactly 30 days.
+- Subscription sources: Stripe (web checkout via ymove), Apple (iOS app), Google (Android app)
+- Apple/Google checkout strips UTM parameters -- these subs always appear as untagged/direct
+- Only Stripe subs going through ymove checkout retain UTM attribution
+- Ahmed's Meta ad campaigns (may26_warm) started ~28 days ago (as of June 2, 2026)
+- Active subscribers as of June 2: ~1,950 (after cleanup)
+- Gross MRR: ~$33,800
+- ymove site ID: 75
+- Admin password: mmadmin2026 | Viewer password: MMTeam262 (NOT in Railway env vars yet)
+
+
+WHAT WE CHANGED THIS SESSION (S35, 18 COMMITS)
+================================================
+
+1. MRR TREND: DEFAULT TO MONTHS, CAP AT 12 BARS
+   - MRR Trend chart defaults to Months view on load (was Weeks)
+   - Both Weeks and Months capped at 12 bars max
+   - MRR by Source now sits properly next to trend chart
+
+2. CHANNEL PERFORMANCE: HISTORICAL VIEW FALLBACK (N* + M notation)
+   - Page views before May 16, 2026 lack utm_content/utm_term (old Squarespace script)
+   - Added fallback: distributes campaign-level views proportionally by trial starts
+   - Display format: "384* + 321" means 384 estimated historical + 321 exact new views
+   - Asterisk has hover tooltip explaining the estimation
+   - Footnote added below table
+   - TODO: REMOVE FALLBACK AFTER AUG 15, 2026 (90 days from UTM script deployment)
+   - TODO: CHECK BY JUN 15, 2026 that new UTM tracker produces page_views with utm_content/utm_term
+
+3. SUBSCRIBER TREND: NEW TIME RANGES + DAILY GRANULARITY
+   - Added 7 Days, 14 Days, 4 Weeks, 8 Weeks to range options
+   - 7d/14d use daily data points (lazy-loaded from /api/admin/trend-daily)
+   - Daily data covers last 30 days, fetched once per session then cached
+   - Loading state shown while fetching
+
+4. PIE CHARTS FOR UTM BREAKDOWN
+   - Bar/Pie toggle on UTM Source, Medium, Campaign charts
+   - SVG pie chart with legend showing counts and percentages
+   - Stored in window._utmChartData for instant toggle
+
+5. DAILY STATS SNAPSHOTS (Date Comparison Infrastructure)
+   - New table: daily_stats_snapshots (date, JSONB data)
+   - Captures: MRR, fees, subscriber counts by source, churn, conversions, page views
+   - Scheduler: 9:15 AM ET daily (after shadow sync 8AM and digest 9AM)
+   - Manual trigger: POST /api/admin/snapshot-now
+   - List snapshots: GET /api/admin/snapshots
+   - Retrieve: GET /api/admin/snapshot/{YYYY-MM-DD}
+   - First snapshot taken manually on May 20, 2026
+
+6. DATE COMPARISON FEATURE
+   - Replaced date range filter with "Compare to" date picker
+   - Quick buttons: 7d ago, 30d ago, 90d ago, Today Only
+   - Comparison banner shows delta cards for each metric
+   - For dates BEFORE snapshots: reconstructs MRR, subs, fees from subscription timestamps
+   - For dates WITH snapshots: uses exact stored data (includes churn, conversions, page views)
+   - Metrics without historical data show "N/A" with "Available after snapshots begin"
+   - Backend: GET /api/admin/compare/{YYYY-MM-DD}
+   - MRR uses exact same query as stats endpoint (status='active' only, not trialing)
+
+7. SUBSCRIBER COUNT RECONCILIATION
+   - Ran ymove diff: Ours 1,959 vs ymove 1,934 (36 only in ours, 11 only in ymove)
+   - Canceled 9 known bad records via POST /api/admin/s35-cleanup-known-bad:
+     * 2 test accounts (ymove.app emails from Ahmed's QA)
+     * 1 Markus test record (s25_test_cancel batch)
+     * 6 Apple/Google subs not found in ymove (orphaned)
+   - Remaining ~12 gap is structural: Stripe-only subs that ymove doesn't track (legitimate)
+   - 28 Stripe subs in our DB not in ymove -- verified NONE are expired, all actively billing
+
+8. CHANNEL PERFORMANCE: MAJOR QUERY FIX (Cancellation/Conversion discrepancy)
+   - BUG FOUND: Table was filtering ALL columns by subscription created_at, but dashboard
+     churn filters by effective_canceled_at. This caused massive discrepancy (3 vs 70+).
+   - FIX: Changed channel perf query:
+     * Trial Starts: still filtered by created_at (when they signed up)
+     * Still Trialing: created_at in window AND trial_end >= NOW()
+       (was: status='trialing', which missed Apple subs reported as 'active' during trial)
+     * Trial Canceled: effective_canceled_at in window AND converted_at IS NULL
+       (was: created_at in window AND status='canceled')
+     * Paid Conversions: converted_at in window
+       (was: created_at in window AND converted_at IS NOT NULL)
+   - Removed trial_start IS NOT NULL filter (was excluding subs with missing trial data)
+   - NOTE: Trial Starts + Still Trialing won't equal Trial Canceled + Paid Conv because
+     starts/trialing are cohort-based (created in window) while canceled/converted are
+     event-based (event happened in window). This is Approach A (see below).
+   - Same fixes applied to CSV export endpoint
+
+9. SHADOW SYNC: effective_canceled_at FIX
+   - BUG FOUND: Shadow sync set canceled_at=NOW() but never set effective_canceled_at
+   - This made shadow-sync cancellations invisible to dashboard churn (which requires
+     effective_canceled_at > NOW() - 30 days)
+   - FIX: Added effective_canceled_at = NOW() to shadow sync cancel query
+   - Backfill endpoint created: POST /api/admin/backfill-effective-canceled-at
+     * Dry run by default, {apply:true} to commit, {revert:true} to undo
+     * Tags records with s35_backfill_eca_20260602 for reversibility
+     * Found 284 records needing backfill
+     * BACKFILL WAS APPLIED THEN REVERTED -- Will decided to let the fix accumulate
+       naturally going forward rather than backfill historical data, since the 30-day
+       churn jumped from 5.3% to 10.6% and needs more investigation
+
+10. UTM LINKS: CREATED DATE COLUMN
+    - Added "Created" column to saved UTM links table
+    - Data was already stored (created_at DEFAULT NOW()), just not displayed
+
+11. BAR CHART ALIGNMENT FIX (attempted and reverted)
+    - Tried fixed-height labels to fix 525 vs 505 visual issue
+    - Made charts look worse, reverted to original layout
+    - Minor cosmetic issue, not worth fixing now
+
+12. DIAGNOSTIC ENDPOINTS ADDED
+    - GET /api/admin/debug/ghost-subs: status breakdown of 30d subs + cancel analysis
+    - Enhanced /api/admin/debug/ymove-meta with converted_at gap analysis
+    - Enhanced data-audit expired_but_active check with source breakdown and record details
+
+
+APPROACH A vs APPROACH B -- CHANNEL PERF DESIGN DECISION
+=========================================================
+The channel performance table currently uses Approach A (event-based). This is a deliberate
+trade-off that was discussed extensively.
+
+APPROACH A (CURRENT): Count events by when they happened
+  - Trial Starts: subs created in window
+  - Still Trialing: subs created in window whose trial is still running
+  - Trial Canceled: cancellations that HAPPENED in window (any creation date)
+  - Paid Conv: conversions that HAPPENED in window (any creation date)
+  - PRO: Cancellation/conversion numbers match dashboard churn exactly
+  - CON: Columns don't add up (starts ≠ trialing + canceled + converted)
+         because cancellations include older subs
+
+APPROACH B (COHORT): Count everything by when the person signed up
+  - Trial Starts: subs created in window
+  - Still Trialing: subs created in window, still in trial
+  - Trial Canceled: subs created in window that are now canceled
+  - Paid Conv: subs created in window that converted
+  - PRO: Numbers always add up (starts = trialing + canceled + converted)
+  - CON: With 30-day trials and 30-day window, almost everyone is "still trialing"
+         Cancellation/conversion numbers look artificially low
+         Numbers don't match dashboard churn
+
+The "Trial-to-Paid Conversion (Rolling Windows)" table elsewhere on the dashboard already
+implements Approach B correctly. The channel perf table uses Approach A to match the
+dashboard totals. Both views exist and serve different purposes.
+
+
+DATA QUALITY ISSUES (KNOWN)
+============================
+
+1. converted_at GAP (HIGH PRIORITY)
+   - 397 active subs are past their trial but missing converted_at
+   - 169 of those are from the last 90 days
+   - 0 missing from last 30 days (real-time webhook IS working for new Stripe subs)
+   - The gap is from older imports and Apple/Google subs
+   - Existing backfill endpoint: POST /api/admin/backfill-conversions
+     Only catches 28 of 397 (heuristic too strict: requires current_period_start > trial_end)
+   - The smart-backfill at /api/admin/smart-backfill-conversions may catch more
+   - Impact: "Paid Conv" column underreports, dashboard may miscategorize some paid
+     cancellations as trial cancellations (converted_at IS NULL)
+
+2. effective_canceled_at NULL on shadow sync cancellations
+   - 284 canceled subs have canceled_at set but effective_canceled_at NULL
+   - All from shadow sync (cancel_state = 'expired')
+   - Fixed going forward (shadow sync now sets effective_canceled_at = NOW())
+   - Backfill was applied and reverted -- needs more investigation before reapplying
+   - Impact: Dashboard 30-day churn undercounts (these cancellations are invisible)
+
+3. Apple subs reported as 'active' during trial
+   - ymove reports Apple subs as status='active' even when in 30-day trial
+   - We store what ymove tells us, so these subs have status='active', trial_end in future
+   - Fixed in channel perf (uses trial_end >= NOW() instead of status='trialing')
+   - 87 such subs found in last 30 days as of June 2
+
+4. Missing trial_start/trial_end on some subs
+   - Some subs (mainly from shadow sync undetermined imports) lack trial dates
+   - Every subscriber starts with a trial, so this is a data capture bug
+   - Removed trial_start IS NOT NULL filter from channel perf to include them
+
+5. Future-dated records
+   - 2 subs have created_at in the future (e.g. 2026-12-31)
+   - Audit flagged them, not yet fixed
+   - Fix endpoint exists: POST /api/admin/fix-future-dates
+
+6. 82 expired-but-active subs
+   - status='active' but current_period_end is 7+ days in the past
+   - Likely missed cancellation webhooks
+   - Need verification against Stripe before changing status
+
+7. Subscriber drift with ymove
+   - After cleanup: ~1,950 ours vs ~1,938 ymove
+   - Remaining gap is 28 Stripe-only subs (legitimate, ymove doesn't track them)
+   - 11 subs in ymove but not in ours (need investigation)
+   - Shadow sync not_found handling: currently logs but doesn't deactivate
+     (conservative by design -- not_found could be API glitch)
+   - Consider: deactivate after 3 consecutive not_found results
+
+
+LANDING PAGE TRACKING -- BLOCKED ON TOSH
+==========================================
+Status: NOT WORKING. Requires ymove change.
+
+Flow: Squarespace script → sets mm_lp cookie → appends to ymove join URL → ymove should
+store mm_lp in user meta → we read it via member-lookup API → store as landing_page
+
+Problem: ymove captures standard UTM params (utm_source, utm_medium, etc.) from the signup
+URL but ignores custom params like mm_lp. Confirmed by checking raw meta on recent signups:
+all UTM fields present, mm_lp absent.
+
+Proof: The SAME script, SAME URL, SAME mechanism delivers utm_source (which works) and
+mm_lp (which doesn't). ymove selectively stores recognized params only.
+
+Action needed: Tosh needs to add mm_lp to ymove's list of captured URL params on signup.
+Will sent email to Tosh (CC Ahmed) on June 2 requesting this change.
+
+
+SQUARESPACE UTM TRACKING SCRIPT
+=================================
+Location: squarespace_utm_script.html in repo root
+Updated: May 16, 2026 (S34)
+Status: DEPLOYED by Ahmed (utm_content and utm_term are flowing to page_views)
+
+What it does:
+1. Captures UTM params from URL, stores as cookies (30-day expiry, mm_ prefix)
+2. Auto-sets mm_lp cookie with current pathname (landing page)
+3. Rewrites ymove checkout links to include all stored UTM cookies as URL params
+4. Posts page-view to backend with UTM params
+
+Cookie list: utm_source, utm_medium, utm_campaign, utm_term, utm_content, ym_source, mm_lp
+Page-view POST includes: utm_source, utm_medium, utm_campaign, utm_content, utm_term
+(does NOT send mm_lp or ym_source to page-view endpoint)
+
+Note: mm_lp is captured and appended to ymove links, but ymove doesn't store it (see above).
+
+
+DATA FLOW: UTM → SUBSCRIPTION
+===============================
+1. User clicks UTM link → lands on Squarespace site
+2. squarespace_utm_script.html captures UTMs from URL, stores in cookies
+3. Script sets mm_lp cookie to current pathname
+4. When user clicks ymove checkout link, script appends all cookies to URL
+5. User subscribes through ymove → Stripe subscription created
+6. Stripe fires customer.subscription.created webhook → main.py stores sub
+7. _ymove_lookup_utm() queries ymove Member Lookup API, reads meta field
+8. _store_utm_on_subscription() writes UTM fields + landing_page to sub record
+9. For Apple/Google: ymove fires webhooks → main.py stores sub (no UTMs, app store strips them)
+
+When trial-to-paid conversion happens:
+- Stripe sends customer.subscription.updated webhook
+- previous_attributes.status = 'trialing', new status = 'active'
+- We stamp converted_at = NOW()
+- This works for Stripe subs going forward (0 missing in last 30d)
+- Apple/Google subs don't get this webhook, so converted_at must be backfilled
+
+
+SCHEDULER JOBS
+===============
+All times Eastern:
+- 8:00 AM: Shadow sync (ymove verification of Apple/Google subs)
+- 9:00 AM: Daily digest email
+- 9:15 AM: Daily stats snapshot (for date comparison feature)
+
+
+KEY ENDPOINTS (frequently used)
+================================
+Admin dashboard:        GET /mm-admin
+Stats API:              GET /api/admin/stats?cp_days=90
+Date comparison:        GET /api/admin/compare/{YYYY-MM-DD}
+Snapshot manual:        POST /api/admin/snapshot-now
+Snapshot list:          GET /api/admin/snapshots
+Trend daily:            GET /api/admin/trend-daily
+Channel perf CSV:       GET /api/admin/channel-perf-csv?cp_days=90
+UTM links CRUD:         GET/POST/DELETE /api/admin/utm-links
+Data audit:             GET /api/admin/data-audit
+ymove diff:             POST /api/admin/ymove-diff
+Ghost subs diagnostic:  GET /api/admin/debug/ghost-subs
+ymove meta debug:       GET /api/admin/debug/ymove-meta
+Test account scan:      POST /api/admin/s28-test-account-scan
+Cleanup test data:      POST /api/admin/cleanup-test-data
+Backfill conversions:   POST /api/admin/backfill-conversions
+Backfill eff canceled:  POST /api/admin/backfill-effective-canceled-at (reversible)
+S35 known bad cleanup:  POST /api/admin/s35-cleanup-known-bad (already applied)
+Run sync now:           POST /api/admin/run-daily-sync-now
+Ad spend CRUD:          GET/POST/DELETE /api/admin/ad-spend
+
+
+SESSION RULES (carry forward)
+==============================
+- Read before editing: always view the file before making changes
+- One push at a time with visual confirmation from Will
+- Anti-anchoring: if Will pushes back twice, stop and enumerate assumptions
+- Never confirm visual fixes from text extraction alone
+- Timebox bugs at 30 minutes
+- Fix backend before frontend
+- Git workflow: clone → edit → commit → push with Will's PAT
+
+
+NEXT SESSION TODO LIST
+=======================
+
+PRIORITY 1: CONVERTED_AT BACKFILL
+  - 397 active subs missing converted_at (169 in last 90d)
+  - Current backfill only catches 28 (heuristic too strict)
+  - Need broader backfill: any active sub past trial_end without converted_at
+  - This will fix: paid conversions undercount, trial/paid cancellation miscategorization
+  - Be careful: run dry first, verify numbers, make reversible
+
+PRIORITY 2: EFFECTIVE_CANCELED_AT BACKFILL INVESTIGATION
+  - 284 canceled subs with NULL effective_canceled_at
+  - Fix is in place going forward (shadow sync now sets it)
+  - Need to decide whether to backfill historical: caused churn to jump from 5.3% to 10.6%
+  - Investigate: are those 284 all legitimate recent cancellations, or are some very old
+    cancellations where canceled_at is inaccurate (set to sync run date, not actual cancel date)?
+
+PRIORITY 3: LANDING PAGE -- FOLLOW UP WITH TOSH
+  - Tosh needs to add mm_lp to ymove's captured URL params
+  - Email sent June 2, follow up if no response by June 9
+
+PRIORITY 4: CHANNEL PERF APPROACH DECISION
+  - Currently Approach A (event-based, matches dashboard, columns don't add up)
+  - Ahmed may prefer Approach B (cohort, columns add up, but low numbers for short windows)
+  - Could implement both as toggleable views
+  - Waiting on Ahmed's feedback
+
+PRIORITY 5: NOT_FOUND HANDLING IN SHADOW SYNC
+  - Shadow sync identifies subs not found in ymove but doesn't deactivate them
+  - Conservative by design (not_found could be API glitch)
+  - Consider: deactivate after 3 consecutive daily not_found results
+  - Would close the remaining subscriber drift gap
+
+PRIORITY 6: VIEWER PASSWORDS TO RAILWAY ENV
+  - ADMIN_PASSWORD and VIEWER_PASSWORD still using code defaults
+
+LOWER PRIORITY:
+  - Bar chart visual alignment (525 vs 505 height issue, cosmetic)
+  - Future-dated records cleanup (2 subs with 2026-12-31 dates)
+  - 82 expired-but-active subs (need Stripe verification)
+  - X-axis label readability on trend chart (labelEvery logic)
+  - Avg trial days + avg paid lifetime columns (data ready, not displayed)
+  - Google SSO for viewer access
