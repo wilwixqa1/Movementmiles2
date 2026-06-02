@@ -8684,6 +8684,68 @@ async def admin_snapshot_now(request: Request):
     return {"status": "ok", "message": "Snapshot written for today"}
 
 
+@app.get("/api/admin/debug/ghost-subs")
+async def debug_ghost_subs(request: Request):
+    """S35: Find subs created in last 30d with trial_start that are NOT trialing,
+    NOT trial_canceled, and NOT paid_conversions. These are invisible in channel perf."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        # Status breakdown of all 30d trial subs
+        breakdown = await conn.fetch("""
+            SELECT status, 
+                   COUNT(*) as count,
+                   COUNT(*) FILTER (WHERE converted_at IS NOT NULL) as has_converted_at,
+                   COUNT(*) FILTER (WHERE converted_at IS NULL) as no_converted_at,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end < NOW()) as trial_ended,
+                   COUNT(*) FILTER (WHERE trial_end IS NOT NULL AND trial_end >= NOW()) as trial_ongoing,
+                   COUNT(*) FILTER (WHERE trial_end IS NULL) as no_trial_end
+            FROM subscriptions
+            WHERE created_at > NOW() - INTERVAL '30 days'
+              AND status != 'incomplete_expired'
+              AND trial_start IS NOT NULL
+            GROUP BY status
+            ORDER BY count DESC
+        """)
+        # Sample of the ghost subs specifically
+        ghosts = await conn.fetch("""
+            SELECT id, email, status, source, converted_at, trial_start, trial_end,
+                   effective_canceled_at, created_at, plan_amount, plan_interval
+            FROM subscriptions
+            WHERE created_at > NOW() - INTERVAL '30 days'
+              AND status != 'incomplete_expired'
+              AND trial_start IS NOT NULL
+              AND status != 'trialing'
+              AND NOT (status = 'canceled' AND converted_at IS NULL)
+              AND converted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+    return {
+        "status_breakdown": [
+            {
+                "status": r["status"], "count": r["count"],
+                "has_converted_at": r["has_converted_at"],
+                "no_converted_at": r["no_converted_at"],
+                "trial_ended": r["trial_ended"],
+                "trial_ongoing": r["trial_ongoing"],
+                "no_trial_end": r["no_trial_end"],
+            } for r in breakdown
+        ],
+        "ghost_samples": [
+            {
+                "id": r["id"], "email": r["email"], "status": r["status"],
+                "source": r["source"], "converted_at": str(r["converted_at"]),
+                "trial_start": str(r["trial_start"]), "trial_end": str(r["trial_end"]),
+                "effective_canceled_at": str(r["effective_canceled_at"]),
+                "created_at": str(r["created_at"]),
+            } for r in ghosts
+        ],
+    }
+
+
 @app.get("/api/admin/compare/{date_str}")
 async def admin_compare_date(date_str: str, request: Request):
     """S35: Return reconstructed stats for a past date alongside today's live stats.
