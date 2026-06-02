@@ -1149,15 +1149,17 @@ function renderUtmLinks(links) {
   var th = 'padding:8px 12px;font-size:.68rem;text-align:left;color:var(--navy-mid);font-weight:600;text-transform:uppercase';
   var td = 'padding:6px 12px;font-size:.82rem;border-bottom:1px solid var(--border)';
   var html = '<table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid var(--border);border-radius:8px;overflow:hidden">';
-  html += '<tr style="background:#f7f7f7"><th style="'+th+'">Label</th><th style="'+th+'">Source</th><th style="'+th+'">Medium</th><th style="'+th+'">Campaign</th><th style="'+th+'">URL</th><th style="'+th+'"></th></tr>';
+  html += '<tr style="background:#f7f7f7"><th style="'+th+'">Label</th><th style="'+th+'">Source</th><th style="'+th+'">Medium</th><th style="'+th+'">Campaign</th><th style="'+th+'">Created</th><th style="'+th+'">URL</th><th style="'+th+'"></th></tr>';
   links.forEach(function(l) {
     var dest = l.base_url.indexOf('ymove') > -1 ? 'Checkout' : 'Website';
     var displayLabel = escHtml(l.label || dest);
+    var created = l.created_at ? new Date(l.created_at).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'}) : '--';
     html += '<tr>';
     html += '<td style="'+td+'">'+displayLabel+'</td>';
     html += '<td style="'+td+'">'+escHtml(l.utm_source)+'</td>';
     html += '<td style="'+td+'">'+escHtml(l.utm_medium || '--')+'</td>';
     html += '<td style="'+td+'">'+escHtml(l.utm_campaign || '--')+'</td>';
+    html += '<td style="'+td+';white-space:nowrap;font-size:.76rem;color:var(--navy-mid)">'+created+'</td>';
     html += '<td style="'+td+';max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="'+escHtml(l.full_url)+'" target="_blank" style="color:var(--navy);font-size:.78rem">'+dest+'</a></td>';
     html += '<td style="'+td+';text-align:center"><span onclick="deleteUtmLink('+l.id+')" style="color:var(--red);cursor:pointer;font-size:.78rem" title="Delete">&#10005;</span></td>';
     html += '</tr>';
