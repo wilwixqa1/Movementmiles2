@@ -14086,3 +14086,51 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
+
+
+@app.post("/api/admin/s35-cleanup-test-jun26")
+async def s35_cleanup_test_jun26(request: Request):
+    """S35: Cancel 7 test accounts from Ahmed's June 26 QA session."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+
+    target_emails = [
+        "asdfasdfsadfafs@ymove.app",
+        "asdfsdafsadf@ymove.app",
+        "ffsadnjksafdjknfsna@ymove.app",
+        "jdjdkdkdkdd@ymove.app",
+        "safdsfdsdfasfad@ymove.app",
+        "sakdfjjksadkjfassakdfjjksadkjfas@ymove.app",
+        "sdfsadfasdf@ymove.app",
+    ]
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id, created_at
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+               ORDER BY email""",
+            [e.lower() for e in target_emails]
+        )
+        preview = [
+            {"id": r["id"], "email": r["email"], "source": r["source"],
+             "status": r["status"], "sub_id": r["stripe_subscription_id"],
+             "created_at": str(r["created_at"])}
+            for r in rows
+        ]
+        if apply and rows:
+            ids = [r["id"] for r in rows]
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET status = 'canceled', effective_canceled_at = NOW(),
+                       updated_at = NOW(),
+                       import_batch = COALESCE(import_batch, '') || ' s35_cleanup_test_jun26'
+                   WHERE id = ANY($1::int[])""",
+                ids
+            )
+    return {"status": "applied" if apply else "dry_run", "records_found": len(preview), "records": preview}
