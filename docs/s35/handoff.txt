@@ -353,3 +353,57 @@ LOWER PRIORITY:
   - X-axis label readability on trend chart (labelEvery logic)
   - Avg trial days + avg paid lifetime columns (data ready, not displayed)
   - Google SSO for viewer access
+
+
+JUNE 30 SESSION ADDITIONS
+==========================
+
+AI INSIGHTS FIX:
+  - Model string updated from claude-sonnet-4-20250514 (deprecated, 404) to claude-sonnet-4-6
+  - Both call_anthropic and call_anthropic_raw updated (lines 519, 554)
+
+LANDING PAGE STATUS (as of June 30):
+  - Tosh confirmed June 18 he added mm_lp to TRACKING_KEYS
+  - BUT he only added it on the backend, not the checkout frontend
+  - Tosh confirmed June 30 it's now implemented on the frontend too
+  - Data starts fresh from June 30 -- no retroactive landing page data possible
+  - Monitor: check ymove-meta endpoint in a few days to confirm mm_lp appears
+
+ASHRAF ADDED TO DAILY DIGEST:
+  - ashraf@marketingwizusa.com added to DIGEST_RECIPIENTS in Railway env var
+  - No recipient limit in code -- comma-separated list
+
+CLEANUPS PERFORMED JUNE 30:
+  - 7 test accounts from Ahmed's June 26 QA (all @ymove.app) -- canceled
+  - 6 Apple orphans not found in ymove -- canceled (see watch list below)
+
+RE-IMPORT WATCH LIST:
+  Monitor these emails for re-import in future sessions. They were canceled
+  because ymove diff showed them as "only in ours" (not found in ymove).
+  If they reappear as active, the shadow sync re-imported them and we need
+  to implement dedup protection for canceled records.
+
+  Canceled June 30, 2026 (Apple orphans, batch: s35_cleanup_apple_orphans_jun30):
+  - brentonjensen@gmail.com (apple)
+  - bryonyquigly@gmail.com (apple)
+  - csilluk76@gmail.com (apple)
+  - kerrileighnelson@gmail.com (apple)
+  - kimslettebak@gmail.com (apple)
+  - mawslab@gmail.com (apple)
+
+  Canceled May 20, 2026 (Apple/Google orphans, batch: s35_cleanup_known_bad_20260520):
+  - gregistfather@gmail.com (apple)
+  - katie.l.mackenzie@gmail.com (apple)
+  - laural5920@yahoo.com (apple)
+  - nicky.young30@gmail.com (apple)
+  - marie.humbert@ymail.com (google)
+  - paulina.swieton825@gmail.com (google)
+
+  NOT canceled (undetermined, risk of re-import):
+  - nickovalc@gmail.com (undetermined, autosync June 14)
+  - tiffanymcintosh49@hotmail.com (undetermined, autosync June 30)
+
+CURRENT SUBSCRIBER GAP (as of June 30):
+  Ours: ~1,990 | ymove: ~1,974 | Gap: ~16
+  Remaining gap is structural: Stripe-only subs ymove doesn't track (legitimate)
+  15 subs in ymove not in ours (likely missed webhooks, needs investigation)
