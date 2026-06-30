@@ -7182,7 +7182,7 @@ async def debug_ymove_meta(request: Request):
     # S35: Also include converted_at gap analysis
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT email, utm_source, utm_content, utm_term, utm_meta_raw
+            """SELECT email, utm_source, utm_content, utm_term, utm_meta_raw, created_at
                FROM subscriptions
                WHERE utm_meta_raw IS NOT NULL
                ORDER BY created_at DESC
@@ -7207,6 +7207,7 @@ async def debug_ymove_meta(request: Request):
         "samples": [
             {
                 "email": r["email"],
+                "created_at": str(r["created_at"]),
                 "utm_source": r["utm_source"],
                 "utm_content": r["utm_content"],
                 "utm_term": r["utm_term"],
