@@ -14134,3 +14134,50 @@ async def s35_cleanup_test_jun26(request: Request):
                 ids
             )
     return {"status": "applied" if apply else "dry_run", "records_found": len(preview), "records": preview}
+
+
+@app.post("/api/admin/s35-cleanup-apple-orphans-jun30")
+async def s35_cleanup_apple_orphans_jun30(request: Request):
+    """S35: Cancel 6 Apple orphans not found in ymove (confirmed via diff June 30)."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    apply = body.get("apply", False)
+
+    target_emails = [
+        "brentonjensen@gmail.com",
+        "bryonyquigly@gmail.com",
+        "csilluk76@gmail.com",
+        "kerrileighnelson@gmail.com",
+        "kimslettebak@gmail.com",
+        "mawslab@gmail.com",
+    ]
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, email, source, status, stripe_subscription_id, created_at
+               FROM subscriptions
+               WHERE lower(email) = ANY($1::text[])
+                 AND status IN ('active', 'trialing')
+               ORDER BY email""",
+            [e.lower() for e in target_emails]
+        )
+        preview = [
+            {"id": r["id"], "email": r["email"], "source": r["source"],
+             "status": r["status"], "sub_id": r["stripe_subscription_id"],
+             "created_at": str(r["created_at"])}
+            for r in rows
+        ]
+        if apply and rows:
+            ids = [r["id"] for r in rows]
+            await conn.execute(
+                """UPDATE subscriptions
+                   SET status = 'canceled', effective_canceled_at = NOW(),
+                       updated_at = NOW(),
+                       import_batch = COALESCE(import_batch, '') || ' s35_cleanup_apple_orphans_jun30'
+                   WHERE id = ANY($1::int[])""",
+                ids
+            )
+    return {"status": "applied" if apply else "dry_run", "records_found": len(preview), "records": preview}
