@@ -14228,6 +14228,7 @@ async def program_insights(request: Request):
     if not db_pool:
         raise HTTPException(status_code=500, detail="No database")
     async with db_pool.acquire() as conn:
+        last_synced_at = await conn.fetchval("SELECT MAX(fetched_at) FROM ymove_engagement")
         rows = await conn.fetch(
             """
             WITH latest_eng AS (
@@ -14313,6 +14314,7 @@ async def program_insights(request: Request):
     out.sort(key=lambda x: -x["followers"])
     return {
         "members_included": total["followers"],
+        "last_synced_at": str(last_synced_at) if last_synced_at else None,
         "overall": finalize("All ymove-matched members", total),
         "programs": out,
         "notes": [
@@ -14507,65 +14509,73 @@ async def run_engagement_sync(limit: int = 0, batch_label: str = "", scope: str 
 
     counts = {"found": 0, "not_found": 0, "errors": 0}
     started = datetime.now(timezone.utc)
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for i, email in enumerate(emails):
-                if i > 0:
-                    await asyncio.sleep(1.0)  # strict 1 req/sec pace
-                found = False
-                user = None
-                try:
-                    resp = await client.get(
-                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
-                        headers={"X-Authorization": YMOVE_API_KEY},
-                        params={"email": email, "includeWorkoutHistory": "1"}
-                    )
-                    if resp.status_code == 429:
-                        retry_after = float(resp.headers.get("retry-after", "10"))
-                        print(f"[Engagement Sync] 429 at {email}, backing off {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        resp = await client.get(
-                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
-                            headers={"X-Authorization": YMOVE_API_KEY},
-                            params={"email": email, "includeWorkoutHistory": "1"}
-                        )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        user = data.get("user") if isinstance(data, dict) else None
-                        found = bool(data.get("found")) and isinstance(user, dict)
-                        counts["found" if found else "not_found"] += 1
-                    elif resp.status_code == 404:
-                        counts["not_found"] += 1
-                    else:
-                        counts["errors"] += 1
-                        print(f"[Engagement Sync] HTTP {resp.status_code} for {email}")
-                except Exception as e:
-                    counts["errors"] += 1
-                    print(f"[Engagement Sync] Error for {email}: {e}")
 
-                ext = _s36_extract_engagement(user) if found else _s36_extract_engagement({})
+    async def _fetch_one(client, email):
+        """One member lookup with a single 429 retry. Returns (email, found, user)."""
+        try:
+            resp = await client.get(
+                f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                headers={"X-Authorization": YMOVE_API_KEY},
+                params={"email": email, "includeWorkoutHistory": "1"}
+            )
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("retry-after", "10"))
+                print(f"[Engagement Sync] 429 at {email}, backing off {retry_after}s")
+                await asyncio.sleep(retry_after)
+                resp = await client.get(
+                    f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                    headers={"X-Authorization": YMOVE_API_KEY},
+                    params={"email": email, "includeWorkoutHistory": "1"}
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                user = data.get("user") if isinstance(data, dict) else None
+                found = bool(data.get("found")) and isinstance(user, dict)
+                counts["found" if found else "not_found"] += 1
+                return (email, found, user)
+            elif resp.status_code == 404:
+                counts["not_found"] += 1
+            else:
+                counts["errors"] += 1
+                print(f"[Engagement Sync] HTTP {resp.status_code} for {email}")
+        except Exception as e:
+            counts["errors"] += 1
+            print(f"[Engagement Sync] Error for {email}: {e}")
+        return (email, False, None)
+
+    try:
+        # S36: batches of 20 concurrent lookups, per Tosh (Jul 17): "you can also do
+        # batches of x amount to speed it up, 20 is about same load as 1". A short
+        # breather between batches keeps this from degenerating into a firehose.
+        BATCH_SIZE = 20
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for start in range(0, len(emails), BATCH_SIZE):
+                if start > 0:
+                    await asyncio.sleep(1.0)  # pause between batches
+                chunk = emails[start:start + BATCH_SIZE]
+                results_chunk = await asyncio.gather(*[_fetch_one(client, em) for em in chunk])
                 async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """INSERT INTO ymove_engagement
-                           (email, batch, found, raw, programs_total, programs_active,
-                            active_program_ids, active_program_titles, all_program_titles,
-                            workout_count, last_workout_at, program_sessions_count,
-                            last_program_session_at, ymove_subscription_active)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
-                        email, batch, found,
-                        json.dumps(user) if found else None,
-                        ext["programs_total"], ext["programs_active"],
-                        ext["active_program_ids"], ext["active_program_titles"],
-                        ext["all_program_titles"], ext["workout_count"],
-                        ext["last_workout_at"], ext["program_sessions_count"],
-                        ext["last_program_session_at"], ext["ymove_subscription_active"],
-                    )
-                if (i + 1) % 25 == 0:
-                    async with db_pool.acquire() as conn:
+                    for email, found, user in results_chunk:
+                        ext = _s36_extract_engagement(user) if found else _s36_extract_engagement({})
                         await conn.execute(
-                            "UPDATE engagement_sync_runs SET progress_current = $1 WHERE id = $2",
-                            i + 1, run_id
+                            """INSERT INTO ymove_engagement
+                               (email, batch, found, raw, programs_total, programs_active,
+                                active_program_ids, active_program_titles, all_program_titles,
+                                workout_count, last_workout_at, program_sessions_count,
+                                last_program_session_at, ymove_subscription_active)
+                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                            email, batch, found,
+                            json.dumps(user) if found else None,
+                            ext["programs_total"], ext["programs_active"],
+                            ext["active_program_ids"], ext["active_program_titles"],
+                            ext["all_program_titles"], ext["workout_count"],
+                            ext["last_workout_at"], ext["program_sessions_count"],
+                            ext["last_program_session_at"], ext["ymove_subscription_active"],
                         )
+                    await conn.execute(
+                        "UPDATE engagement_sync_runs SET progress_current = $1 WHERE id = $2",
+                        min(start + BATCH_SIZE, len(emails)), run_id
+                    )
 
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         results = {**counts, "total": len(emails), "elapsed_seconds": round(elapsed, 1)}
@@ -14617,8 +14627,8 @@ async def engagement_sync_now(request: Request):
             "status": "dry_run",
             "scope": scope,
             "planned_members": len(emails),
-            "estimated_minutes": round(len(emails) * 2.1 / 60.0, 1),
-            "pace": "1 request/second, includeWorkoutHistory=1",
+            "estimated_minutes": round(len(emails) * 0.125 / 60.0, 1),
+            "pace": "batches of 20 concurrent lookups, ~1s between batches, includeWorkoutHistory=1 (batching OK'd by Tosh Jul 17)",
             "first_5": emails[:5],
             "note": "No ymove calls were made. Pass {confirm: true} without dry_run to execute.",
         }
@@ -14633,5 +14643,5 @@ async def engagement_sync_now(request: Request):
         "status": "started",
         "scope": scope,
         "limit": limit or "no cap",
-        "note": "Running in background at 1 req/sec. Poll /api/admin/engagement-sync-runs.",
+        "note": "Running in background in batches of 20. Poll /api/admin/engagement-sync-runs.",
     }
