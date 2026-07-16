@@ -627,6 +627,43 @@
       </div>
     </div>
 
+    <!-- S36 Phase 2: Retention by Program - joins latest ymove engagement snapshot
+         per member to subscription outcomes. Data source: /api/admin/program-insights -->
+    <div class="card" style="margin-bottom:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+        <div class="section-title" style="margin-bottom:0">Retention by Program</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)">All-time, per member's latest engagement snapshot. Click a column header to re-sort.</div>
+      </div>
+      <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
+        <table id="program-insights-table" style="width:100%;font-size:.84rem">
+          <thead>
+            <tr>
+              <th style="cursor:pointer" onclick="sortProgramInsights('program')">Program</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('followers')">Followers</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('trialing')">Trialing</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('paid_active')">Paid (Active)</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('trial_canceled')">Trial Canceled</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('paid_canceled')">Paid Canceled</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('conv_rate')">Conv Rate</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('paid_cancel_rate')">Paid Cancel Rate</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('avg_workouts')">Avg Workouts</th>
+              <th style="cursor:pointer;text-align:right" onclick="sortProgramInsights('avg_tenure_days')">Avg Tenure</th>
+            </tr>
+          </thead>
+          <tbody id="program-insights-tbody">
+            <tr><td colspan="10" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
+        Members count in every program they actively follow (shared attribution), so follower counts sum above the member total.
+        Conv Rate = Paid &divide; (Paid + Trial Canceled), resolved trials only. Paid Cancel Rate = Paid Canceled &divide; all Paid.
+        &ldquo;(No Program)&rdquo; = ymove-matched members following nothing; it is the comparison cohort.
+        Rows under 20 followers are dimmed &mdash; treat those rates as anecdote, not signal.
+        Some paid cancellations may appear as trial cancellations due to the known converted_at gap.
+      </div>
+    </div>
+
     <!-- S32: UTM Trend over time (cohort view) -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
@@ -1340,6 +1377,7 @@ function fmtDollars(cents) {
 }
 
 function loadStats() {
+  loadProgramInsights();  // S36: retention-by-program card refreshes alongside stats
   var statsUrl = '/api/admin/stats';
   var qp = [];
   var cpDays = window._channelPerfDays || 90;
@@ -2005,6 +2043,79 @@ function renderUtmTrendChart() {
     container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">No UTM-tagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' in this window. ' + (untaggedTotal > 0 ? untaggedTotal + ' untagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' (Apple/Google or pre-tracking).' : '') + '</div>';
     legend.innerHTML = '';
   }
+}
+
+// S36 Phase 2: Retention by Program - loader, sorter, renderer.
+var programInsightsData = null;
+var piSort = {key: 'followers', dir: -1};
+
+function piEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function loadProgramInsights() {
+  fetch('/api/admin/program-insights', {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    programInsightsData = d;
+    renderProgramInsights();
+  }).catch(function() {
+    var tb = document.getElementById('program-insights-tbody');
+    if (tb) tb.innerHTML = '<tr><td colspan="10" class="empty-msg">Could not load program insights.</td></tr>';
+  });
+}
+
+function sortProgramInsights(key) {
+  if (piSort.key === key) { piSort.dir = -piSort.dir; }
+  else { piSort.key = key; piSort.dir = (key === 'program') ? 1 : -1; }
+  renderProgramInsights();
+}
+
+function renderProgramInsights() {
+  var tb = document.getElementById('program-insights-tbody');
+  if (!tb || !programInsightsData) return;
+  var rows = (programInsightsData.programs || []).slice();
+  var k = piSort.key, dir = piSort.dir;
+  rows.sort(function(a, b) {
+    var av = a[k], bv = b[k];
+    if (av == null) av = -1; if (bv == null) bv = -1;
+    if (typeof av === 'string') { return av.localeCompare(bv) * dir; }
+    return (av - bv) * dir;
+  });
+  var pct = function(v) { return v == null ? '&mdash;' : v.toFixed(1) + '%'; };
+  var html = '';
+  var o = programInsightsData.overall;
+  if (o) {
+    html += '<tr style="font-weight:700;border-bottom:2px solid var(--navy-mid)">'
+      + '<td>' + piEsc(o.program) + '</td>'
+      + '<td style="text-align:right">' + o.followers + '</td>'
+      + '<td style="text-align:right">' + o.trialing + '</td>'
+      + '<td style="text-align:right">' + o.paid_active + '</td>'
+      + '<td style="text-align:right">' + o.trial_canceled + '</td>'
+      + '<td style="text-align:right">' + o.paid_canceled + '</td>'
+      + '<td style="text-align:right">' + pct(o.conv_rate) + '</td>'
+      + '<td style="text-align:right">' + pct(o.paid_cancel_rate) + '</td>'
+      + '<td style="text-align:right">' + o.avg_workouts + '</td>'
+      + '<td style="text-align:right">' + o.avg_tenure_days + 'd</td></tr>';
+  }
+  rows.forEach(function(p) {
+    var dim = p.small_sample ? ';opacity:.45' : '';
+    var noProg = p.program === '(No Program)' ? ';font-style:italic' : '';
+    html += '<tr style="border-bottom:1px solid #eef0f4' + dim + noProg + '">'
+      + '<td>' + piEsc(p.program) + (p.small_sample ? ' <span title="Under 20 followers: rates are anecdote, not signal">&#9888;</span>' : '') + '</td>'
+      + '<td style="text-align:right">' + p.followers + '</td>'
+      + '<td style="text-align:right">' + p.trialing + '</td>'
+      + '<td style="text-align:right">' + p.paid_active + '</td>'
+      + '<td style="text-align:right">' + p.trial_canceled + '</td>'
+      + '<td style="text-align:right">' + p.paid_canceled + '</td>'
+      + '<td style="text-align:right">' + pct(p.conv_rate) + '</td>'
+      + '<td style="text-align:right">' + pct(p.paid_cancel_rate) + '</td>'
+      + '<td style="text-align:right">' + p.avg_workouts + '</td>'
+      + '<td style="text-align:right">' + p.avg_tenure_days + 'd</td></tr>';
+  });
+  tb.innerHTML = html || '<tr><td colspan="10" class="empty-msg">No engagement data yet. Run the engagement sync first.</td></tr>';
 }
 
 // S32: Channel Performance Table renderer + sort handler.
