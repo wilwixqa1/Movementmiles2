@@ -14341,15 +14341,22 @@ def _s36_extract_engagement(user: dict) -> dict:
     }
 
 
-async def _s36_engagement_target_emails(limit: int = 0):
+async def _s36_engagement_target_emails(limit: int = 0, scope: str = "all"):
     """Distinct member emails, most recently created subscription first.
-    Includes canceled members: ymove returns full history for them, and churned
-    members are the point of the retention analysis."""
+    scope='all': every member ever, incl. canceled (one-time backfill; ymove
+    returns full history for canceled members, and churned members are the
+    point of the retention analysis).
+    scope='active': members with a currently active/trialing subscription only
+    (weekly re-sync; canceled members' engagement history is frozen, so it
+    never needs re-fetching)."""
+    where = "email IS NOT NULL AND email != ''"
+    if scope == "active":
+        where += " AND status IN ('active', 'trialing')"
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT lower(email) AS em, MAX(created_at) AS mc
+            f"""SELECT lower(email) AS em, MAX(created_at) AS mc
                FROM subscriptions
-               WHERE email IS NOT NULL AND email != ''
+               WHERE {where}
                GROUP BY lower(email)
                ORDER BY mc DESC"""
         )
@@ -14357,22 +14364,22 @@ async def _s36_engagement_target_emails(limit: int = 0):
     return emails[:limit] if limit and limit > 0 else emails
 
 
-async def run_engagement_sync(limit: int = 0, batch_label: str = ""):
+async def run_engagement_sync(limit: int = 0, batch_label: str = "", scope: str = "all"):
     """Paced full engagement sync. One ymove lookup per second with
     includeWorkoutHistory=1. Writes one ymove_engagement row per member."""
     if not YMOVE_API_KEY or not db_pool:
         print("[Engagement Sync] Skipped: missing YMOVE_API_KEY or database")
         return
 
-    batch = batch_label or f"s36_engagement_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
-    emails = await _s36_engagement_target_emails(limit)
+    batch = batch_label or f"s36_engagement_{scope}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+    emails = await _s36_engagement_target_emails(limit, scope)
 
     async with db_pool.acquire() as conn:
         run_id = await conn.fetchval(
             "INSERT INTO engagement_sync_runs (status, batch, progress_total) VALUES ('running', $1, $2) RETURNING id",
             batch, len(emails)
         )
-    print(f"[Engagement Sync] Run {run_id} starting: {len(emails)} members, batch={batch}")
+    print(f"[Engagement Sync] Run {run_id} starting: {len(emails)} members, scope={scope}, batch={batch}")
 
     counts = {"found": 0, "not_found": 0, "errors": 0}
     started = datetime.now(timezone.utc)
@@ -14455,8 +14462,9 @@ async def run_engagement_sync(limit: int = 0, batch_label: str = ""):
 
 
 async def run_weekly_engagement_sync():
-    """Scheduler wrapper: full-membership weekly run."""
-    await run_engagement_sync(limit=0, batch_label=f"s36_weekly_{datetime.now(timezone.utc).strftime('%Y%m%d')}")
+    """Scheduler wrapper: weekly re-sync of active/trialing members only.
+    Canceled members are covered by the one-time scope=all backfill."""
+    await run_engagement_sync(limit=0, batch_label=f"s36_weekly_{datetime.now(timezone.utc).strftime('%Y%m%d')}", scope="active")
 
 
 @app.post("/api/admin/engagement-sync-now")
@@ -14476,12 +14484,16 @@ async def engagement_sync_now(request: Request):
     except Exception:
         pass
     limit = int(body.get("limit") or 0)
+    scope = body.get("scope") or "all"
+    if scope not in ("all", "active"):
+        return JSONResponse(status_code=400, content={"error": "scope must be 'all' or 'active'"})
     if body.get("dry_run"):
-        emails = await _s36_engagement_target_emails(limit)
+        emails = await _s36_engagement_target_emails(limit, scope)
         return {
             "status": "dry_run",
+            "scope": scope,
             "planned_members": len(emails),
-            "estimated_minutes": round(len(emails) / 60.0, 1),
+            "estimated_minutes": round(len(emails) * 2.1 / 60.0, 1),
             "pace": "1 request/second, includeWorkoutHistory=1",
             "first_5": emails[:5],
             "note": "No ymove calls were made. Pass {confirm: true} without dry_run to execute.",
@@ -14492,9 +14504,10 @@ async def engagement_sync_now(request: Request):
         })
     if not YMOVE_API_KEY:
         return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
-    asyncio.create_task(run_engagement_sync(limit=limit))
+    asyncio.create_task(run_engagement_sync(limit=limit, scope=scope))
     return {
         "status": "started",
-        "limit": limit or "all members",
+        "scope": scope,
+        "limit": limit or "no cap",
         "note": "Running in background at 1 req/sec. Poll /api/admin/engagement-sync-runs.",
     }
