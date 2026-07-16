@@ -3146,11 +3146,16 @@ async def inspect_ymove_user(request: Request):
     if not YMOVE_API_KEY:
         return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    # S36: optional passthrough of includeWorkoutHistory (heavier for ymove -- use sparingly)
+    lookup_params = {"email": email}
+    if request.query_params.get("include_workouts") == "1":
+        lookup_params["includeWorkoutHistory"] = "1"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
             headers={"X-Authorization": YMOVE_API_KEY},
-            params={"email": email}
+            params=lookup_params
         )
         return {
             "email": email,
