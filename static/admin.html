@@ -632,7 +632,7 @@
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
         <div class="section-title" style="margin-bottom:0">Retention by Program</div>
-        <div style="font-size:.72rem;color:var(--navy-mid)">All-time, per member's latest engagement snapshot. Click a column header to re-sort.</div>
+        <div style="font-size:.72rem;color:var(--navy-mid)" id="program-insights-subtitle">Click a column header to re-sort.</div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
         <table id="program-insights-table" style="width:100%;font-size:.84rem">
@@ -656,7 +656,7 @@
         </table>
       </div>
       <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
-        Members count in every program they actively follow (shared attribution), so follower counts sum above the member total.
+        Canceled members keep the programs they had when they left. Members count in every program they actively follow (shared attribution), so follower counts sum above the member total.
         Conv Rate = Paid &divide; (Paid + Trial Canceled), resolved trials only. Paid Cancel Rate = Paid Canceled &divide; all Paid.
         &ldquo;(No Program)&rdquo; = ymove-matched members following nothing; it is the comparison cohort.
         Rows under 20 followers are dimmed &mdash; treat those rates as anecdote, not signal.
@@ -2076,6 +2076,13 @@ function sortProgramInsights(key) {
 function renderProgramInsights() {
   var tb = document.getElementById('program-insights-tbody');
   if (!tb || !programInsightsData) return;
+  var sub = document.getElementById('program-insights-subtitle');
+  if (sub) {
+    var dt = programInsightsData.last_synced_at ? programInsightsData.last_synced_at.slice(0, 10) : 'n/a';
+    sub.textContent = 'All ' + programInsightsData.members_included
+      + ' members past and present. Program data as of the last sync: ' + dt
+      + '. Click a column header to re-sort.';
+  }
   var rows = (programInsightsData.programs || []).slice();
   var k = piSort.key, dir = piSort.dir;
   rows.sort(function(a, b) {
