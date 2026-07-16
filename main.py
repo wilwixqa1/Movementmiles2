@@ -14200,6 +14200,130 @@ async def engagement_sample(request: Request):
     ]}
 
 
+@app.get("/api/admin/program-insights")
+async def program_insights(request: Request):
+    """S36 Phase 2: Retention by Program. Joins the LATEST engagement snapshot
+    per member to their LATEST subscription record, classifies each member's
+    outcome, and aggregates per followed program.
+
+    Outcome classification per member:
+      - trialing:        status active/trialing AND trial_end in the future
+      - paid_active:     status active/trialing AND trial past (proxy for paying;
+                         deliberately does NOT rely on converted_at, sidestepping
+                         the known converted_at gap for actives)
+      - paid_canceled:   canceled AND converted_at set
+      - trial_canceled:  canceled AND converted_at NULL (caveat: the converted_at
+                         gap miscategorizes some paid cancels as trial cancels)
+
+    Rates (resolved-only, consistent with Channel Performance):
+      conv_rate = paid / (paid + trial_canceled), paid = paid_active + paid_canceled
+      paid_cancel_rate = paid_canceled / paid
+
+    Attribution: a member counts toward every program in their latest snapshot's
+    active_program_titles (shared attribution). Members found in ymove with no
+    active program are aggregated under "(No Program)" as the comparison cohort.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH latest_eng AS (
+                SELECT DISTINCT ON (lower(email))
+                       lower(email) AS em, found, active_program_titles,
+                       workout_count, last_workout_at
+                FROM ymove_engagement
+                ORDER BY lower(email), fetched_at DESC
+            ),
+            latest_sub AS (
+                SELECT DISTINCT ON (lower(email))
+                       lower(email) AS em, status, trial_end, converted_at,
+                       created_at, canceled_at, effective_canceled_at,
+                       plan_interval, plan_amount, renewal_count
+                FROM subscriptions
+                WHERE email IS NOT NULL AND email != ''
+                ORDER BY lower(email), created_at DESC
+            )
+            SELECT e.em, e.active_program_titles, e.workout_count, e.last_workout_at,
+                   s.status, s.trial_end, s.converted_at, s.created_at,
+                   s.canceled_at, s.effective_canceled_at, s.renewal_count
+            FROM latest_eng e
+            JOIN latest_sub s ON s.em = e.em
+            WHERE e.found = TRUE
+            """
+        )
+
+    now = datetime.now(timezone.utc)
+
+    def classify(r):
+        status = (r["status"] or "").lower()
+        if status in ("active", "trialing"):
+            te = r["trial_end"]
+            if te and te > now:
+                return "trialing"
+            return "paid_active"
+        if status == "canceled":
+            return "paid_canceled" if r["converted_at"] else "trial_canceled"
+        return None
+
+    def agg_new():
+        return {"followers": 0, "trialing": 0, "paid_active": 0,
+                "paid_canceled": 0, "trial_canceled": 0,
+                "workouts_sum": 0, "tenure_days_sum": 0.0, "renewals_sum": 0}
+
+    programs = {}
+    total = agg_new()
+
+    for r in rows:
+        outcome = classify(r)
+        if outcome is None:
+            continue
+        end = r["effective_canceled_at"] or r["canceled_at"] or now
+        tenure = max((end - r["created_at"]).total_seconds() / 86400.0, 0.0) if r["created_at"] else 0.0
+        titles = [t for t in (r["active_program_titles"] or []) if t] or ["(No Program)"]
+        for key in set(titles) | {"__total__"}:
+            a = total if key == "__total__" else programs.setdefault(key, agg_new())
+            a["followers"] += 1
+            a[outcome] += 1
+            a["workouts_sum"] += r["workout_count"] or 0
+            a["tenure_days_sum"] += tenure
+            a["renewals_sum"] += r["renewal_count"] or 0
+
+    def finalize(name, a):
+        paid = a["paid_active"] + a["paid_canceled"]
+        resolved = paid + a["trial_canceled"]
+        return {
+            "program": name,
+            "followers": a["followers"],
+            "trialing": a["trialing"],
+            "paid_active": a["paid_active"],
+            "trial_canceled": a["trial_canceled"],
+            "paid_canceled": a["paid_canceled"],
+            "conv_rate": round(paid / resolved * 100, 1) if resolved else None,
+            "paid_cancel_rate": round(a["paid_canceled"] / paid * 100, 1) if paid else None,
+            "avg_workouts": round(a["workouts_sum"] / a["followers"], 1) if a["followers"] else 0,
+            "avg_tenure_days": round(a["tenure_days_sum"] / a["followers"]) if a["followers"] else 0,
+            "avg_renewals": round(a["renewals_sum"] / a["followers"], 1) if a["followers"] else 0,
+            "small_sample": a["followers"] < 20,
+        }
+
+    out = [finalize(n, a) for n, a in programs.items()]
+    out.sort(key=lambda x: -x["followers"])
+    return {
+        "members_included": total["followers"],
+        "overall": finalize("All ymove-matched members", total),
+        "programs": out,
+        "notes": [
+            "Attribution is shared: multi-program members count in each program they actively follow.",
+            "Conv Rate is resolved-only: paid / (paid + trial canceled); still-trialing members are excluded from the rate.",
+            "Rows under 20 followers are flagged; treat their rates as anecdote, not signal.",
+            "trial_canceled may include some paid cancellations due to the known converted_at gap.",
+        ],
+    }
+
+
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
