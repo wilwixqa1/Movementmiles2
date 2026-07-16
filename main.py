@@ -299,6 +299,45 @@ async def startup():
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                # S36: Program/workout engagement snapshots from ymove (includeWorkoutHistory=1).
+                # One row per member per sync run. Insights read only the latest row per
+                # member; raw JSONB preserved for future longitudinal analysis.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ymove_engagement (
+                        id SERIAL PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        fetched_at TIMESTAMPTZ DEFAULT NOW(),
+                        batch TEXT,
+                        found BOOLEAN DEFAULT FALSE,
+                        raw JSONB,
+                        programs_total INTEGER DEFAULT 0,
+                        programs_active INTEGER DEFAULT 0,
+                        active_program_ids TEXT[],
+                        active_program_titles TEXT[],
+                        all_program_titles TEXT[],
+                        workout_count INTEGER DEFAULT 0,
+                        last_workout_at TIMESTAMPTZ,
+                        program_sessions_count INTEGER DEFAULT 0,
+                        last_program_session_at TIMESTAMPTZ,
+                        ymove_subscription_active BOOLEAN
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS engagement_sync_runs (
+                        id SERIAL PRIMARY KEY,
+                        status TEXT DEFAULT 'running',
+                        started_at TIMESTAMPTZ DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ,
+                        batch TEXT,
+                        progress_current INTEGER DEFAULT 0,
+                        progress_total INTEGER DEFAULT 0,
+                        results JSONB,
+                        error TEXT
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ymove_engagement_email_fetched ON ymove_engagement (lower(email), fetched_at DESC)"
+                )
 
             # Block 3c: reactivated_at column + backfill (S23)
             async with db_pool.acquire() as conn:
@@ -373,6 +412,18 @@ async def startup():
                 id="daily_stats_snapshot",
                 replace_existing=True,
             )
+            # S36: Weekly program-engagement sync (includeWorkoutHistory=1 is heavier
+            # for ymove, per Tosh). Gated behind ENGAGEMENT_SYNC_ENABLED=1 so nothing
+            # runs automatically until the manual test run is verified and Tosh has
+            # confirmed the pace. Mondays 3:00 AM ET when enabled.
+            if YMOVE_API_KEY and os.environ.get("ENGAGEMENT_SYNC_ENABLED", "0") == "1":
+                scheduler.add_job(
+                    run_weekly_engagement_sync,
+                    CronTrigger(day_of_week="mon", hour=3, minute=0, timezone=et),
+                    id="weekly_engagement_sync",
+                    replace_existing=True,
+                )
+                print("Weekly engagement sync scheduled (Mon 3:00 AM ET)")
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
             print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg} + stats snapshot 9:15 AM ET)")
@@ -14186,3 +14237,262 @@ async def s35_cleanup_apple_orphans_jun30(request: Request):
                 ids
             )
     return {"status": "applied" if apply else "dry_run", "records_found": len(preview), "records": preview}
+
+
+# =============================================================================
+# S36: PROGRAM ENGAGEMENT SYNC (ymove includeWorkoutHistory=1)
+# Purpose: member x program -> outcome. Snapshots programFollowing / workoutHistory /
+# programSessions per member so retention/LTV by program can be computed by joining
+# the LATEST snapshot per member to our subscription outcomes.
+# Pace: strictly 1 request/second (gentler than shadow sync) because the flag is
+# heavier for ymove. Weekly schedule is env-gated off until verified with Tosh.
+# =============================================================================
+
+def _s36_parse_ts(val):
+    """Parse ymove ISO timestamps like 2026-07-15T17:30:24.000Z -> aware datetime."""
+    if not val or not isinstance(val, str):
+        return None
+    try:
+        return datetime.fromisoformat(val.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _s36_extract_engagement(user: dict) -> dict:
+    """Extract queryable columns from a ymove member payload (with workout history)."""
+    pf = user.get("programFollowing") or []
+    wh = user.get("workoutHistory") or []
+    ps = user.get("programSessions") or []
+    active = [p for p in pf if p.get("active")]
+    workout_ts = [t for t in (_s36_parse_ts(w.get("createdAt")) for w in wh) if t]
+    session_ts = [t for t in (_s36_parse_ts(s.get("createdAt")) for s in ps) if t]
+    return {
+        "programs_total": len(pf),
+        "programs_active": len(active),
+        "active_program_ids": [str(p.get("programId") or "") for p in active],
+        "active_program_titles": [(p.get("title") or "").strip() for p in active],
+        "all_program_titles": [(p.get("title") or "").strip() for p in pf],
+        "workout_count": len(wh),
+        "last_workout_at": max(workout_ts) if workout_ts else None,
+        "program_sessions_count": len(ps),
+        "last_program_session_at": max(session_ts) if session_ts else None,
+        "ymove_subscription_active": bool(user.get("activeSubscription")),
+    }
+
+
+async def _s36_engagement_target_emails(limit: int = 0):
+    """Distinct member emails, most recently created subscription first.
+    Includes canceled members: ymove returns full history for them, and churned
+    members are the point of the retention analysis."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT lower(email) AS em, MAX(created_at) AS mc
+               FROM subscriptions
+               WHERE email IS NOT NULL AND email != ''
+               GROUP BY lower(email)
+               ORDER BY mc DESC"""
+        )
+    emails = [r["em"] for r in rows]
+    return emails[:limit] if limit and limit > 0 else emails
+
+
+async def run_engagement_sync(limit: int = 0, batch_label: str = ""):
+    """Paced full engagement sync. One ymove lookup per second with
+    includeWorkoutHistory=1. Writes one ymove_engagement row per member."""
+    if not YMOVE_API_KEY or not db_pool:
+        print("[Engagement Sync] Skipped: missing YMOVE_API_KEY or database")
+        return
+
+    batch = batch_label or f"s36_engagement_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+    emails = await _s36_engagement_target_emails(limit)
+
+    async with db_pool.acquire() as conn:
+        run_id = await conn.fetchval(
+            "INSERT INTO engagement_sync_runs (status, batch, progress_total) VALUES ('running', $1, $2) RETURNING id",
+            batch, len(emails)
+        )
+    print(f"[Engagement Sync] Run {run_id} starting: {len(emails)} members, batch={batch}")
+
+    counts = {"found": 0, "not_found": 0, "errors": 0}
+    started = datetime.now(timezone.utc)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for i, email in enumerate(emails):
+                if i > 0:
+                    await asyncio.sleep(1.0)  # strict 1 req/sec pace
+                found = False
+                user = None
+                try:
+                    resp = await client.get(
+                        f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                        headers={"X-Authorization": YMOVE_API_KEY},
+                        params={"email": email, "includeWorkoutHistory": "1"}
+                    )
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "10"))
+                        print(f"[Engagement Sync] 429 at {email}, backing off {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        resp = await client.get(
+                            f"{YMOVE_API_BASE}/api/site/{YMOVE_SITE_ID}/member-lookup",
+                            headers={"X-Authorization": YMOVE_API_KEY},
+                            params={"email": email, "includeWorkoutHistory": "1"}
+                        )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        user = data.get("user") if isinstance(data, dict) else None
+                        found = bool(data.get("found")) and isinstance(user, dict)
+                        counts["found" if found else "not_found"] += 1
+                    elif resp.status_code == 404:
+                        counts["not_found"] += 1
+                    else:
+                        counts["errors"] += 1
+                        print(f"[Engagement Sync] HTTP {resp.status_code} for {email}")
+                except Exception as e:
+                    counts["errors"] += 1
+                    print(f"[Engagement Sync] Error for {email}: {e}")
+
+                ext = _s36_extract_engagement(user) if found else _s36_extract_engagement({})
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO ymove_engagement
+                           (email, batch, found, raw, programs_total, programs_active,
+                            active_program_ids, active_program_titles, all_program_titles,
+                            workout_count, last_workout_at, program_sessions_count,
+                            last_program_session_at, ymove_subscription_active)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                        email, batch, found,
+                        json.dumps(user) if found else None,
+                        ext["programs_total"], ext["programs_active"],
+                        ext["active_program_ids"], ext["active_program_titles"],
+                        ext["all_program_titles"], ext["workout_count"],
+                        ext["last_workout_at"], ext["program_sessions_count"],
+                        ext["last_program_session_at"], ext["ymove_subscription_active"],
+                    )
+                if (i + 1) % 25 == 0:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE engagement_sync_runs SET progress_current = $1 WHERE id = $2",
+                            i + 1, run_id
+                        )
+
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        results = {**counts, "total": len(emails), "elapsed_seconds": round(elapsed, 1)}
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE engagement_sync_runs SET status = 'completed', completed_at = NOW(),
+                   progress_current = $1, results = $2 WHERE id = $3""",
+                len(emails), json.dumps(results), run_id
+            )
+        print(f"[Engagement Sync] Run {run_id} completed: {results}")
+    except Exception as e:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE engagement_sync_runs SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2",
+                str(e)[:500], run_id
+            )
+        print(f"[Engagement Sync] Run {run_id} FAILED: {e}")
+
+
+async def run_weekly_engagement_sync():
+    """Scheduler wrapper: full-membership weekly run."""
+    await run_engagement_sync(limit=0, batch_label=f"s36_weekly_{datetime.now(timezone.utc).strftime('%Y%m%d')}")
+
+
+@app.post("/api/admin/engagement-sync-now")
+async def engagement_sync_now(request: Request):
+    """S36: Trigger a program-engagement sync.
+    Body: {confirm: true, limit: 25, dry_run: true}
+    - dry_run: makes ZERO ymove calls; reports planned volume and duration.
+    - limit: cap members for a small test slice (0 = all members).
+    Poll /api/admin/engagement-sync-runs for progress."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    limit = int(body.get("limit") or 0)
+    if body.get("dry_run"):
+        emails = await _s36_engagement_target_emails(limit)
+        return {
+            "status": "dry_run",
+            "planned_members": len(emails),
+            "estimated_minutes": round(len(emails) / 60.0, 1),
+            "pace": "1 request/second, includeWorkoutHistory=1",
+            "first_5": emails[:5],
+            "note": "No ymove calls were made. Pass {confirm: true} without dry_run to execute.",
+        }
+    if not body.get("confirm"):
+        return JSONResponse(status_code=400, content={
+            "error": "Pass {confirm: true} to execute, or {dry_run: true} to preview. This calls ymove with the heavy workout-history flag."
+        })
+    if not YMOVE_API_KEY:
+        return JSONResponse(status_code=500, content={"error": "YMOVE_API_KEY not set"})
+    asyncio.create_task(run_engagement_sync(limit=limit))
+    return {
+        "status": "started",
+        "limit": limit or "all members",
+        "note": "Running in background at 1 req/sec. Poll /api/admin/engagement-sync-runs.",
+    }
+
+
+@app.get("/api/admin/engagement-sync-runs")
+async def engagement_sync_runs_list(request: Request):
+    """S36: Recent engagement sync runs with progress and results."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, status, started_at, completed_at, batch,
+                      progress_current, progress_total, results, error
+               FROM engagement_sync_runs ORDER BY started_at DESC LIMIT 10"""
+        )
+    return {"runs": [
+        {
+            "id": r["id"], "status": r["status"], "batch": r["batch"],
+            "started_at": str(r["started_at"]), "completed_at": str(r["completed_at"]) if r["completed_at"] else None,
+            "progress": f"{r['progress_current']}/{r['progress_total']}",
+            "results": json.loads(r["results"]) if r["results"] else None,
+            "error": r["error"],
+        } for r in rows
+    ]}
+
+
+@app.get("/api/admin/engagement-sample")
+async def engagement_sample(request: Request):
+    """S36: Latest engagement snapshot per member (newest members first) for
+    visual verification after a sync run. Excludes raw JSONB for readability."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    try:
+        limit = min(int(request.query_params.get("limit", "15")), 100)
+    except Exception:
+        limit = 15
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT ON (lower(email))
+                      email, fetched_at, batch, found, programs_total, programs_active,
+                      active_program_titles, workout_count, last_workout_at,
+                      program_sessions_count, ymove_subscription_active
+               FROM ymove_engagement
+               ORDER BY lower(email), fetched_at DESC"""
+        )
+    rows = sorted(rows, key=lambda r: r["fetched_at"], reverse=True)[:limit]
+    return {"count": len(rows), "members": [
+        {
+            "email": r["email"], "fetched_at": str(r["fetched_at"]), "batch": r["batch"],
+            "found": r["found"], "programs": f"{r['programs_active']} active / {r['programs_total']} total",
+            "active_program_titles": r["active_program_titles"],
+            "workout_count": r["workout_count"],
+            "last_workout_at": str(r["last_workout_at"]) if r["last_workout_at"] else None,
+            "program_sessions": r["program_sessions_count"],
+            "ymove_says_active": r["ymove_subscription_active"],
+        } for r in rows
+    ]}
