@@ -1,0 +1,105 @@
+S36 HANDOFF -- PROGRAM ENGAGEMENT & RETENTION BY PROGRAM
+Sessions: July 16-17, 2026
+Prev: docs/s35/handoff.txt
+
+== WHAT S36 BUILT ==
+
+Context: Tosh email (Jul 10) exposed workout history / program sessions /
+program following on ymove member-lookup via includeWorkoutHistory=1. Meg and
+Ahmed want LTV and cancellation rate by program. Tosh confirmed (Jul 13)
+current query load is fine; (Jul 17) batches of 20 are same load as 1, and
+includeWorkoutHistory is REQUIRED for programFollowing (no cheap-call option).
+
+1. ENGAGEMENT SYNC (backend)
+   - Table ymove_engagement: one row per member per sync run. raw JSONB keeps
+     the full ymove user payload; extracted columns for querying (programs
+     total/active, active_program_ids/titles, workout_count, last_workout_at,
+     program_sessions_count, ymove_subscription_active).
+   - Design rule: insights read ONLY the latest row per member (Will's call:
+     older snapshots would over-represent abandoned programs; raw history is
+     stored but never aggregated).
+   - Table engagement_sync_runs: run log w/ progress, results, errors.
+   - run_engagement_sync(limit, batch_label, scope):
+       scope='all'    -> every member ever (one-time backfill, DONE, never again)
+       scope='active' -> active/trialing only (weekly; canceled members'
+                         history is frozen so re-fetching is pointless)
+   - Batched: 20 concurrent lookups per batch, ~1s between batches, one 429
+     retry per request (Tosh OK'd Jul 17). Was 1 req/sec sequential.
+   - Endpoints:
+       POST /api/admin/engagement-sync-now  {confirm|dry_run, limit, scope}
+            dry_run makes ZERO ymove calls.
+       GET  /api/admin/engagement-sync-runs
+       GET  /api/admin/engagement-sample?limit=N
+   - Weekly schedule: Mon 3:00 AM ET, scope=active (~2,006 members, ~4 min
+     batched). GATED behind Railway env ENGAGEMENT_SYNC_ENABLED=1.
+     STATUS AT HANDOFF: flag not yet set -- Will to arm it.
+
+2. BACKFILL (completed Jul 16, run id 2, batch s36_engagement_all_20260716_0521)
+   7,929 members processed / 7,245 found / 684 not_found / 0 errors / 4h39m.
+   684 not_found = old imports ymove has no record of (~8.6%).
+
+3. RETENTION BY PROGRAM (dashboard card, below Channel Performance)
+   - GET /api/admin/program-insights. Latest engagement row per member JOIN
+     latest subscription per member (email lowercased both sides).
+   - Outcome classes: trialing / paid_active (active + trial past, deliberately
+     ignores converted_at) / paid_canceled (converted_at set) / trial_canceled.
+   - Conv Rate = paid/(paid+trial_canceled) resolved-only; Paid Cancel Rate =
+     paid_canceled/paid. Shared attribution across a member's active programs.
+     "(No Program)" = ymove-found members following nothing (comparison cohort).
+   - Rows <20 followers dimmed w/ warning glyph. Overall baseline row pinned.
+   - Subtitle shows live member count + last sync date from the API.
+
+== FIRST FINDINGS (Jul 16 data) ==
+   - Program followers convert 52-58% vs 42.5% for (No Program); avg workouts
+     27+ vs 6.9; tenure ~200-250d vs 139d. Correlation, not causation.
+   - ITBS/Knee Pain best paid retention (50.1% paid cancel); Intermediate
+     Prehab worst (69.6%).
+   - Conv rates UNDERSTATED table-wide by the converted_at gap (see below).
+
+== SIDE FINDINGS ==
+   - mm_lp landing page tracking CONFIRMED WORKING (S35 Priority 3 closed).
+     New signups carry mm_lp + full UTM chain incl. utm_id, fbclid.
+   - ymove individual member-lookup returns FULL data for canceled/expired
+     members, and even for members the bulk diff reports "only in ours"
+     (listing endpoint only returns actives). Reframes ymove-diff semantics
+     AND the not_found handling debate (S35 issue 9g).
+   - Future-dated subs (issue 9e) explained: jgrant444 created 2026-12-31 in
+     our DB vs ymove signupDate 2025-12-31. Year-off parse error on import.
+   - Jul 15 digest "1 verify error" = single transient lookup failure in
+     shadow sync run 117; no action taken on the member; self-heals next run.
+     Only investigate if it recurs daily.
+
+== LANDMINES LEARNED ==
+   - ROUTE ORDER: @app.get("/{path:path}") catch-all at ~line 14200 serves the
+     marketing site. Any GET endpoint defined AFTER it in main.py is silently
+     swallowed (200 + HTML). POSTs unaffected. Register new GETs BEFORE it.
+   - Deploy verification must check RESPONSE BODY, not status code (catch-all
+     returns 200 for everything).
+   - NO GIT PUSH WHILE A SYNC IS RUNNING: Railway redeploys on push and kills
+     the background task. Corollary: a push IS the emergency stop for a
+     runaway sync (no cancel endpoint exists).
+   - inspect-ymove-user queries ymove for any non-empty email -- don't use it
+     as a health check. Use /api/admin/stats.
+
+== CHANNEL PERF / CHART NOTES (from Will's questions) ==
+   - Landing-page grouped conversions are structurally zero until ~Jul 30
+     (mm_lp live Jun 30 + 30-day trial). First real read mid-August.
+   - BUG (S37): trend-chart footnote says "194 untagged paid conversions" then
+     itemizes 589+223+46=858. Two different windows jammed in one sentence.
+
+== S37 PRIORITIES ==
+   1. converted_at backfill (S35 Priority 1, now user-visible: suppresses
+      Retention-by-Program conv rates). 397+ subs missing converted_at.
+   2. Arm weekly sync: Railway ENGAGEMENT_SYNC_ENABLED=1 (after Will confirms
+      Tosh reply sent / no objection).
+   3. Footnote math bug above.
+   4. Phase 3 candidates: ghost-follower early warning (trialists with 0
+      workouts by day 14), digest line for best-retaining program, CSV export
+      for Retention by Program.
+   5. Still open from S35: effective_canceled_at investigation (284 NULLs),
+      not_found 3-strike deactivation (now informed by the lookup-vs-listing
+      finding), passwords to Railway env, 82 expired-but-active subs.
+
+== BILLING NOTE ==
+   S36 spanned two working sessions (Jul 16 overnight + Jul 17). Hours TBD by
+   Will for the July invoice.
