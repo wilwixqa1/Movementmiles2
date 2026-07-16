@@ -14139,6 +14139,67 @@ async def root():
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# S36: registered BEFORE the marketing-site catch-all below, otherwise
+# @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
+@app.get("/api/admin/engagement-sync-runs")
+async def engagement_sync_runs_list(request: Request):
+    """S36: Recent engagement sync runs with progress and results."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, status, started_at, completed_at, batch,
+                      progress_current, progress_total, results, error
+               FROM engagement_sync_runs ORDER BY started_at DESC LIMIT 10"""
+        )
+    return {"runs": [
+        {
+            "id": r["id"], "status": r["status"], "batch": r["batch"],
+            "started_at": str(r["started_at"]), "completed_at": str(r["completed_at"]) if r["completed_at"] else None,
+            "progress": f"{r['progress_current']}/{r['progress_total']}",
+            "results": json.loads(r["results"]) if r["results"] else None,
+            "error": r["error"],
+        } for r in rows
+    ]}
+
+
+@app.get("/api/admin/engagement-sample")
+async def engagement_sample(request: Request):
+    """S36: Latest engagement snapshot per member (newest members first) for
+    visual verification after a sync run. Excludes raw JSONB for readability."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    try:
+        limit = min(int(request.query_params.get("limit", "15")), 100)
+    except Exception:
+        limit = 15
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT ON (lower(email))
+                      email, fetched_at, batch, found, programs_total, programs_active,
+                      active_program_titles, workout_count, last_workout_at,
+                      program_sessions_count, ymove_subscription_active
+               FROM ymove_engagement
+               ORDER BY lower(email), fetched_at DESC"""
+        )
+    rows = sorted(rows, key=lambda r: r["fetched_at"], reverse=True)[:limit]
+    return {"count": len(rows), "members": [
+        {
+            "email": r["email"], "fetched_at": str(r["fetched_at"]), "batch": r["batch"],
+            "found": r["found"], "programs": f"{r['programs_active']} active / {r['programs_total']} total",
+            "active_program_titles": r["active_program_titles"],
+            "workout_count": r["workout_count"],
+            "last_workout_at": str(r["last_workout_at"]) if r["last_workout_at"] else None,
+            "program_sessions": r["program_sessions_count"],
+            "ymove_says_active": r["ymove_subscription_active"],
+        } for r in rows
+    ]}
+
+
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
@@ -14437,62 +14498,3 @@ async def engagement_sync_now(request: Request):
         "limit": limit or "all members",
         "note": "Running in background at 1 req/sec. Poll /api/admin/engagement-sync-runs.",
     }
-
-
-@app.get("/api/admin/engagement-sync-runs")
-async def engagement_sync_runs_list(request: Request):
-    """S36: Recent engagement sync runs with progress and results."""
-    pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="No database")
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT id, status, started_at, completed_at, batch,
-                      progress_current, progress_total, results, error
-               FROM engagement_sync_runs ORDER BY started_at DESC LIMIT 10"""
-        )
-    return {"runs": [
-        {
-            "id": r["id"], "status": r["status"], "batch": r["batch"],
-            "started_at": str(r["started_at"]), "completed_at": str(r["completed_at"]) if r["completed_at"] else None,
-            "progress": f"{r['progress_current']}/{r['progress_total']}",
-            "results": json.loads(r["results"]) if r["results"] else None,
-            "error": r["error"],
-        } for r in rows
-    ]}
-
-
-@app.get("/api/admin/engagement-sample")
-async def engagement_sample(request: Request):
-    """S36: Latest engagement snapshot per member (newest members first) for
-    visual verification after a sync run. Excludes raw JSONB for readability."""
-    pw = request.headers.get("X-Admin-Password", "")
-    require_admin(pw)
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="No database")
-    try:
-        limit = min(int(request.query_params.get("limit", "15")), 100)
-    except Exception:
-        limit = 15
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT DISTINCT ON (lower(email))
-                      email, fetched_at, batch, found, programs_total, programs_active,
-                      active_program_titles, workout_count, last_workout_at,
-                      program_sessions_count, ymove_subscription_active
-               FROM ymove_engagement
-               ORDER BY lower(email), fetched_at DESC"""
-        )
-    rows = sorted(rows, key=lambda r: r["fetched_at"], reverse=True)[:limit]
-    return {"count": len(rows), "members": [
-        {
-            "email": r["email"], "fetched_at": str(r["fetched_at"]), "batch": r["batch"],
-            "found": r["found"], "programs": f"{r['programs_active']} active / {r['programs_total']} total",
-            "active_program_titles": r["active_program_titles"],
-            "workout_count": r["workout_count"],
-            "last_workout_at": str(r["last_workout_at"]) if r["last_workout_at"] else None,
-            "program_sessions": r["program_sessions_count"],
-            "ymove_says_active": r["ymove_subscription_active"],
-        } for r in rows
-    ]}
