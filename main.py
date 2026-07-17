@@ -14326,6 +14326,178 @@ async def program_insights(request: Request):
     }
 
 
+@app.get("/api/admin/activation-insights")
+async def activation_insights(request: Request):
+    """S36 Phase 3: Activation threshold analysis (Ahmed's request, Jul 17).
+
+    Buckets members by workouts completed and shows conversion/retention per
+    bucket, across four windows ANCHORED TO EACH MEMBER'S SIGNUP: first 30d,
+    first 60d, first 90d, and lifetime. Signup anchoring (not calendar
+    windows) keeps churned members comparable to actives, which is the whole
+    point: how much EARLY activity predicts commitment.
+
+    Eligibility per window:
+      - Full window must have elapsed (created_at <= now - W days), so every
+        included member had equal opportunity. Lifetime includes everyone.
+      - ymove caps workoutHistory at the 50 most recent. If a member is capped
+        AND their oldest visible workout is after signup, their early workouts
+        may have scrolled out of the window -> excluded from windowed views
+        (counted in excluded_history_capped). Lifetime view: capped members
+        are included; their count is a floor (>=50 -> the 50+ bucket, which is
+        exactly where they belong).
+
+    Also returns workouts-at-cancellation distribution: canceled members
+    bucketed by lifetime workouts at the time they left (snapshots of canceled
+    members are frozen at their final state), split trial vs paid cancels.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    async with db_pool.acquire() as conn:
+        last_synced_at = await conn.fetchval("SELECT MAX(fetched_at) FROM ymove_engagement")
+        rows = await conn.fetch(
+            """
+            WITH latest_eng AS (
+                SELECT DISTINCT ON (lower(email))
+                       lower(email) AS em, found, workout_count,
+                       (SELECT array_agg(w->>'createdAt')
+                        FROM jsonb_array_elements(COALESCE(raw->'workoutHistory', '[]'::jsonb)) w) AS workout_ts
+                FROM ymove_engagement
+                ORDER BY lower(email), fetched_at DESC
+            ),
+            latest_sub AS (
+                SELECT DISTINCT ON (lower(email))
+                       lower(email) AS em, status, trial_end, converted_at,
+                       created_at, canceled_at, effective_canceled_at
+                FROM subscriptions
+                WHERE email IS NOT NULL AND email != ''
+                ORDER BY lower(email), created_at DESC
+            )
+            SELECT e.em, e.workout_count, e.workout_ts,
+                   s.status, s.trial_end, s.converted_at, s.created_at,
+                   s.canceled_at, s.effective_canceled_at
+            FROM latest_eng e
+            JOIN latest_sub s ON s.em = e.em
+            WHERE e.found = TRUE
+            """
+        )
+
+    now = datetime.now(timezone.utc)
+    BUCKETS = [(0, 0, "0"), (1, 2, "1-2"), (3, 5, "3-5"), (6, 9, "6-9"),
+               (10, 14, "10-14"), (15, 24, "15-24"), (25, 49, "25-49"),
+               (50, None, "50+")]
+
+    def bucket_label(n):
+        for lo, hi, label in BUCKETS:
+            if n >= lo and (hi is None or n <= hi):
+                return label
+        return "50+"
+
+    def classify(r):
+        status = (r["status"] or "").lower()
+        if status in ("active", "trialing"):
+            te = r["trial_end"]
+            return "trialing" if (te and te > now) else "paid_active"
+        if status == "canceled":
+            return "paid_canceled" if r["converted_at"] else "trial_canceled"
+        return None
+
+    # Pre-parse each member once
+    members = []
+    for r in rows:
+        outcome = classify(r)
+        if outcome is None or not r["created_at"]:
+            continue
+        ts = sorted(t for t in (_s36_parse_ts(x) for x in (r["workout_ts"] or [])) if t)
+        end = r["effective_canceled_at"] or r["canceled_at"] or now
+        tenure = max((end - r["created_at"]).total_seconds() / 86400.0, 0.0)
+        members.append({
+            "outcome": outcome,
+            "created_at": r["created_at"],
+            "wo_total": r["workout_count"] or 0,
+            "wo_ts": ts,
+            "capped": (r["workout_count"] or 0) >= 50,
+            "tenure": tenure,
+        })
+
+    def agg_new():
+        return {"members": 0, "trialing": 0, "paid_active": 0,
+                "paid_canceled": 0, "trial_canceled": 0, "tenure_sum": 0.0}
+
+    def finalize_bucket(label, a):
+        paid = a["paid_active"] + a["paid_canceled"]
+        resolved = paid + a["trial_canceled"]
+        return {
+            "bucket": label,
+            "members": a["members"],
+            "trialing": a["trialing"],
+            "paid_active": a["paid_active"],
+            "trial_canceled": a["trial_canceled"],
+            "paid_canceled": a["paid_canceled"],
+            "conv_rate": round(paid / resolved * 100, 1) if resolved else None,
+            "paid_cancel_rate": round(a["paid_canceled"] / paid * 100, 1) if paid else None,
+            "still_active_pct": round((a["trialing"] + a["paid_active"]) / a["members"] * 100, 1) if a["members"] else None,
+            "avg_tenure_days": round(a["tenure_sum"] / a["members"]) if a["members"] else 0,
+            "small_sample": a["members"] < 20,
+        }
+
+    windows = {}
+    for wname, wdays in (("30", 30), ("60", 60), ("90", 90), ("lifetime", None)):
+        buckets = {label: agg_new() for _, _, label in BUCKETS}
+        excluded_capped = 0
+        excluded_young = 0
+        included = 0
+        for m in members:
+            if wdays is not None:
+                if (now - m["created_at"]).days < wdays:
+                    excluded_young += 1
+                    continue
+                # capped history that doesn't reach back to signup -> early count unknowable
+                if m["capped"] and (not m["wo_ts"] or m["wo_ts"][0] > m["created_at"]):
+                    excluded_capped += 1
+                    continue
+                cutoff = m["created_at"] + timedelta(days=wdays)
+                n = sum(1 for t in m["wo_ts"] if t < cutoff)
+            else:
+                n = m["wo_total"]
+            a = buckets[bucket_label(n)]
+            a["members"] += 1
+            a[m["outcome"]] += 1
+            a["tenure_sum"] += m["tenure"]
+            included += 1
+        windows[wname] = {
+            "included": included,
+            "excluded_history_capped": excluded_capped,
+            "excluded_window_not_elapsed": excluded_young,
+            "buckets": [finalize_bucket(label, buckets[label]) for _, _, label in BUCKETS],
+        }
+
+    # Workouts at cancellation: canceled members' snapshots are frozen at exit
+    cxl = {label: {"trial_canceled": 0, "paid_canceled": 0} for _, _, label in BUCKETS}
+    for m in members:
+        if m["outcome"] in ("trial_canceled", "paid_canceled"):
+            cxl[bucket_label(m["wo_total"])][m["outcome"]] += 1
+    cancellation_distribution = [
+        {"bucket": label, **cxl[label], "total": cxl[label]["trial_canceled"] + cxl[label]["paid_canceled"]}
+        for _, _, label in BUCKETS
+    ]
+
+    return {
+        "members_matched": len(members),
+        "last_synced_at": str(last_synced_at) if last_synced_at else None,
+        "windows": windows,
+        "cancellation_distribution": cancellation_distribution,
+        "notes": [
+            "Windows are anchored to each member's signup date, not the calendar: 'First 30d' counts workouts in that member's first 30 days.",
+            "Windowed views exclude members whose full window has not elapsed yet, and capped members (50 visible workouts) whose history no longer reaches back to signup.",
+            "Lifetime includes everyone; capped members' counts are a floor and land in 50+ where they belong.",
+            "The weekly sync captures new members' trials completely from Jul 2026 onward, so windowed exclusions shrink over time.",
+            "Correlation, not causation: early workouts partly reveal motivated members rather than create commitment.",
+        ],
+    }
+
+
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
