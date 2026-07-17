@@ -2094,6 +2094,14 @@ function renderUtmTrendChart() {
 }
 
 // S36 Phase 3: Activation threshold card - loader + window toggle + renderer.
+function actBar(valueHtml, fillPct) {
+  return '<div style="display:flex;align-items:center;justify-content:flex-end;gap:8px">'
+    + '<span style="display:inline-block;width:72px;height:8px;border-radius:4px;background:#eef0f4;overflow:hidden;flex:none">'
+    + '<span style="display:block;height:100%;width:' + fillPct + '%;border-radius:4px;background:var(--navy-mid, #1f3a5f)"></span>'
+    + '</span><span style="min-width:52px;text-align:right">' + valueHtml + '</span></div>';
+}
+
+
 var activationData = null;
 var activationWindow = '30';
 
@@ -2141,7 +2149,7 @@ function renderActivationInsights() {
     html += '<tr style="border-bottom:1px solid #eef0f4' + dim + '">'
       + '<td>' + b.bucket + (b.small_sample ? ' <span title="Under 20 members: anecdote, not signal">&#9888;</span>' : '') + '</td>'
       + '<td style="text-align:right">' + b.members + '</td>'
-      + '<td style="text-align:right;background:linear-gradient(90deg, rgba(31,58,95,.14) ' + barW + '%, transparent ' + barW + '%)">' + pct(b.conv_rate) + '</td>'
+      + '<td>' + actBar(pct(b.conv_rate), barW) + '</td>'
       + '<td style="text-align:right">' + pct(b.paid_cancel_rate) + '</td>'
       + '<td style="text-align:right">' + pct(b.still_active_pct) + '</td>'
       + '<td style="text-align:right">' + b.avg_tenure_days + 'd</td></tr>';
@@ -2159,7 +2167,7 @@ function renderActivationInsights() {
         + '<td>' + b.bucket + '</td>'
         + '<td style="text-align:right">' + b.trial_canceled + '</td>'
         + '<td style="text-align:right">' + b.paid_canceled + '</td>'
-        + '<td style="text-align:right;background:linear-gradient(90deg, rgba(31,58,95,.14) ' + barW + '%, transparent ' + barW + '%)">' + b.total + '</td></tr>';
+        + '<td>' + actBar(String(b.total), barW) + '</td></tr>';
     });
     ctb.innerHTML = chtml;
   }
