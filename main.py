@@ -338,6 +338,27 @@ async def startup():
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ymove_engagement_email_fetched ON ymove_engagement (lower(email), fetched_at DESC)"
                 )
+                # S36: Deduped lifetime workout accumulator. ymove caps workoutHistory
+                # at the 50 most recent; weekly overlapping snapshots + UNIQUE(entry_id)
+                # reconstruct complete histories over time. Feeds the future
+                # intensity (workouts/week) -> LTV / retention table. Cold storage:
+                # no dashboard reads from this yet.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS member_workouts (
+                        id SERIAL PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        entry_id TEXT NOT NULL UNIQUE,
+                        workout_id TEXT,
+                        title TEXT,
+                        categories TEXT[],
+                        workout_at TIMESTAMPTZ,
+                        first_seen_batch TEXT,
+                        ingested_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_member_workouts_email_at ON member_workouts (lower(email), workout_at)"
+                )
 
             # Block 3c: reactivated_at column + backfill (S23)
             async with db_pool.acquire() as conn:
@@ -14498,6 +14519,39 @@ async def activation_insights(request: Request):
     }
 
 
+@app.post("/api/admin/seed-member-workouts")
+async def seed_member_workouts(request: Request):
+    """S36: One-time retroactive seed of the member_workouts accumulator from
+    ALL stored engagement snapshots (raw payloads were kept from day one, so
+    the accumulator can be built as if it had always existed). Re-running is
+    harmless: UNIQUE(entry_id) makes duplicate ingestion a no-op. DB-only,
+    zero ymove calls. Body: {confirm: true}"""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    if not body.get("confirm"):
+        return JSONResponse(status_code=400, content={"error": "Pass {confirm: true}. DB-only; makes no ymove calls."})
+    async with db_pool.acquire() as conn:
+        snaps = await conn.fetch(
+            "SELECT email, batch, raw FROM ymove_engagement WHERE found = TRUE AND raw IS NOT NULL ORDER BY fetched_at ASC"
+        )
+        added = 0
+        for s in snaps:
+            raw = s["raw"]
+            user = json.loads(raw) if isinstance(raw, str) else raw
+            added += await _s36_ingest_workouts(conn, s["email"], user, s["batch"] or "seed")
+        total = await conn.fetchval("SELECT COUNT(*) FROM member_workouts")
+        members = await conn.fetchval("SELECT COUNT(DISTINCT lower(email)) FROM member_workouts")
+    return {"snapshots_replayed": len(snaps), "workouts_added": added,
+            "accumulator_total": total, "distinct_members": members}
+
+
 @app.get("/{path:path}")
 async def catch_all(path: str):
     return FileResponse("static/index.html")
@@ -14662,6 +14716,29 @@ async def _s36_engagement_target_emails(limit: int = 0, scope: str = "all"):
     return emails[:limit] if limit and limit > 0 else emails
 
 
+async def _s36_ingest_workouts(conn, email: str, user: dict, batch: str) -> int:
+    """Insert a snapshot payload's workouts into the deduped accumulator.
+    UNIQUE(entry_id) makes re-ingestion a no-op; returns rows actually added."""
+    added = 0
+    for w in (user or {}).get("workoutHistory") or []:
+        eid = w.get("id")
+        if not eid:
+            continue
+        res = await conn.execute(
+            """INSERT INTO member_workouts
+               (email, entry_id, workout_id, title, categories, workout_at, first_seen_batch)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (entry_id) DO NOTHING""",
+            email, str(eid), str(w.get("workoutId") or "") or None,
+            (w.get("title") or "").strip() or None,
+            [c for c in (w.get("categories") or []) if c] or None,
+            _s36_parse_ts(w.get("createdAt")), batch,
+        )
+        if res.endswith("1"):
+            added += 1
+    return added
+
+
 async def run_engagement_sync(limit: int = 0, batch_label: str = "", scope: str = "all"):
     """Paced full engagement sync. One ymove lookup per second with
     includeWorkoutHistory=1. Writes one ymove_engagement row per member."""
@@ -14744,6 +14821,8 @@ async def run_engagement_sync(limit: int = 0, batch_label: str = "", scope: str 
                             ext["last_workout_at"], ext["program_sessions_count"],
                             ext["last_program_session_at"], ext["ymove_subscription_active"],
                         )
+                        if found:
+                            await _s36_ingest_workouts(conn, email, user, batch)
                     await conn.execute(
                         "UPDATE engagement_sync_runs SET progress_current = $1 WHERE id = $2",
                         min(start + BATCH_SIZE, len(emails)), run_id
