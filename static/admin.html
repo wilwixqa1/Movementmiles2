@@ -2094,10 +2094,13 @@ function renderUtmTrendChart() {
 }
 
 // S36 Phase 3: Activation threshold card - loader + window toggle + renderer.
-function actBar(valueHtml, fillPct) {
+function actBar(valueHtml, fillPct, tickPct) {
+  var tick = (tickPct == null) ? ''
+    : '<span title="Window overall" style="position:absolute;left:' + tickPct + '%;top:-2px;bottom:-2px;width:2px;background:#c2410c;border-radius:1px"></span>';
   return '<div style="display:flex;align-items:center;justify-content:flex-end;gap:8px">'
-    + '<span style="display:inline-block;width:72px;height:8px;border-radius:4px;background:#eef0f4;overflow:hidden;flex:none">'
-    + '<span style="display:block;height:100%;width:' + fillPct + '%;border-radius:4px;background:var(--navy-mid, #1f3a5f)"></span>'
+    + '<span style="display:inline-block;position:relative;width:72px;height:8px;border-radius:4px;background:#eef0f4;flex:none">'
+    + '<span style="display:block;height:100%;width:' + Math.min(fillPct, 100) + '%;border-radius:4px;background:var(--navy-mid, #1f3a5f)"></span>'
+    + tick
     + '</span><span style="min-width:52px;text-align:right">' + valueHtml + '</span></div>';
 }
 
@@ -2139,17 +2142,21 @@ function renderActivationInsights() {
     if (activationWindow === 'lifetime') t = win.included + ' members, no exclusions. Caution: lifetime counts are inflated by tenure; use the windowed views to find the inflection point.';
     sub.textContent = t;
   }
-  var maxConv = 0;
-  win.buckets.forEach(function(b) { if (b.conv_rate != null && b.conv_rate > maxConv) maxConv = b.conv_rate; });
+  var sumPaid = 0, sumResolved = 0;
+  win.buckets.forEach(function(b) {
+    var paid = b.paid_active + b.paid_canceled;
+    sumPaid += paid; sumResolved += paid + b.trial_canceled;
+  });
+  var overallConv = sumResolved > 0 ? (sumPaid / sumResolved * 100) : null;
   var pct = function(v) { return v == null ? '&mdash;' : v.toFixed(1) + '%'; };
   var html = '';
   win.buckets.forEach(function(b) {
     var dim = b.small_sample ? ';opacity:.45' : '';
-    var barW = (b.conv_rate != null && maxConv > 0) ? Math.round(b.conv_rate / maxConv * 100) : 0;
+    var barW = (b.conv_rate != null) ? b.conv_rate : 0;  // absolute: 100% of track = 100% conversion
     html += '<tr style="border-bottom:1px solid #eef0f4' + dim + '">'
       + '<td>' + b.bucket + (b.small_sample ? ' <span title="Under 20 members: anecdote, not signal">&#9888;</span>' : '') + '</td>'
       + '<td style="text-align:right">' + b.members + '</td>'
-      + '<td>' + actBar(pct(b.conv_rate), barW) + '</td>'
+      + '<td>' + actBar(pct(b.conv_rate), barW, overallConv) + '</td>'
       + '<td style="text-align:right">' + pct(b.paid_cancel_rate) + '</td>'
       + '<td style="text-align:right">' + pct(b.still_active_pct) + '</td>'
       + '<td style="text-align:right">' + b.avg_tenure_days + 'd</td></tr>';
