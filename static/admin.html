@@ -664,6 +664,53 @@
       </div>
     </div>
 
+    <!-- S36 Phase 3: Activation threshold - workout-count buckets across
+         signup-anchored windows. Data source: /api/admin/activation-insights -->
+    <div class="card" style="margin-bottom:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+        <div class="section-title" style="margin-bottom:0">Activation: Retention by Workout Count</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:.72rem;color:var(--navy-mid)">WINDOW:</span>
+          <button class="quick-btn" data-actwin="30" onclick="setActivationWindow('30')">First 30d</button>
+          <button class="quick-btn" data-actwin="60" onclick="setActivationWindow('60')">First 60d</button>
+          <button class="quick-btn" data-actwin="90" onclick="setActivationWindow('90')">First 90d</button>
+          <button class="quick-btn" data-actwin="lifetime" onclick="setActivationWindow('lifetime')">Lifetime</button>
+        </div>
+      </div>
+      <div id="activation-subtitle" style="font-size:.72rem;color:var(--navy-mid);margin-bottom:8px">Loading...</div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:.84rem">
+          <thead><tr>
+            <th>Workouts</th>
+            <th style="text-align:right">Members</th>
+            <th style="text-align:right;min-width:150px">Conv Rate</th>
+            <th style="text-align:right">Paid Cancel Rate</th>
+            <th style="text-align:right">Still Active</th>
+            <th style="text-align:right">Avg Tenure</th>
+          </tr></thead>
+          <tbody id="activation-tbody"><tr><td colspan="6" class="empty-msg">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div style="font-size:.78rem;font-weight:600;margin:16px 0 4px">Workouts at Cancellation</div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:.84rem">
+          <thead><tr>
+            <th>Workouts when they left</th>
+            <th style="text-align:right">Trial Cancels</th>
+            <th style="text-align:right">Paid Cancels</th>
+            <th style="text-align:right;min-width:150px">Total</th>
+          </tr></thead>
+          <tbody id="activation-cxl-tbody"><tr><td colspan="4" class="empty-msg">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
+        Windows are anchored to each member's signup: &ldquo;First 30d&rdquo; = workouts in that member's first 30 days, so churned and active members are compared on equal footing.
+        Windowed views exclude members whose window has not fully elapsed and members whose visible history (ymove returns the 50 most recent workouts) no longer reaches back to signup; exclusions are shown above and shrink weekly as the sync accumulates new cohorts.
+        Lifetime includes everyone but is inflated by tenure: staying longer produces more workouts, so read the inflection point from the windowed views.
+        Conv Rate = Paid &divide; (Paid + Trial Canceled). Rows under 20 members are dimmed. Correlation, not causation.
+      </div>
+    </div>
+
     <!-- S32: UTM Trend over time (cohort view) -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
@@ -1378,6 +1425,7 @@ function fmtDollars(cents) {
 
 function loadStats() {
   loadProgramInsights();  // S36: retention-by-program card refreshes alongside stats
+  loadActivationInsights();  // S36 Phase 3: activation card too
   var statsUrl = '/api/admin/stats';
   var qp = [];
   var cpDays = window._channelPerfDays || 90;
@@ -2042,6 +2090,78 @@ function renderUtmTrendChart() {
   if (!seriesNames.length) {
     container.innerHTML = '<div class="empty-msg" style="padding:60px 20px;text-align:center">No UTM-tagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' in this window. ' + (untaggedTotal > 0 ? untaggedTotal + ' untagged ' + (measure === 'paid_conversions' ? 'paid conversions' : 'signups') + ' (Apple/Google or pre-tracking).' : '') + '</div>';
     legend.innerHTML = '';
+  }
+}
+
+// S36 Phase 3: Activation threshold card - loader + window toggle + renderer.
+var activationData = null;
+var activationWindow = '30';
+
+function loadActivationInsights() {
+  fetch('/api/admin/activation-insights', {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    activationData = d;
+    renderActivationInsights();
+  }).catch(function() {
+    var tb = document.getElementById('activation-tbody');
+    if (tb) tb.innerHTML = '<tr><td colspan="6" class="empty-msg">Could not load activation insights.</td></tr>';
+  });
+}
+
+function setActivationWindow(w) {
+  activationWindow = w;
+  renderActivationInsights();
+}
+
+function renderActivationInsights() {
+  var tb = document.getElementById('activation-tbody');
+  if (!tb || !activationData) return;
+  document.querySelectorAll('[data-actwin]').forEach(function(btn) {
+    btn.classList.toggle('active', btn.getAttribute('data-actwin') === activationWindow);
+  });
+  var win = activationData.windows[activationWindow];
+  var sub = document.getElementById('activation-subtitle');
+  if (sub) {
+    var t = win.included + ' members with a complete window.';
+    var ex = [];
+    if (win.excluded_history_capped) ex.push(win.excluded_history_capped + ' excluded: history capped at 50 workouts, no longer reaches back to signup');
+    if (win.excluded_window_not_elapsed) ex.push(win.excluded_window_not_elapsed + ' excluded: window not elapsed yet');
+    if (ex.length) t += ' (' + ex.join('; ') + ')';
+    if (activationWindow === 'lifetime') t = win.included + ' members, no exclusions. Caution: lifetime counts are inflated by tenure; use the windowed views to find the inflection point.';
+    sub.textContent = t;
+  }
+  var maxConv = 0;
+  win.buckets.forEach(function(b) { if (b.conv_rate != null && b.conv_rate > maxConv) maxConv = b.conv_rate; });
+  var pct = function(v) { return v == null ? '&mdash;' : v.toFixed(1) + '%'; };
+  var html = '';
+  win.buckets.forEach(function(b) {
+    var dim = b.small_sample ? ';opacity:.45' : '';
+    var barW = (b.conv_rate != null && maxConv > 0) ? Math.round(b.conv_rate / maxConv * 100) : 0;
+    html += '<tr style="border-bottom:1px solid #eef0f4' + dim + '">'
+      + '<td>' + b.bucket + (b.small_sample ? ' <span title="Under 20 members: anecdote, not signal">&#9888;</span>' : '') + '</td>'
+      + '<td style="text-align:right">' + b.members + '</td>'
+      + '<td style="text-align:right;background:linear-gradient(90deg, rgba(31,58,95,.14) ' + barW + '%, transparent ' + barW + '%)">' + pct(b.conv_rate) + '</td>'
+      + '<td style="text-align:right">' + pct(b.paid_cancel_rate) + '</td>'
+      + '<td style="text-align:right">' + pct(b.still_active_pct) + '</td>'
+      + '<td style="text-align:right">' + b.avg_tenure_days + 'd</td></tr>';
+  });
+  tb.innerHTML = html;
+
+  var ctb = document.getElementById('activation-cxl-tbody');
+  if (ctb) {
+    var maxTot = 0;
+    activationData.cancellation_distribution.forEach(function(b) { if (b.total > maxTot) maxTot = b.total; });
+    var chtml = '';
+    activationData.cancellation_distribution.forEach(function(b) {
+      var barW = maxTot > 0 ? Math.round(b.total / maxTot * 100) : 0;
+      chtml += '<tr style="border-bottom:1px solid #eef0f4">'
+        + '<td>' + b.bucket + '</td>'
+        + '<td style="text-align:right">' + b.trial_canceled + '</td>'
+        + '<td style="text-align:right">' + b.paid_canceled + '</td>'
+        + '<td style="text-align:right;background:linear-gradient(90deg, rgba(31,58,95,.14) ' + barW + '%, transparent ' + barW + '%)">' + b.total + '</td></tr>';
+    });
+    ctb.innerHTML = chtml;
   }
 }
 
