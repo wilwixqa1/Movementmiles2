@@ -371,6 +371,18 @@ async def startup():
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_cancel_at TIMESTAMPTZ")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ")
                 await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_state TEXT")
+                # S37: Stripe cancellation_details capture (Ahmed's churn-reason ask).
+                # cancellation_feedback: customer-selected from the self-serve portal
+                #   (too_expensive, unused, switched_service, missing_features, low_quality,
+                #    customer_service, too_complex, other). NULL when not self-serve.
+                # cancellation_comment: optional free-text the customer typed.
+                # cancellation_reason: Stripe's OWN classification, not the customer's
+                #   (cancellation_requested, payment_failed, payment_disputed). This is what
+                #   lets us separate involuntary churn from voluntary in the breakdown.
+                # All three stay NULL for Apple/Google/admin cancels -> "no reason recorded".
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancellation_feedback TEXT")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancellation_comment TEXT")
+                await conn.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancellation_reason TEXT")
                 # Backfill: tag subs reactivated by ymove verification batches
                 backfilled = await conn.execute(
                     """UPDATE subscriptions SET reactivated_at = updated_at
@@ -992,6 +1004,32 @@ async def stripe_webhook(request: Request):
 
             # S26 Phase 2: Period-end cancellation semantics
             # Stripe model: cancel click sets cancel_at_period_end=true, status stays active.
+            # S37: Capture Stripe cancellation_details (Ahmed's churn-reason ask).
+            # Deliberately a separate UPDATE, not folded into the upsert above, so a
+            # failure here can never break subscription ingestion.
+            # Timing: feedback is set the moment the customer clicks cancel in the portal,
+            # which is a subscription.updated with cancel_at_period_end=true. It is NOT
+            # only present on .deleted. We therefore capture on both events.
+            # COALESCE on the write: never overwrite a captured reason with a later NULL
+            # (e.g. an unrelated .updated after the cancel would otherwise wipe it).
+            try:
+                _s37_cd = sub.get("cancellation_details") or {}
+                _s37_feedback = _s37_cd.get("feedback") or None
+                _s37_comment = _s37_cd.get("comment") or None
+                _s37_reason = _s37_cd.get("reason") or None
+                if any((_s37_feedback, _s37_comment, _s37_reason)):
+                    await conn.execute(
+                        """UPDATE subscriptions
+                           SET cancellation_feedback = COALESCE($1, cancellation_feedback),
+                               cancellation_comment  = COALESCE($2, cancellation_comment),
+                               cancellation_reason   = COALESCE($3, cancellation_reason),
+                               updated_at = NOW()
+                           WHERE stripe_subscription_id = $4""",
+                        _s37_feedback, _s37_comment, _s37_reason, sub_id
+                    )
+            except Exception as e:
+                print(f"[S37] cancellation_details capture error: {e}")
+
             # subscription.deleted only fires when the period actually ends (or immediate cancel).
             # We mirror that: track cancel intent in cancel_state='pending', only mark canceled when expired.
             try:
@@ -14162,6 +14200,142 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # S36: registered BEFORE the marketing-site catch-all below, otherwise
 # @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
+@app.get("/api/admin/churn-reasons")
+async def churn_reasons(request: Request):
+    """S37: Churn-reason breakdown from Stripe cancellation_details (Ahmed's ask).
+
+    DENOMINATOR RULE (Ahmed, Jul 23): only self-serve Stripe portal cancellations
+    carry a reason. Apple, Google, payment failures and admin cancels do NOT.
+    Those are bucketed as 'no_reason_recorded' and stay IN the denominator rather
+    than being dropped, so percentages describe all churn and not just the
+    self-serve slice. A card that hid them would badly overstate 'too_expensive'.
+
+    Query params:
+      months=N   limit to cancels in the last N months (0/absent = all time)
+      password   NOT accepted; use X-Admin-Password header (viewer pw is fine)
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    try:
+        months = int(request.query_params.get("months") or 0)
+    except (TypeError, ValueError):
+        months = 0
+
+    # effective_canceled_at is the S26-corrected cancel date; fall back to
+    # canceled_at where it is NULL (284 known NULLs, still open from S35).
+    where = ["status = 'canceled'"]
+    params = []
+    if months > 0:
+        params.append(months)
+        where.append(
+            f"COALESCE(effective_canceled_at, canceled_at) >= NOW() - ($" 
+            f"{len(params)} * INTERVAL '1 month')"
+        )
+    where_sql = " AND ".join(where)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                CASE
+                    WHEN cancellation_feedback IS NOT NULL AND cancellation_feedback <> ''
+                        THEN cancellation_feedback
+                    WHEN cancellation_reason IN ('payment_failed', 'payment_disputed')
+                        THEN 'involuntary_' || cancellation_reason
+                    ELSE 'no_reason_recorded'
+                END AS reason,
+                COUNT(*) AS n,
+                COUNT(*) FILTER (WHERE source = 'stripe') AS n_stripe,
+                COUNT(*) FILTER (WHERE source IN ('apple', 'google')) AS n_iap
+            FROM subscriptions
+            WHERE {where_sql}
+            GROUP BY 1
+            ORDER BY n DESC
+            """,
+            *params
+        )
+
+        by_month = await conn.fetch(
+            f"""
+            SELECT
+                to_char(date_trunc('month', COALESCE(effective_canceled_at, canceled_at)), 'YYYY-MM') AS month,
+                CASE
+                    WHEN cancellation_feedback IS NOT NULL AND cancellation_feedback <> ''
+                        THEN cancellation_feedback
+                    WHEN cancellation_reason IN ('payment_failed', 'payment_disputed')
+                        THEN 'involuntary_' || cancellation_reason
+                    ELSE 'no_reason_recorded'
+                END AS reason,
+                COUNT(*) AS n
+            FROM subscriptions
+            WHERE {where_sql}
+              AND COALESCE(effective_canceled_at, canceled_at) IS NOT NULL
+            GROUP BY 1, 2
+            ORDER BY 1 DESC, 3 DESC
+            """,
+            *params
+        )
+
+        comments = await conn.fetch(
+            f"""
+            SELECT email, cancellation_feedback AS reason, cancellation_comment AS comment,
+                   COALESCE(effective_canceled_at, canceled_at) AS canceled_at
+            FROM subscriptions
+            WHERE {where_sql}
+              AND cancellation_comment IS NOT NULL AND cancellation_comment <> ''
+            ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST
+            LIMIT 100
+            """,
+            *params
+        )
+
+    total = sum(r["n"] for r in rows) or 0
+    known = sum(r["n"] for r in rows if r["reason"] != "no_reason_recorded") or 0
+
+    return {
+        "window_months": months or "all_time",
+        "total_canceled": total,
+        "with_reason": known,
+        "coverage_pct": round(known * 100.0 / total, 1) if total else 0.0,
+        "reasons": [
+            {
+                "reason": r["reason"],
+                "count": r["n"],
+                "pct_of_all_churn": round(r["n"] * 100.0 / total, 1) if total else 0.0,
+                "pct_of_known": (
+                    round(r["n"] * 100.0 / known, 1)
+                    if known and r["reason"] != "no_reason_recorded" else None
+                ),
+                "stripe": r["n_stripe"],
+                "apple_google": r["n_iap"],
+            }
+            for r in rows
+        ],
+        "by_month": [
+            {"month": r["month"], "reason": r["reason"], "count": r["n"]}
+            for r in by_month
+        ],
+        "comments": [
+            {
+                "email": r["email"],
+                "reason": r["reason"],
+                "comment": r["comment"],
+                "canceled_at": str(r["canceled_at"]) if r["canceled_at"] else None,
+            }
+            for r in comments
+        ],
+        "note": (
+            "pct_of_all_churn uses every canceled sub as the denominator. "
+            "pct_of_known excludes no_reason_recorded and will read much higher; "
+            "it answers 'of the people who told us, what did they say'. "
+            "Report both or the numbers mislead."
+        ),
+    }
+
+
 @app.get("/api/admin/engagement-sync-runs")
 async def engagement_sync_runs_list(request: Request):
     """S36: Recent engagement sync runs with progress and results."""
@@ -14895,4 +15069,125 @@ async def engagement_sync_now(request: Request):
         "scope": scope,
         "limit": limit or "no cap",
         "note": "Running in background in batches of 20. Poll /api/admin/engagement-sync-runs.",
+    }
+
+
+@app.post("/api/admin/backfill-cancellation-reasons")
+async def backfill_cancellation_reasons(request: Request):
+    """S37: Backfill cancellation_details from Stripe for historical cancels.
+
+    Body: {preview: true} | {confirm: true, limit: N}
+      preview -> reports how many subs would be touched and shows a sample of
+                 what Stripe returns for the first few. Makes Stripe READ calls
+                 only; writes nothing.
+      confirm -> writes cancellation_feedback / comment / reason, tagged with
+                 import_batch so the whole run is revertible in one statement.
+
+    ONLY touches the three S37 columns plus import_batch/updated_at. Never
+    modifies status, canceled_at, effective_canceled_at or converted_at.
+
+    Apple/Google subs are excluded outright: their IDs are not real Stripe
+    subscriptions and Stripe has nothing to say about them.
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse(status_code=500, content={"error": "STRIPE_SECRET_KEY not set"})
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    preview = bool(body.get("preview"))
+    if not preview and not body.get("confirm"):
+        return JSONResponse(status_code=400, content={
+            "error": "Pass {preview: true} to inspect, or {confirm: true} to write."
+        })
+
+    limit = int(body.get("limit") or 0)
+    batch_id = f"s37_cancel_reason_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT id, email, stripe_subscription_id
+                FROM subscriptions
+                WHERE status = 'canceled'
+                  AND source = 'stripe'
+                  AND stripe_subscription_id LIKE 'sub_%'
+                  AND cancellation_feedback IS NULL
+                  AND cancellation_reason IS NULL
+                ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST
+                {f'LIMIT {limit}' if limit > 0 else ''}"""
+        )
+
+    if preview:
+        import stripe as _s37_stripe
+        _s37_stripe.api_key = STRIPE_SECRET_KEY
+        sample = []
+        for r in rows[:5]:
+            try:
+                real = _s37_stripe.Subscription.retrieve(r["stripe_subscription_id"])
+                cd = real.get("cancellation_details") or {}
+                sample.append({
+                    "email": r["email"],
+                    "feedback": cd.get("feedback"),
+                    "comment": cd.get("comment"),
+                    "reason": cd.get("reason"),
+                })
+            except Exception as e:
+                sample.append({"email": r["email"], "error": str(e)[:120]})
+        return {
+            "status": "preview",
+            "would_process": len(rows),
+            "batch_id_if_run": batch_id,
+            "sample_first_5": sample,
+            "note": "No writes performed. Sample shows exactly what Stripe holds for these subs.",
+        }
+
+    import stripe as _s37_stripe
+    _s37_stripe.api_key = STRIPE_SECRET_KEY
+    updated = 0
+    no_details = 0
+    errors = []
+
+    async with db_pool.acquire() as conn:
+        for r in rows:
+            try:
+                real = _s37_stripe.Subscription.retrieve(r["stripe_subscription_id"])
+                cd = real.get("cancellation_details") or {}
+                fb, cm, rs = cd.get("feedback"), cd.get("comment"), cd.get("reason")
+                if not any((fb, cm, rs)):
+                    no_details += 1
+                    continue
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET cancellation_feedback = $1,
+                           cancellation_comment = $2,
+                           cancellation_reason = $3,
+                           import_batch = $4,
+                           updated_at = NOW()
+                       WHERE id = $5""",
+                    fb, cm, rs, batch_id, r["id"]
+                )
+                updated += 1
+            except Exception as e:
+                errors.append({"email": r["email"], "error": str(e)[:120]})
+
+    return {
+        "status": "completed",
+        "batch_id": batch_id,
+        "scanned": len(rows),
+        "updated": updated,
+        "no_details_in_stripe": no_details,
+        "errors": errors[:20],
+        "error_count": len(errors),
+        "revert_sql": (
+            f"UPDATE subscriptions SET cancellation_feedback = NULL, "
+            f"cancellation_comment = NULL, cancellation_reason = NULL "
+            f"WHERE import_batch = '{batch_id}'"
+        ),
     }

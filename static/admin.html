@@ -711,6 +711,54 @@
       </div>
     </div>
 
+    <!-- S37: Churn Reasons - Stripe cancellation_details breakdown (Ahmed's ask).
+         Data source: /api/admin/churn-reasons -->
+    <div class="card" style="margin-bottom:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+        <div class="section-title" style="margin-bottom:0">Why Members Cancel</div>
+        <div style="display:flex;gap:4px">
+          <span style="font-size:.72rem;color:var(--navy-mid);align-self:center;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Window:</span>
+          <button class="quick-btn" id="churn-btn-3" onclick="setChurnWindow(3)" style="padding:4px 12px;font-size:.72rem">3 Mo</button>
+          <button class="quick-btn" id="churn-btn-6" onclick="setChurnWindow(6)" style="padding:4px 12px;font-size:.72rem">6 Mo</button>
+          <button class="quick-btn" id="churn-btn-12" onclick="setChurnWindow(12)" style="padding:4px 12px;font-size:.72rem">12 Mo</button>
+          <button class="quick-btn active" id="churn-btn-0" onclick="setChurnWindow(0)" style="padding:4px 12px;font-size:.72rem">All Time</button>
+        </div>
+      </div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-bottom:10px" id="churn-reasons-subtitle">Loading...</div>
+      <div style="overflow-x:auto">
+        <table id="churn-reasons-table" style="width:100%;font-size:.84rem">
+          <thead>
+            <tr>
+              <th>Reason</th>
+              <th style="text-align:right">Members</th>
+              <th style="text-align:right">% of All Churn</th>
+              <th style="text-align:right">% of Those Who Told Us</th>
+              <th style="min-width:160px">Share of All Churn</th>
+            </tr>
+          </thead>
+          <tbody id="churn-reasons-tbody">
+            <tr><td colspan="5" class="empty-msg">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="churn-comments-wrap" style="margin-top:16px;display:none">
+        <div style="font-size:.78rem;font-weight:600;color:var(--navy-mid);margin-bottom:6px">What they typed</div>
+        <div style="max-height:260px;overflow-y:auto">
+          <table style="width:100%;font-size:.8rem">
+            <thead><tr>
+              <th>Date</th><th>Reason</th><th>Comment</th>
+            </tr></thead>
+            <tbody id="churn-comments-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
+        Only self-serve cancellations through the Stripe billing portal carry a reason. Apple and Google cancellations, payment failures and admin cancellations do not, and are shown as &ldquo;no reason recorded&rdquo; rather than dropped &mdash; so the denominator stays the full churn population.
+        <br><strong>Read both percentage columns together.</strong> &ldquo;% of All Churn&rdquo; is the honest share of everyone who left. &ldquo;% of Those Who Told Us&rdquo; excludes the no-reason group and always reads higher; it answers a narrower question and will overstate any single reason if quoted alone.
+        <br>Reasons are captured going forward from S37 and backfilled from Stripe for historical cancellations. Coverage is shown above.
+      </div>
+    </div>
+
     <!-- S32: UTM Trend over time (cohort view) -->
     <div class="card" style="margin-bottom:24px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px">
@@ -1426,6 +1474,7 @@ function fmtDollars(cents) {
 function loadStats() {
   loadProgramInsights();  // S36: retention-by-program card refreshes alongside stats
   loadActivationInsights();  // S36 Phase 3: activation card too
+  loadChurnReasons();  // S37: churn-reason breakdown
   var statsUrl = '/api/admin/stats';
   var qp = [];
   var cpDays = window._channelPerfDays || 90;
@@ -2188,6 +2237,101 @@ function piEsc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
+}
+
+var churnReasonsData = null;
+var churnWindow = 0;
+
+var CHURN_LABELS = {
+  too_expensive: 'Too expensive',
+  unused: 'Not using it',
+  switched_service: 'Switched to another service',
+  missing_features: 'Missing features',
+  low_quality: 'Quality not good enough',
+  customer_service: 'Customer service',
+  too_complex: 'Too complicated',
+  other: 'Other (self-serve)',
+  no_reason_recorded: 'No reason recorded',
+  involuntary_payment_failed: 'Payment failed (involuntary)',
+  involuntary_payment_disputed: 'Payment disputed (involuntary)'
+};
+
+function setChurnWindow(m) {
+  churnWindow = m;
+  [0, 3, 6, 12].forEach(function(x) {
+    var b = document.getElementById('churn-btn-' + x);
+    if (b) b.classList.toggle('active', x === m);
+  });
+  loadChurnReasons();
+}
+
+function loadChurnReasons() {
+  var qs = churnWindow > 0 ? '?months=' + churnWindow : '';
+  fetch('/api/admin/churn-reasons' + qs, {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    churnReasonsData = d;
+    renderChurnReasons();
+  }).catch(function() {
+    var tb = document.getElementById('churn-reasons-tbody');
+    if (tb) tb.innerHTML = '<tr><td colspan="5" class="empty-msg">Could not load churn reasons.</td></tr>';
+  });
+}
+
+function renderChurnReasons() {
+  var tb = document.getElementById('churn-reasons-tbody');
+  if (!tb || !churnReasonsData) return;
+  var d = churnReasonsData;
+
+  var sub = document.getElementById('churn-reasons-subtitle');
+  if (sub) {
+    sub.innerHTML = d.total_canceled + ' canceled members in this window. '
+      + d.with_reason + ' gave a reason (' + d.coverage_pct + '% coverage). '
+      + 'The remainder canceled through Apple, Google, an admin action or a failed payment, where no reason is captured.';
+  }
+
+  var rows = (d.reasons || []).slice();
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty-msg">No canceled members in this window.</td></tr>';
+    return;
+  }
+
+  var html = '';
+  rows.forEach(function(r) {
+    var label = CHURN_LABELS[r.reason] || r.reason;
+    var dim = (r.reason === 'no_reason_recorded') ? 'opacity:.55;' : '';
+    var barPct = r.pct_of_all_churn || 0;
+    var barColor = (r.reason === 'no_reason_recorded') ? 'var(--navy-mid)' : 'var(--teal, #2a9d8f)';
+    html += '<tr style="' + dim + '">'
+      + '<td>' + label + '</td>'
+      + '<td style="text-align:right">' + r.count + '</td>'
+      + '<td style="text-align:right">' + barPct.toFixed(1) + '%</td>'
+      + '<td style="text-align:right">' + (r.pct_of_known == null ? '&mdash;' : r.pct_of_known.toFixed(1) + '%') + '</td>'
+      + '<td><div style="background:rgba(0,0,0,.06);border-radius:3px;height:14px;position:relative">'
+      + '<div style="width:' + Math.min(barPct, 100) + '%;background:' + barColor + ';height:100%;border-radius:3px"></div>'
+      + '</div></td>'
+      + '</tr>';
+  });
+  tb.innerHTML = html;
+
+  var cw = document.getElementById('churn-comments-wrap');
+  var ctb = document.getElementById('churn-comments-tbody');
+  var comments = d.comments || [];
+  if (cw && ctb) {
+    if (comments.length) {
+      cw.style.display = 'block';
+      var chtml = '';
+      comments.forEach(function(c) {
+        var dt = c.canceled_at ? c.canceled_at.slice(0, 10) : '&mdash;';
+        var lbl = CHURN_LABELS[c.reason] || c.reason || '&mdash;';
+        var txt = (c.comment || '').replace(/[<>]/g, '');
+        chtml += '<tr><td>' + dt + '</td><td>' + lbl + '</td><td>' + txt + '</td></tr>';
+      });
+      ctb.innerHTML = chtml;
+    } else {
+      cw.style.display = 'none';
+    }
+  }
 }
 
 function loadProgramInsights() {
