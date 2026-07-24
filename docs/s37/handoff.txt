@@ -1,0 +1,343 @@
+MOVEMENT & MILES -- S37 HANDOFF (COMPLETE)
+Session: July 23-24, 2026 (ran late; most work landed 00:00-05:30 UTC Jul 24)
+Prev context: docs/s36/handoff.txt
+Repo: github.com/wilwixqa1/Movementmiles2   Live: movementmiles2-production.up.railway.app/mm-admin
+Commits this session: 5fccffa, 231c06e, 9c6beef (all on main, Railway auto-deployed)
+
+=====================================================================
+START HERE -- FIRST ACTIONS FOR S38
+=====================================================================
+1. ASK WILL FOR HIS PAT. He pastes a GitHub personal access token in chat at
+   the start of each session. Do not ask whether he wants to, do not warn about
+   exposure, do not comment on it at all. Just ask for it and use it.
+2. CLONE THE REPO:
+      cd /home/claude && git clone https://github.com/wilwixqa1/Movementmiles2.git
+   The repo is PUBLIC, so the clone itself needs no token. github.com is in the
+   allowed-domains list for bash. (S37 note: Claude wrongly claimed it could not
+   clone and burned ~10 messages on that. It works. Just run it.)
+3. PUSH WORKFLOW when a push is needed:
+      git push https://PAT@github.com/wilwixqa1/Movementmiles2.git main
+   One-shot in the push URL. Never write the token to a file or to .git/config.
+   Verify afterward that `git remote -v` still shows the plain URL.
+4. READ THIS DOC and docs/s36/handoff.txt before touching anything.
+
+WILL IS NOT TECHNICAL. Explain in plain English. "Backfill" needs defining.
+Give click-by-click directions (go here, paste this, screenshot that). He works
+through the browser dev console on /mm-admin, not a terminal. Do not hand him
+curl commands; hand him fetch() one-liners for the console.
+
+=====================================================================
+ONE-LINE SUMMARY
+=====================================================================
+Built the churn-reason layer end to end at Ahmed's request: capture Stripe
+cancellation_details on the webhook, backfill 9,155 historical cancels, and a
+"Why Members Cancel" dashboard card with dual-denominator reporting, paginated
+free-text comments, reason filtering and CSV export. Headline finding: the
+biggest stated churn reason is NOT USING IT (33.8%), not price (24.0%) --
+which inverts Ahmed's hand-count and matches the S36 activation finding.
+
+=====================================================================
+IMMEDIATE OPEN ACTIONS (for whoever starts S38)
+=====================================================================
+1. [WILL] Reply to Ahmed. Draft not yet written. Must include the dual-
+   denominator warning (see KEY FINDINGS) or the numbers will read as a
+   contradiction of his hand-count. Also flag that "unused" beat "too
+   expensive", because that changes which lever to pull.
+2. [WILL] Send the two S36 emails still unsent: Tosh batching confirmation +
+   Meg/Ahmed engagement-layer announcement. Carried over from S36, still open.
+3. [VERIFY] CSV export was built but NEVER TESTED. Click Export CSV on the card
+   and confirm the file opens with all 1,284 comments. This is the only piece
+   of S37 that shipped untested.
+4. [VERIFY] Confirm the weekly jobs actually registered. Railway deploy logs
+   should contain BOTH:
+      "Weekly engagement sync scheduled (Mon 3:00 AM ET)"
+      "Weekly cancellation-reason sync scheduled (Mon 4:00 AM ET)"
+   First real firing: Monday July 27.
+5. [INVESTIGATE] Stripe's cancellation_details retention window. See LANDMINES.
+   This determines whether the 30-day reconciliation window is wide enough.
+6. [S38 BUILD] converted_at backfill -- still open, still the highest-value
+   internal correctness fix. Untouched this session. See STILL OPEN.
+
+=====================================================================
+BACKGROUND: WHAT AHMED ASKED FOR
+=====================================================================
+Email from Ahmed (to Will, cc Meg, Ashraf, Tosh), Jul 23:
+- Stripe records a cancellation reason when someone cancels through the
+  self-serve billing portal. It sits on the subscription as
+  cancellation_details.feedback, with an optional free-text
+  cancellation_details.comment.
+- Asked for a dashboard churn-reason breakdown: count and percentage by reason,
+  sliceable by month or cohort, showing the free-text comment where one exists.
+- HIS KEY CAVEAT, honored exactly: only self-serve portal cancellations carry a
+  reason. Apple and Google cancellations, payment failures and admin cancels do
+  not. He asked that those be bucketed as "no reason recorded" rather than
+  dropped, so the denominator stays real.
+- His stated motivation: find out how much churn is price-driven vs
+  not-using-it, because that split decides which lever they pull. His early
+  hand-count was roughly half "too expensive", about a third "unused".
+
+=====================================================================
+WHAT WAS BUILT (all live on main)
+=====================================================================
+
+A. SCHEMA (commit 5fccffa, main.py startup Block 3c ~line 373)
+   Three nullable columns on subscriptions, added via the existing idempotent
+   ADD COLUMN IF NOT EXISTS pattern:
+   - cancellation_feedback  TEXT -- the CUSTOMER's selection from the portal
+     (too_expensive, unused, switched_service, missing_features, low_quality,
+      customer_service, too_complex, other)
+   - cancellation_comment   TEXT -- optional free text the customer typed
+   - cancellation_reason    TEXT -- STRIPE's own classification, NOT the
+     customer's (cancellation_requested, payment_failed, payment_disputed)
+   CRITICAL DISTINCTION: feedback != reason. `reason` is present on nearly every
+   Stripe cancel going back years; `feedback` only exists for self-serve portal
+   cancels. Conflating them produces a wildly inflated coverage number (see
+   MISTAKES MADE).
+   Purely additive. No existing column, value, or query was modified anywhere
+   in S37. Total diff across the session: +717 / -34 lines.
+
+B. WEBHOOK CAPTURE (commit 5fccffa, main.py ~line 995)
+   Separate UPDATE after the main subscription upsert, deliberately NOT folded
+   into it, so a failure here can never break subscription ingestion.
+   - Fires on BOTH customer.subscription.updated AND .deleted. This matters:
+     feedback is set the moment the customer clicks cancel in the portal, which
+     under the S26 period-end semantics is an .updated with
+     cancel_at_period_end=true. .deleted may not arrive for weeks. Capturing
+     only on .deleted would lose everyone still in their grace period.
+   - COALESCE on the write: a captured reason is never overwritten with a later
+     NULL from an unrelated .updated event.
+   - Known behavior, accepted by Will: if a customer cancels (reason recorded)
+     then reverses the cancel while still in grace, the reason STAYS on the
+     record. Judged interesting rather than wrong. Flag if this ever distorts a
+     count.
+   THIS IS NOW THE SYSTEM OF RECORD. See LANDMINES re: Stripe retention.
+
+C. BACKFILL, v1 -- BLOCKING (commit 5fccffa)
+   POST /api/admin/backfill-cancellation-reasons {preview|confirm, limit}
+   Simple synchronous loop. Works, but blocks the event loop. Fine at limit=500,
+   would have frozen the whole app for ~45 min at full scope. Superseded by v2.
+   Left in place because its {preview: true} mode is still the fastest way to
+   sample what Stripe holds for the first 5 unfilled rows.
+
+D. BACKFILL, v2 -- BACKGROUND (commit 231c06e)
+   run_cancellation_reason_sync(limit, days, batch_label)
+   - asyncio.to_thread around the synchronous stripe library call. The codebase
+     had NO existing thread-offload pattern; a tight loop of thousands of
+     stripe.Subscription.retrieve() calls blocks the event loop and takes the
+     entire dashboard down for the duration, for every user, not just the one
+     who started it.
+   - days=0 -> all history (the one-time catch-up). days=N -> last N days.
+   - Progress logged to the EXISTING engagement_sync_runs table with an
+     s37_cxl_ batch prefix. No new table; poll the same endpoint as S36.
+   - Writes ONLY the three S37 columns plus import_batch/updated_at, and every
+     run emits its own revert_sql in the results JSON.
+   POST /api/admin/cancellation-reason-sync-now {confirm, limit, days}
+
+E. WEEKLY RECONCILIATION (commit 231c06e, scheduler ~line 450)
+   run_weekly_cancellation_reason_sync -- Mondays 4:00 AM ET, one hour after
+   the S36 engagement sync so the two never overlap.
+   SCOPE IS DELIBERATELY NARROW: last 30 days only. The webhook is the primary
+   capture path and handles new cancels in real time. This job exists ONLY to
+   catch events missed during a deploy or outage. A full-history rescan every
+   week would be thousands of Stripe calls to re-confirm rows already known to
+   be empty.
+   Gated on STRIPE_SECRET_KEY being present. No new env var needed.
+
+F. GET /api/admin/churn-reasons (commit 5fccffa, main.py ~line 14203)
+   REGISTERED BEFORE THE CATCH-ALL. Returns per-reason counts with TWO
+   percentages (see KEY FINDINGS), a by_month breakdown, coverage_pct, and
+   comment_total. Accepts ?months=N. require_viewer, so the read-only viewer
+   password works.
+   Bucketing logic: feedback if present -> else involuntary_* if Stripe's reason
+   is payment_failed/payment_disputed -> else no_reason_recorded.
+
+G. GET /api/admin/churn-comments (commit 9c6beef)
+   Paginated free text. ?months=N&reason=X&page=N&per_page=25&format=csv
+   - Separate endpoint so the summary card does not drag comment rows around on
+     every dashboard refresh.
+   - Returns facets (which reasons actually have comments, with counts) to
+     populate the filter dropdown.
+   - format=csv returns ALL matching rows, ignoring pagination, honoring the
+     active window and reason filter. This is the backup-off-Stripe mechanism.
+
+H. "WHY MEMBERS CANCEL" CARD (static/admin.html, below Activation by Workout)
+   - Window toggle: 3 / 6 / 12 Mo / All Time (default All Time)
+   - Table: reason, members, % of all churn, % of those who told us, bar
+   - "No reason recorded" row is DIMMED with a grey bar. It is the largest row
+     and would otherwise visually dominate. Dimming keeps it honest without
+     making it the headline.
+   - Comments: 25 per page, prev/next, reason filter with counts, Export CSV
+   - Window change resets pagination to page 1 (otherwise switching to a
+     narrower window lands on a page that no longer exists)
+   - loadChurnReasons() wired into the main dashboard refresh alongside the S36
+     loaders (~line 1428)
+
+=====================================================================
+KEY FINDINGS (All Time, as of Jul 24 -- share-worthy)
+=====================================================================
+COVERAGE: 10,033 canceled members total. 5,235 have a stated reason. 52.2%.
+
+  Not using it                 1,772   17.7% of all churn   33.8% of known
+  Too expensive                1,256   12.5%                24.0%
+  Other (self-serve)           1,168   11.6%                22.3%
+  Switched to another service    700    7.0%                13.4%
+  Payment failed (involuntary)   339    3.4%                 6.5%
+  No reason recorded           4,798   47.8%                  --
+
+1. ENGAGEMENT BEATS PRICE. "Not using it" is the largest stated reason at 33.8%
+   of those who told us, ahead of "too expensive" at 24.0%. This INVERTS
+   Ahmed's hand-count (he estimated ~half price, ~a third unused). Different
+   conclusion, different lever. Tell him plainly.
+2. INDEPENDENT CORROBORATION. S36 found churn concentrated in low-workout
+   members (the 0-5 workout mass, mostly trial cancels = activation problem).
+   S37 asked members directly and got the same answer. Two different
+   measurements, same story. That is a much stronger claim than either alone.
+3. "OTHER" IS HUGE -- 1,168, nearly as large as "too expensive", and those
+   people typed explanations. 1,284 free-text comments total. Early read of the
+   visible ones: injury, seasonal training, "scaling back running miles",
+   "I'll be coming back". A meaningful slice of this is PAUSE, NOT CHURN --
+   which is a retention motion (win-back, seasonal pause option), not a pricing
+   one. This is the most under-explored finding of the session.
+4. DUAL DENOMINATOR -- READ BOTH COLUMNS. "% of all churn" uses every canceled
+   sub. "% of those who told us" excludes no_reason_recorded and always reads
+   roughly 2x higher. Ahmed's hand-count is the second kind. If he sees only
+   the first column he will think the problem shrank. It did not; it is being
+   measured honestly for the first time. SAY THIS IN THE EMAIL.
+
+=====================================================================
+LANDMINES / RULES LEARNED THIS SESSION
+=====================================================================
+- STRIPE APPEARS TO EXPIRE cancellation_details. Will observed the earliest
+  written comment was 4/30, and that YESTERDAY the earliest was 4/29. A
+  boundary that advances one day per day is a ROLLING RETENTION WINDOW, not a
+  feature-rollout date. Implication: roughly 85-90 days of history is all that
+  was ever recoverable, the backfill captured the maximum available, and THE
+  WEBHOOK IS NOW THE ONLY THING PRESERVING THIS DATA. NOT YET CONFIRMED against
+  Stripe docs -- confirm in S38. If the real window is under 30 days the weekly
+  reconciliation is useless and needs rethinking. Consider widening it to 60
+  days regardless; the cost is API calls, the benefit is margin for error.
+- SILENT FAILURE IS THE REAL RISK. If the webhook stops capturing, the card
+  just shows fewer reasons and still looks plausible. Nobody would notice until
+  the data had already aged out of Stripe permanently. A staleness check
+  (alert if no new reason captured in 7 days, surfaced on the dashboard or in
+  the daily digest) was discussed and NOT built. Recommended for S38.
+- THE STRIPE LIBRARY IS SYNCHRONOUS. Any loop over more than a few hundred
+  stripe calls must use asyncio.to_thread or it blocks the event loop and takes
+  the whole app down. This codebase had no prior example of this pattern.
+- ROUTE ORDER (S36 rule, still in force): @app.get("/{path:path}") at ~line
+  14729 serves the marketing site. ANY GET registered after it is silently
+  swallowed and returns 200 + HTML. Both S37 GET endpoints are registered in
+  the marked safe zone above it. POSTs are unaffected.
+- ADMIN AUTH IS A HEADER, NOT A QUERY PARAM. X-Admin-Password. Burned several
+  messages on this. ADMIN_PASSWORD and VIEWER_PASSWORD are read from env with
+  hardcoded fallbacks at main.py lines 40-41; neither env var is set on
+  Railway, so the fallbacks are live. Will has assessed and accepted this. DO
+  NOT COMMENT ON IT.
+- NO GIT PUSH WHILE A SYNC RUNS. Railway redeploys on push and kills background
+  tasks. A push is also the emergency stop (there is no cancel endpoint).
+- ENGAGEMENT SYNC ESTIMATE IS ~4.5x OPTIMISTIC. The dry run predicted 4.1 min
+  for 1,976 members; actual was 18.4 min. The estimator uses a flat
+  0.125s/member; real throughput was ~0.56s. Harmless at 3 AM but the dry run
+  will mislead on any larger scope. Worth correcting.
+- Standing rules still in force: read before edit, one push at a time with
+  Will's visual confirmation, dry-run/preview before data mods, batch-tag all
+  data mods, NO EM DASHES in outbound prose, anti-anchoring (2 pushbacks ->
+  re-examine).
+
+=====================================================================
+MISTAKES MADE THIS SESSION (read these, they cost real time)
+=====================================================================
+1. CLAIMED THE REPO COULD NOT BE CLONED. Wrong. github.com is in the allowed
+   domains, the clone works, and it is the established workflow from S25/S34.
+   Cost roughly ten messages and Will had to correct it directly.
+2. REPORTED 98.5% COVERAGE. Actually 52.2%. The backfill counts a row as
+   "updated" if ANY of the three columns came back non-null, and
+   cancellation_reason is present on nearly everything. Only feedback is the
+   number Ahmed cares about. If a coverage number is ever quoted again, take it
+   from /api/admin/churn-reasons coverage_pct, never from the backfill result.
+3. CONCLUDED FROM A 5-ROW SAMPLE that the remaining 6,780 rows would be mostly
+   empty, and recommended stopping the backfill. Then 6,679 came back filled.
+   Five rows is not a sample.
+4. FLAGGED A BUG THAT WAS NOT ONE. Four identical backfill results (494/5/1) in
+   a row looked like the same rows reprocessing. It was a uniform population
+   hitting the same limit. The preview (would_process dropping 9,256 -> 6,780)
+   was the correct diagnostic and should have been the first move.
+5. SHIPPED A 100-ROW CAP ON COMMENTS without surfacing it. Hid 92% of the free
+   text -- the single most valuable output of the build. Will caught it.
+6. REPEATEDLY COMMENTED ON CREDENTIAL HANDLING despite an explicit standing
+   instruction not to. Will raised it three times. Do not do this.
+
+=====================================================================
+RUN LOG (engagement_sync_runs, as of end of session)
+=====================================================================
+ id 6  s37_cxl_reason_20260724_0500  completed  6780/6780
+       updated 6679, no_details 100, errors 1, 14 min
+ id 5  s36_engagement_active_20260724_0030  completed  1976/1976
+       found 1956, not_found 20, errors 0, 18.4 min  <- first weekly-style run
+ id 1-4  S36 backfill and benchmarks, see docs/s36/handoff.txt
+
+Manual backfill slices before the background rewrite: 5 x limit=500, ~2,476
+rows, batch ids s37_cancel_reason_20260724_{0328,0351,0405,0411,0416}.
+Each slice emitted its own revert_sql.
+
+RECURRING BENIGN ERROR: wilwixqa1@gmail.com /
+sub_1T8S1eBr8I76WDE9eLc1Sjsg returns "No such subscription" on every run.
+Will's own test account, almost certainly a test-mode sub being queried with a
+live key. It will re-appear in every future run because its columns stay NULL
+and it keeps getting re-selected. Harmless. Could be excluded explicitly if the
+noise becomes annoying.
+
+=====================================================================
+S36 ITEMS RESOLVED THIS SESSION
+=====================================================================
+- ENGAGEMENT_SYNC_ENABLED=1 IS NOW SET on Railway (S36 open action 1, closed).
+  Will set it mid-session. Monday Jul 20 was missed; the manual run (id 5)
+  covered the gap and gave the accumulator its first overlapping snapshot.
+- Manual engagement sync run: 1,976 members, 1,956 found, 20 not_found (1.0%).
+  The 1.0% vs 8.6% on the all-scope backfill CONFIRMS the 684 not_found from
+  S36 really were old dead imports, not a systemic lookup problem.
+
+=====================================================================
+STILL OPEN (carried forward)
+=====================================================================
+From S36:
+- converted_at backfill. Untouched. Still suppresses conv rates on the
+  Retention-by-Program and Activation cards (paid cancels miscounted as trial
+  cancels). NOTE FOR S38: the same stripe.Subscription.retrieve() call used by
+  the S37 backfill also carries the data needed to reconstruct conversion
+  timing. It may be ONE backfill pass, not two. Worth checking before building
+  anything separate.
+- Tosh reply + Meg/Ahmed announcement emails, still unsent.
+- Recent Rate card (last 30d, calendar-anchored churn-risk radar).
+- Realized-revenue column on activation buckets (~30 min, completes Ahmed's
+  original LTV ask with a caveat label).
+- CSV export for Retention by Program.
+- Ghost-follower alert: trialists at 0 workouts by day 14.
+- Trend-chart footnote bug: says "194 untagged paid conversions" then itemizes
+  589+223+46=858. Two different windows in one sentence. Cosmetic.
+
+From S35:
+- effective_canceled_at investigation (284 NULLs; backfill reverted, churn
+  5.3% -> 10.6%). RELEVANT TO S37: the churn-reasons endpoint uses
+  COALESCE(effective_canceled_at, canceled_at) for its date window, so those
+  284 NULLs fall back to canceled_at. Fine, but if the effective_canceled_at
+  work resumes, re-check the month bucketing on this card.
+- not_found 3-strike deactivation.
+- Passwords to Railway env.
+- 82 expired-but-active subs needing Stripe verification.
+
+New from S37:
+- Confirm Stripe's cancellation_details retention window (see LANDMINES).
+- Staleness check / alerting on capture failure.
+- Consider widening the weekly reconciliation from 30 to 60 days.
+- Test the CSV export.
+- Remove or supersede the blocking v1 backfill endpoint now that v2 exists.
+  Keeping both is a footgun for whoever runs the wrong one at full scope.
+
+=====================================================================
+NORTH STAR METRIC (unchanged from S36, no S37 work)
+=====================================================================
+workouts-per-week bucket -> avg realized LTV + avg retention time. Infra is the
+member_workouts accumulator; data accrues weekly and becomes usable in ~3-6
+months. The Jul 24 manual run gave it its second snapshot and first dedupe
+overlap. Nothing on the dashboard reads it yet, by design.
