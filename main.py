@@ -457,6 +457,19 @@ async def startup():
                     replace_existing=True,
                 )
                 print("Weekly engagement sync scheduled (Mon 3:00 AM ET)")
+            # S37: Weekly cancellation-reason reconciliation. Narrow by design --
+            # last 30 days only, because the webhook is the primary capture path
+            # and this is purely a safety net for events missed during deploys.
+            # Mondays 4:00 AM ET, an hour after the engagement sync so the two
+            # never overlap on Stripe/ymove load.
+            if STRIPE_SECRET_KEY:
+                scheduler.add_job(
+                    run_weekly_cancellation_reason_sync,
+                    CronTrigger(day_of_week="mon", hour=4, minute=0, timezone=et),
+                    id="weekly_cancellation_reason_sync",
+                    replace_existing=True,
+                )
+                print("Weekly cancellation-reason sync scheduled (Mon 4:00 AM ET)")
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
             print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg} + stats snapshot 9:15 AM ET)")
@@ -15190,4 +15203,171 @@ async def backfill_cancellation_reasons(request: Request):
             f"cancellation_comment = NULL, cancellation_reason = NULL "
             f"WHERE import_batch = '{batch_id}'"
         ),
+    }
+
+
+async def _s37_fetch_cancellation(sub_id: str):
+    """Retrieve cancellation_details for one subscription.
+
+    The stripe library is synchronous. Called directly in a loop it blocks the
+    event loop and freezes every other request for the length of the run, which
+    at several thousand subscriptions means minutes of downtime. to_thread keeps
+    the loop free.
+    """
+    import stripe as _s37_stripe
+    _s37_stripe.api_key = STRIPE_SECRET_KEY
+
+    def _blocking():
+        real = _s37_stripe.Subscription.retrieve(sub_id)
+        cd = real.get("cancellation_details") or {}
+        return cd.get("feedback"), cd.get("comment"), cd.get("reason")
+
+    return await asyncio.to_thread(_blocking)
+
+
+async def run_cancellation_reason_sync(limit: int = 0, days: int = 0, batch_label: str = None):
+    """S37: Fetch Stripe cancellation_details for canceled subs missing a reason.
+
+    days=0  -> all history (the one-time catch-up)
+    days=N  -> only subs canceled in the last N days (the weekly safety net,
+               which exists because the webhook can miss events during a deploy
+               or an outage, not because new cancels need polling)
+
+    Writes ONLY the three S37 columns plus import_batch. Progress is logged to
+    engagement_sync_runs so it can be polled from the existing endpoint.
+    """
+    batch = batch_label or f"s37_cxl_reason_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+    if not db_pool or not STRIPE_SECRET_KEY:
+        print("[S37 CxlSync] Missing db_pool or STRIPE_SECRET_KEY; aborting.")
+        return
+
+    async with db_pool.acquire() as conn:
+        where = [
+            "status = 'canceled'",
+            "source = 'stripe'",
+            "stripe_subscription_id LIKE 'sub_%'",
+            "cancellation_feedback IS NULL",
+            "cancellation_reason IS NULL",
+        ]
+        if days > 0:
+            where.append(
+                f"COALESCE(effective_canceled_at, canceled_at) >= NOW() - INTERVAL '{int(days)} days'"
+            )
+        rows = await conn.fetch(
+            f"""SELECT id, stripe_subscription_id FROM subscriptions
+                WHERE {' AND '.join(where)}
+                ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST
+                {f'LIMIT {int(limit)}' if limit > 0 else ''}"""
+        )
+        run_id = await conn.fetchval(
+            """INSERT INTO engagement_sync_runs (status, batch, progress_total)
+               VALUES ('running', $1, $2) RETURNING id""",
+            batch, len(rows)
+        )
+
+    updated = 0
+    no_details = 0
+    errors = []
+    try:
+        for i, r in enumerate(rows, 1):
+            try:
+                fb, cm, rs = await _s37_fetch_cancellation(r["stripe_subscription_id"])
+                if any((fb, cm, rs)):
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE subscriptions
+                               SET cancellation_feedback = COALESCE($1, cancellation_feedback),
+                                   cancellation_comment  = COALESCE($2, cancellation_comment),
+                                   cancellation_reason   = COALESCE($3, cancellation_reason),
+                                   import_batch = $4, updated_at = NOW()
+                               WHERE id = $5""",
+                            fb, cm, rs, batch, r["id"]
+                        )
+                    updated += 1
+                else:
+                    no_details += 1
+            except Exception as e:
+                errors.append(str(e)[:120])
+
+            if i % 50 == 0 or i == len(rows):
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE engagement_sync_runs SET progress_current = $1 WHERE id = $2",
+                        i, run_id
+                    )
+                await asyncio.sleep(0.2)  # gentle on the Stripe API
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE engagement_sync_runs
+                   SET status = 'completed', completed_at = NOW(), results = $1
+                   WHERE id = $2""",
+                json.dumps({
+                    "total": len(rows), "updated": updated,
+                    "no_details_in_stripe": no_details,
+                    "errors": len(errors), "sample_errors": errors[:5],
+                    "revert_sql": (
+                        "UPDATE subscriptions SET cancellation_feedback = NULL, "
+                        "cancellation_comment = NULL, cancellation_reason = NULL "
+                        f"WHERE import_batch = '{batch}'"
+                    ),
+                }), run_id
+            )
+        print(f"[S37 CxlSync] {batch}: {updated} updated, {no_details} empty, {len(errors)} errors")
+    except Exception as e:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE engagement_sync_runs SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2",
+                str(e)[:500], run_id
+            )
+        print(f"[S37 CxlSync] Run {run_id} FAILED: {e}")
+
+
+async def run_weekly_cancellation_reason_sync():
+    """Scheduler wrapper: reconcile the last 30 days only.
+
+    The webhook is the primary capture path and handles cancels in real time.
+    This exists solely to catch events missed during a deploy or outage, so the
+    window is deliberately narrow: a full-history re-scan every week would be
+    thousands of Stripe calls to re-confirm rows already known to be empty.
+    """
+    await run_cancellation_reason_sync(
+        days=30,
+        batch_label=f"s37_cxl_weekly_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+    )
+
+
+@app.post("/api/admin/cancellation-reason-sync-now")
+async def cancellation_reason_sync_now(request: Request):
+    """S37: Trigger the cancellation-reason sync in the background.
+
+    Body: {confirm: true, limit: 0, days: 0}
+      days=0 = all history (one-time catch-up), days=30 = recent only.
+    Poll /api/admin/engagement-sync-runs for progress (shared run log).
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse(status_code=500, content={"error": "STRIPE_SECRET_KEY not set"})
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    if not body.get("confirm"):
+        return JSONResponse(status_code=400, content={
+            "error": "Pass {confirm: true}. Use the preview on /api/admin/backfill-cancellation-reasons to inspect first."
+        })
+
+    limit = int(body.get("limit") or 0)
+    days = int(body.get("days") or 0)
+    asyncio.create_task(run_cancellation_reason_sync(limit=limit, days=days))
+    return {
+        "status": "started",
+        "scope": f"last {days} days" if days > 0 else "all history",
+        "limit": limit or "no cap",
+        "note": "Running in background. Poll /api/admin/engagement-sync-runs for progress.",
     }
