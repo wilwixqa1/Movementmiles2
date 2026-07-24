@@ -14213,6 +14213,119 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # S36: registered BEFORE the marketing-site catch-all below, otherwise
 # @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
+
+@app.post("/api/admin/verify-stripe-drift")
+async def verify_stripe_drift(request: Request):
+    """S38: READ-ONLY. Confirm whether our active/trialing Stripe subs are
+    genuinely stale vs. Stripe's live status. Investigates the reconciliation
+    drift (we hold N more Stripe actives than ymove reports). Makes NO writes,
+    NO schema changes. Just retrieves each sub from Stripe and buckets it.
+
+    Stripe statuses that mean 'still a live/paying member':
+        active, trialing, past_due (grace)  -> NOT stale
+    Everything else (canceled, unpaid, incomplete_expired, incomplete,
+        paused)                             -> STALE (we say active, Stripe disagrees)
+
+    Uses asyncio.to_thread per S37 rule: a tight loop of synchronous
+    stripe.Subscription.retrieve() calls would block the event loop and take
+    the whole dashboard down. POST endpoint, so the catch-all does not swallow it.
+
+    Body/params: {limit} optional cap for a quick sample (default: all).
+    Auth: X-Admin-Password header.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        limit = int(body.get("limit") or request.query_params.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+
+    async with db_pool.acquire() as conn:
+        q = """SELECT id, readable_id, email, stripe_subscription_id, status
+               FROM subscriptions
+               WHERE source = 'stripe'
+                 AND status IN ('active', 'trialing')
+                 AND email != '' AND email IS NOT NULL
+               ORDER BY id"""
+        if limit > 0:
+            q += f" LIMIT {limit}"
+        rows = await conn.fetch(q)
+
+    live_ok = {"active", "trialing", "past_due"}
+
+    def _check(sub_id):
+        import stripe as _s
+        _s.api_key = STRIPE_SECRET_KEY
+        try:
+            real = _s.Subscription.retrieve(sub_id)
+            return {"ok": True, "stripe_status": real.get("status"),
+                    "cancel_at_period_end": real.get("cancel_at_period_end"),
+                    "current_period_end": real.get("current_period_end")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    stale, still_live, pending_grace, not_found, errors = [], [], [], [], []
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    for r in rows:
+        sub_id = r["stripe_subscription_id"] or ""
+        if not sub_id.startswith("sub_"):
+            errors.append({"readable_id": r["readable_id"], "email": r["email"],
+                           "our_status": r["status"], "reason": "no valid sub_ id"})
+            continue
+        res = await asyncio.to_thread(_check, sub_id)
+        base = {"readable_id": r["readable_id"], "email": r["email"],
+                "our_status": r["status"], "sub_id": sub_id}
+        if not res["ok"]:
+            err = res["error"]
+            if "No such subscription" in err:
+                not_found.append({**base, "error": err})
+            else:
+                errors.append({**base, "error": err})
+            continue
+        ss = res["stripe_status"]
+        pe = res.get("current_period_end")
+        entry = {**base, "stripe_status": ss,
+                 "cancel_at_period_end": res.get("cancel_at_period_end")}
+        if ss in live_ok:
+            # active but flagged to cancel at period end = still live now, will lapse
+            if res.get("cancel_at_period_end") and pe and pe <= now_ts:
+                stale.append({**entry, "note": "cancel_at_period_end elapsed"})
+            elif res.get("cancel_at_period_end"):
+                pending_grace.append(entry)
+            else:
+                still_live.append(entry)
+        else:
+            stale.append(entry)
+
+    return {
+        "checked": len(rows),
+        "summary": {
+            "still_live": len(still_live),
+            "pending_grace": len(pending_grace),
+            "stale": len(stale),
+            "not_found_on_stripe": len(not_found),
+            "errors": len(errors),
+        },
+        "stale": stale,
+        "not_found_on_stripe": not_found,
+        "pending_grace": pending_grace,
+        "errors": errors,
+        "note": "READ-ONLY. No rows were modified. 'stale' = we say active/trialing, "
+                "Stripe says otherwise. 'not_found_on_stripe' = Stripe has no such sub "
+                "(often test-mode subs queried with a live key, e.g. Will's test account).",
+    }
+
+
 @app.get("/api/admin/churn-reasons")
 async def churn_reasons(request: Request):
     """S37: Churn-reason breakdown from Stripe cancellation_details (Ahmed's ask).
