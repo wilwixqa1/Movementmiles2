@@ -14326,6 +14326,138 @@ async def verify_stripe_drift(request: Request):
     }
 
 
+@app.post("/api/admin/fix-stripe-drift")
+async def fix_stripe_drift(request: Request):
+    """S38: Remediate stale Stripe actives found by verify-stripe-drift.
+    Flips our-active/trialing rows to 'canceled' ONLY when Stripe confirms the
+    sub is genuinely canceled/unpaid/expired at write time (re-verified live,
+    never trusting an earlier scan).
+
+    Cancel date comes from STRIPE, not NOW(): effective_canceled_at uses
+    ended_at (actual termination) coalesced to canceled_at (cancel requested),
+    so churn lands in the correct historical month instead of a fake spike today.
+
+    Two modes (body JSON):
+      {"preview": true}                       -> re-verify + show diff, NO writes
+      {"confirm": true, "batch_label": "..."} -> write, tag every row, emit revert_sql
+
+    Every touched row gets import_batch = batch_label for one-command revert.
+    Auth: X-Admin-Password header. Admin only.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = bool(body.get("preview"))
+    confirm = bool(body.get("confirm"))
+    batch_label = body.get("batch_label") or ""
+    if not preview and not confirm:
+        raise HTTPException(status_code=400, detail="Pass preview:true or confirm:true")
+    if confirm and not batch_label:
+        raise HTTPException(status_code=400, detail="confirm requires a batch_label for reversibility")
+
+    # Stripe statuses meaning 'still a live/paying member' -> leave alone
+    live_ok = {"active", "trialing", "past_due"}
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, readable_id, email, stripe_subscription_id, status
+               FROM subscriptions
+               WHERE source = 'stripe'
+                 AND status IN ('active', 'trialing')
+                 AND email != '' AND email IS NOT NULL
+               ORDER BY id"""
+        )
+
+    def _check(sub_id):
+        import stripe as _s
+        _s.api_key = STRIPE_SECRET_KEY
+        try:
+            real = _s.Subscription.retrieve(sub_id)
+            return {"ok": True, "status": real.get("status"),
+                    "canceled_at": real.get("canceled_at"),
+                    "ended_at": real.get("ended_at")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    to_fix, skipped_live, errors = [], 0, 0
+    for r in rows:
+        sub_id = r["stripe_subscription_id"] or ""
+        if not sub_id.startswith("sub_"):
+            errors += 1
+            continue
+        res = await asyncio.to_thread(_check, sub_id)
+        if not res["ok"]:
+            errors += 1
+            continue
+        if res["status"] in live_ok:
+            skipped_live += 1
+            continue
+        # Genuinely canceled on Stripe. Prefer ended_at, fall back to canceled_at.
+        ts = res.get("ended_at") or res.get("canceled_at")
+        eff_dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+        to_fix.append({
+            "id": r["id"], "readable_id": r["readable_id"], "email": r["email"],
+            "our_status": r["status"], "stripe_status": res["status"],
+            "effective_canceled_at": eff_dt.isoformat() if eff_dt else None,
+            "_eff_dt": eff_dt,
+        })
+
+    if preview or not confirm:
+        return {
+            "mode": "preview",
+            "would_cancel": len(to_fix),
+            "skipped_still_live": skipped_live,
+            "errors": errors,
+            "rows": [{k: v for k, v in f.items() if k != "_eff_dt"} for f in to_fix],
+            "note": "PREVIEW ONLY. No rows modified. Run again with "
+                    "{confirm:true, batch_label:'...'} to apply.",
+        }
+
+    # confirm path
+    updated = 0
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            for f in to_fix:
+                eff = f["_eff_dt"]
+                await conn.execute(
+                    """UPDATE subscriptions
+                       SET status = 'canceled',
+                           canceled_at = COALESCE(canceled_at, $1),
+                           effective_canceled_at = $1,
+                           cancel_state = 'expired',
+                           import_batch = $2,
+                           updated_at = NOW()
+                       WHERE id = $3""",
+                    eff or datetime.now(timezone.utc), batch_label, f["id"]
+                )
+                updated += 1
+
+    revert_sql = (
+        f"UPDATE subscriptions SET status='active', cancel_state=NULL, "
+        f"effective_canceled_at=NULL, updated_at=NOW() "
+        f"WHERE import_batch='{batch_label}';"
+    )
+    return {
+        "mode": "confirm",
+        "updated": updated,
+        "skipped_still_live": skipped_live,
+        "errors": errors,
+        "batch_label": batch_label,
+        "revert_sql": revert_sql,
+        "note": "Rows flipped to canceled using Stripe cancel dates. "
+                "To fully undo, run the revert_sql (note it does not restore "
+                "prior canceled_at where one already existed).",
+    }
+
+
 @app.get("/api/admin/churn-reasons")
 async def churn_reasons(request: Request):
     """S37: Churn-reason breakdown from Stripe cancellation_details (Ahmed's ask).
