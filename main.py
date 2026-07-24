@@ -14292,15 +14292,14 @@ async def churn_reasons(request: Request):
             *params
         )
 
-        comments = await conn.fetch(
+        # Comments are paginated via /api/admin/churn-comments; this endpoint
+        # returns only the total so the card can size its pager without
+        # carrying rows it is not displaying.
+        comment_total = await conn.fetchval(
             f"""
-            SELECT email, cancellation_feedback AS reason, cancellation_comment AS comment,
-                   COALESCE(effective_canceled_at, canceled_at) AS canceled_at
-            FROM subscriptions
+            SELECT COUNT(*) FROM subscriptions
             WHERE {where_sql}
               AND cancellation_comment IS NOT NULL AND cancellation_comment <> ''
-            ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST
-            LIMIT 100
             """,
             *params
         )
@@ -14331,6 +14330,128 @@ async def churn_reasons(request: Request):
             {"month": r["month"], "reason": r["reason"], "count": r["n"]}
             for r in by_month
         ],
+        "comment_total": comment_total or 0,
+        "note": (
+            "pct_of_all_churn uses every canceled sub as the denominator. "
+            "pct_of_known excludes no_reason_recorded and will read much higher; "
+            "it answers 'of the people who told us, what did they say'. "
+            "Report both or the numbers mislead."
+        ),
+    }
+
+
+@app.get("/api/admin/churn-comments")
+async def churn_comments(request: Request):
+    """S37: Paginated free-text cancellation comments.
+
+    Separate from /churn-reasons so the summary card does not carry comment
+    rows it is not displaying on every dashboard refresh.
+
+    Query params:
+      months=N   same window semantics as /churn-reasons (0/absent = all time)
+      reason=X   filter to one feedback value (e.g. 'other', 'too_expensive')
+      page=N     1-indexed
+      per_page=N default 25, max 200
+      format=csv return a CSV download of ALL matching rows, ignoring paging
+    """
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    try:
+        months = int(request.query_params.get("months") or 0)
+    except (TypeError, ValueError):
+        months = 0
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = min(200, max(1, int(request.query_params.get("per_page") or 25)))
+    except (TypeError, ValueError):
+        per_page = 25
+    reason = (request.query_params.get("reason") or "").strip()
+    as_csv = (request.query_params.get("format") or "").lower() == "csv"
+
+    where = [
+        "status = 'canceled'",
+        "cancellation_comment IS NOT NULL",
+        "cancellation_comment <> ''",
+    ]
+    params = []
+    if months > 0:
+        params.append(months)
+        where.append(
+            f"COALESCE(effective_canceled_at, canceled_at) >= NOW() - ($"
+            f"{len(params)} * INTERVAL '1 month')"
+        )
+    if reason:
+        params.append(reason)
+        where.append(f"cancellation_feedback = ${len(params)}")
+    where_sql = " AND ".join(where)
+
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM subscriptions WHERE {where_sql}", *params
+        ) or 0
+
+        if as_csv:
+            rows = await conn.fetch(
+                f"""SELECT email, cancellation_feedback AS reason,
+                           cancellation_comment AS comment,
+                           COALESCE(effective_canceled_at, canceled_at) AS canceled_at
+                    FROM subscriptions WHERE {where_sql}
+                    ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST""",
+                *params
+            )
+        else:
+            offset = (page - 1) * per_page
+            rows = await conn.fetch(
+                f"""SELECT email, cancellation_feedback AS reason,
+                           cancellation_comment AS comment,
+                           COALESCE(effective_canceled_at, canceled_at) AS canceled_at
+                    FROM subscriptions WHERE {where_sql}
+                    ORDER BY COALESCE(effective_canceled_at, canceled_at) DESC NULLS LAST
+                    LIMIT {per_page} OFFSET {offset}""",
+                *params
+            )
+
+        # Reason values that actually have comments attached, for the filter UI.
+        facets = await conn.fetch(
+            """SELECT cancellation_feedback AS reason, COUNT(*) AS n
+               FROM subscriptions
+               WHERE status = 'canceled'
+                 AND cancellation_comment IS NOT NULL AND cancellation_comment <> ''
+                 AND cancellation_feedback IS NOT NULL
+               GROUP BY 1 ORDER BY 2 DESC"""
+        )
+
+    if as_csv:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["canceled_at", "email", "reason", "comment"])
+        for r in rows:
+            w.writerow([
+                str(r["canceled_at"])[:19] if r["canceled_at"] else "",
+                r["email"] or "",
+                r["reason"] or "",
+                (r["comment"] or "").replace("\r", " ").replace("\n", " "),
+            ])
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="churn_comments_{stamp}.csv"'},
+        )
+
+    return {
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": max(1, (total + per_page - 1) // per_page),
+        "reason_filter": reason or None,
+        "facets": [{"reason": f["reason"], "count": f["n"]} for f in facets],
         "comments": [
             {
                 "email": r["email"],
@@ -14338,14 +14459,8 @@ async def churn_reasons(request: Request):
                 "comment": r["comment"],
                 "canceled_at": str(r["canceled_at"]) if r["canceled_at"] else None,
             }
-            for r in comments
+            for r in rows
         ],
-        "note": (
-            "pct_of_all_churn uses every canceled sub as the denominator. "
-            "pct_of_known excludes no_reason_recorded and will read much higher; "
-            "it answers 'of the people who told us, what did they say'. "
-            "Report both or the numbers mislead."
-        ),
     }
 
 

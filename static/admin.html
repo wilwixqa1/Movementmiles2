@@ -741,15 +741,32 @@
           </tbody>
         </table>
       </div>
-      <div id="churn-comments-wrap" style="margin-top:16px;display:none">
-        <div style="font-size:.78rem;font-weight:600;color:var(--navy-mid);margin-bottom:6px">What they typed</div>
-        <div style="max-height:260px;overflow-y:auto">
+      <div id="churn-comments-wrap" style="margin-top:20px;display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+          <div style="font-size:.78rem;font-weight:600;color:var(--navy-mid)" id="churn-comments-title">What they typed</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <select id="churn-comments-filter" onchange="setChurnCommentFilter(this.value)" style="font-size:.72rem;padding:3px 8px">
+              <option value="">All reasons</option>
+            </select>
+            <button class="quick-btn" onclick="exportChurnComments()" style="padding:4px 12px;font-size:.72rem">Export CSV</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
           <table style="width:100%;font-size:.8rem">
             <thead><tr>
-              <th>Date</th><th>Reason</th><th>Comment</th>
+              <th style="width:96px">Date</th>
+              <th style="width:180px">Reason</th>
+              <th>Comment</th>
             </tr></thead>
             <tbody id="churn-comments-tbody"></tbody>
           </table>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:12px;flex-wrap:wrap">
+          <div style="font-size:.72rem;color:var(--navy-mid)" id="churn-comments-range"></div>
+          <div style="display:flex;gap:4px">
+            <button class="quick-btn" onclick="churnCommentsPage(-1)" id="churn-prev" style="padding:4px 12px;font-size:.72rem">&larr; Prev</button>
+            <button class="quick-btn" onclick="churnCommentsPage(1)" id="churn-next" style="padding:4px 12px;font-size:.72rem">Next &rarr;</button>
+          </div>
         </div>
       </div>
       <div style="font-size:.72rem;color:var(--navy-mid);margin-top:8px">
@@ -2258,6 +2275,7 @@ var CHURN_LABELS = {
 
 function setChurnWindow(m) {
   churnWindow = m;
+  churnCommentsPageNum = 1;  // otherwise a narrower window lands on a page that no longer exists
   [0, 3, 6, 12].forEach(function(x) {
     var b = document.getElementById('churn-btn-' + x);
     if (b) b.classList.toggle('active', x === m);
@@ -2314,24 +2332,114 @@ function renderChurnReasons() {
   });
   tb.innerHTML = html;
 
-  var cw = document.getElementById('churn-comments-wrap');
-  var ctb = document.getElementById('churn-comments-tbody');
-  var comments = d.comments || [];
-  if (cw && ctb) {
-    if (comments.length) {
-      cw.style.display = 'block';
-      var chtml = '';
-      comments.forEach(function(c) {
-        var dt = c.canceled_at ? c.canceled_at.slice(0, 10) : '&mdash;';
-        var lbl = CHURN_LABELS[c.reason] || c.reason || '&mdash;';
-        var txt = (c.comment || '').replace(/[<>]/g, '');
-        chtml += '<tr><td>' + dt + '</td><td>' + lbl + '</td><td>' + txt + '</td></tr>';
-      });
-      ctb.innerHTML = chtml;
-    } else {
-      cw.style.display = 'none';
-    }
+  loadChurnComments();
+}
+
+var churnCommentsPageNum = 1;
+var churnCommentsFilter = '';
+var churnCommentsData = null;
+
+function churnCommentsQS(extra) {
+  var p = [];
+  if (churnWindow > 0) p.push('months=' + churnWindow);
+  if (churnCommentsFilter) p.push('reason=' + encodeURIComponent(churnCommentsFilter));
+  p.push('page=' + churnCommentsPageNum);
+  p.push('per_page=25');
+  if (extra) p.push(extra);
+  return '?' + p.join('&');
+}
+
+function loadChurnComments() {
+  fetch('/api/admin/churn-comments' + churnCommentsQS(), {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    churnCommentsData = d;
+    renderChurnComments();
+  }).catch(function() {
+    var w = document.getElementById('churn-comments-wrap');
+    if (w) w.style.display = 'none';
+  });
+}
+
+function setChurnCommentFilter(v) {
+  churnCommentsFilter = v;
+  churnCommentsPageNum = 1;
+  loadChurnComments();
+}
+
+function churnCommentsPage(delta) {
+  if (!churnCommentsData) return;
+  var next = churnCommentsPageNum + delta;
+  if (next < 1 || next > churnCommentsData.total_pages) return;
+  churnCommentsPageNum = next;
+  loadChurnComments();
+}
+
+function exportChurnComments() {
+  var qs = churnCommentsQS('format=csv');
+  fetch('/api/admin/churn-comments' + qs, {
+    headers: {'X-Admin-Password': adminPw}
+  }).then(function(r) { return r.blob(); }).then(function(b) {
+    var url = URL.createObjectURL(b);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'churn_comments.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+}
+
+function renderChurnComments() {
+  var d = churnCommentsData;
+  var wrap = document.getElementById('churn-comments-wrap');
+  var tb = document.getElementById('churn-comments-tbody');
+  if (!wrap || !tb || !d) return;
+
+  if (!d.total) {
+    wrap.style.display = 'none';
+    return;
   }
+  wrap.style.display = 'block';
+
+  var sel = document.getElementById('churn-comments-filter');
+  if (sel && sel.options.length <= 1 && d.facets) {
+    d.facets.forEach(function(f) {
+      var o = document.createElement('option');
+      o.value = f.reason;
+      o.textContent = (CHURN_LABELS[f.reason] || f.reason) + ' (' + f.count + ')';
+      sel.appendChild(o);
+    });
+  }
+
+  var title = document.getElementById('churn-comments-title');
+  if (title) {
+    title.textContent = 'What they typed \u2014 ' + d.total + ' comment' + (d.total === 1 ? '' : 's');
+  }
+
+  var html = '';
+  (d.comments || []).forEach(function(c) {
+    var dt = c.canceled_at ? c.canceled_at.slice(0, 10) : '&mdash;';
+    var lbl = CHURN_LABELS[c.reason] || c.reason || '&mdash;';
+    var txt = (c.comment || '').replace(/[<>]/g, '');
+    html += '<tr><td style="white-space:nowrap">' + dt + '</td>'
+      + '<td>' + lbl + '</td>'
+      + '<td>' + txt + '</td></tr>';
+  });
+  tb.innerHTML = html;
+
+  var rng = document.getElementById('churn-comments-range');
+  if (rng) {
+    var from = (d.page - 1) * d.per_page + 1;
+    var to = Math.min(d.page * d.per_page, d.total);
+    rng.textContent = 'Showing ' + from + '\u2013' + to + ' of ' + d.total
+      + '  (page ' + d.page + ' of ' + d.total_pages + ')';
+  }
+  var prev = document.getElementById('churn-prev');
+  var next = document.getElementById('churn-next');
+  if (prev) prev.disabled = (d.page <= 1);
+  if (next) next.disabled = (d.page >= d.total_pages);
 }
 
 function loadProgramInsights() {
