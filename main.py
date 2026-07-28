@@ -14214,6 +14214,73 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # S36: registered BEFORE the marketing-site catch-all below, otherwise
 # @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
 
+@app.post("/api/admin/debug-mrr-trend")
+async def debug_mrr_trend(request: Request):
+    """S38: READ-ONLY. Decompose the current-week MRR-trend bar to explain why it
+    reads higher than the Gross MRR card. Runs the trend join for the current
+    week and buckets contributing rows by (status, plan_interval) so we can see
+    exactly which rows the trend counts that the active-only card does not.
+    No writes.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    async with db_pool.acquire() as conn:
+        # A) What the CARD counts: active-only, normalized to monthly cents
+        card = await conn.fetchrow(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN plan_interval='month' THEN plan_amount ELSE 0 END),0)
+               + COALESCE(SUM(CASE WHEN plan_interval='year'  THEN plan_amount/12 ELSE 0 END),0) AS mrr_cents,
+                 COUNT(*) AS n
+               FROM subscriptions
+               WHERE status = 'active'"""
+        )
+
+        # B) What the TREND counts for the CURRENT week bucket, broken down
+        breakdown = await conn.fetch(
+            """WITH w AS (SELECT date_trunc('week', NOW()) AS wk)
+               SELECT
+                 s.status,
+                 s.plan_interval,
+                 (s.effective_canceled_at IS NOT NULL AND s.effective_canceled_at > (SELECT wk FROM w)) AS kept_by_cancel_clause,
+                 COUNT(*) AS n,
+                 COALESCE(SUM(CASE WHEN s.plan_interval='month' THEN s.plan_amount
+                                   WHEN s.plan_interval='year'  THEN s.plan_amount/12
+                                   ELSE 0 END),0) AS mrr_cents
+               FROM subscriptions s, w
+               WHERE s.created_at <= w.wk
+                 AND (s.status IN ('active','trialing') OR s.effective_canceled_at > w.wk)
+                 AND s.status != 'incomplete_expired'
+               GROUP BY s.status, s.plan_interval, kept_by_cancel_clause
+               ORDER BY mrr_cents DESC"""
+        )
+
+    rows = [{"status": r["status"], "plan_interval": r["plan_interval"],
+             "kept_by_cancel_clause": r["kept_by_cancel_clause"],
+             "n": r["n"], "mrr": round(r["mrr_cents"]/100, 2)} for r in breakdown]
+    trend_total = round(sum(r["mrr"] for r in rows), 2)
+
+    # Aggregate the two suspected inflators
+    trialing_mrr = round(sum(r["mrr"] for r in rows if r["status"] == "trialing"), 2)
+    trialing_n = sum(r["n"] for r in rows if r["status"] == "trialing")
+    canceled_kept_mrr = round(sum(r["mrr"] for r in rows if r["kept_by_cancel_clause"]), 2)
+    canceled_kept_n = sum(r["n"] for r in rows if r["kept_by_cancel_clause"])
+
+    return {
+        "card_active_only": {"mrr": round(card["mrr_cents"]/100, 2), "subs": card["n"]},
+        "trend_current_week": {"mrr": trend_total, "subs": sum(r["n"] for r in rows)},
+        "gap": round(trend_total - card["mrr_cents"]/100, 2),
+        "inflator_trialing": {"mrr": trialing_mrr, "subs": trialing_n},
+        "inflator_canceled_still_counted": {"mrr": canceled_kept_mrr, "subs": canceled_kept_n},
+        "breakdown": rows,
+        "note": "READ-ONLY. 'card_active_only' = Gross MRR card logic. "
+                "'trend_current_week' = the last trend bar. The two inflators explain the gap: "
+                "trialing subs (not paying yet) and canceled subs kept by the effective_canceled_at>week clause.",
+    }
+
+
 @app.post("/api/admin/verify-stripe-drift")
 async def verify_stripe_drift(request: Request):
     """S38: READ-ONLY. Confirm whether our active/trialing Stripe subs are
