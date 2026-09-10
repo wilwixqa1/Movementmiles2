@@ -14214,6 +14214,130 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # S36: registered BEFORE the marketing-site catch-all below, otherwise
 # @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
 
+@app.post("/api/admin/debug-klaviyo-sweep")
+async def debug_klaviyo_sweep(request: Request):
+    """S39: READ-ONLY. Builds the Klaviyo sweep population exactly as the real
+    push job would, and reports what it finds. Sends NOTHING to Klaviyo, writes
+    NOTHING to the database. This exists to answer four questions before we
+    build the push:
+
+      1. How many emails end up in the sweep, split active vs cancelled?
+      2. How many emails have multiple subscription rows, and how many of those
+         rows disagree with each other on status?
+      3. How many emails are malformed? Klaviyo rejects an ENTIRE batch if one
+         address is invalid, so this has to be zero before we send.
+      4. How many active members have no clean billing source?
+
+    Resolution rule (same one the push job will use): one row per lowercased
+    email. If ANY row for that email is active or trialing, the email is active.
+    Otherwise cancelled. Klaviyo matches on email, so two rows for the same
+    person must collapse to one decision before we send.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    raw_body = await request.body()
+    body = json.loads(raw_body) if raw_body else {}
+    cancel_months = int(body.get("cancel_months", 12))
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH base AS (
+                SELECT lower(trim(email)) AS em,
+                       status,
+                       source,
+                       created_at,
+                       COALESCE(effective_canceled_at, canceled_at) AS cxl_at,
+                       CASE WHEN status IN ('active', 'trialing') THEN 1 ELSE 0 END AS act
+                FROM subscriptions
+                WHERE email IS NOT NULL AND trim(email) <> ''
+            ),
+            agg AS (
+                SELECT em,
+                       MAX(act) AS is_active,
+                       COUNT(*) AS row_count,
+                       COUNT(DISTINCT status) AS status_variants,
+                       MAX(cxl_at) AS last_cxl,
+                       BOOL_OR(act = 0 AND cxl_at IS NULL) AS has_undated_cancel
+                FROM base
+                GROUP BY em
+            ),
+            win AS (
+                SELECT DISTINCT ON (em) em, source, status
+                FROM base
+                ORDER BY em, act DESC, created_at DESC
+            )
+            SELECT a.em, a.is_active, a.row_count, a.status_variants,
+                   a.last_cxl, a.has_undated_cancel,
+                   w.source AS win_source, w.status AS win_status
+            FROM agg a JOIN win w ON w.em = a.em
+        """)
+
+    # Window filter applied in Python so we can report what the window EXCLUDES
+    # rather than silently dropping it.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cancel_months * 31)
+
+    active_count, cancelled_count = 0, 0
+    excluded_old, undated_cancels = 0, 0
+    multi_row, conflicting = 0, 0
+    source_counts = {}
+    bad_emails = []
+
+    email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
+
+    for r in rows:
+        em = r["em"]
+        if not email_re.match(em):
+            bad_emails.append(em)
+            continue
+
+        if r["row_count"] > 1:
+            multi_row += 1
+            if r["status_variants"] > 1:
+                conflicting += 1
+
+        if r["is_active"] == 1:
+            active_count += 1
+            src = r["win_source"] or "(blank)"
+            source_counts[src] = source_counts.get(src, 0) + 1
+        else:
+            if r["last_cxl"] is None:
+                undated_cancels += 1
+            elif r["last_cxl"] >= cutoff:
+                cancelled_count += 1
+            else:
+                excluded_old += 1
+
+    return {
+        "ok": True,
+        "read_only": True,
+        "cancel_window_months": cancel_months,
+        "distinct_emails_scanned": len(rows),
+        "sweep": {
+            "active": active_count,
+            "cancelled": cancelled_count,
+            "total_payload": active_count + cancelled_count,
+        },
+        "excluded": {
+            "cancelled_outside_window": excluded_old,
+            "cancelled_with_no_date": undated_cancels,
+            "malformed_emails": len(bad_emails),
+        },
+        "duplicates": {
+            "emails_with_multiple_rows": multi_row,
+            "of_those_with_conflicting_status": conflicting,
+        },
+        "active_by_source": source_counts,
+        "malformed_samples": bad_emails[:20],
+        "notes": [
+            "past_due resolves to cancelled per Ahmed's spec, but the shadow sync "
+            "treats past_due as active-ish. Expect a small deliberate gap.",
+            "Klaviyo rejects the whole batch on one bad email. malformed_emails "
+            "must be 0 before the real push runs.",
+        ],
+    }
+
+
 @app.post("/api/admin/debug-mrr-trend")
 async def debug_mrr_trend(request: Request):
     """S38: READ-ONLY. Decompose the current-week MRR-trend bar to explain why it
