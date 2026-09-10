@@ -42,6 +42,12 @@ VIEWER_PASSWORD = os.environ.get("VIEWER_PASSWORD", "MMTeam262")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# S39: Klaviyo member-status sync. KLAVIYO_API_KEY is set on Railway, not
+# hardcoded, because the scoped key is issued separately from the one in the
+# original request. Revision is pinned and overridable so a Klaviyo API
+# deprecation can be handled with an env change instead of a deploy.
+KLAVIYO_API_KEY = os.environ.get("KLAVIYO_API_KEY", "")
+KLAVIYO_REVISION = os.environ.get("KLAVIYO_REVISION", "2024-10-15")
 DIGEST_RECIPIENTS = os.environ.get("DIGEST_RECIPIENTS", "")
 DIGEST_FROM_EMAIL = os.environ.get("DIGEST_FROM_EMAIL", "onboarding@resend.dev")
 
@@ -14223,6 +14229,198 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # S36: registered BEFORE the marketing-site catch-all below, otherwise
 # @app.get('/{path:path}') swallows these GET routes (POSTs are unaffected).
+
+KLAVIYO_PROP_STATUS = "Subscription Status"
+KLAVIYO_PROP_SOURCE = "Billing Source"
+KLAVIYO_VAL_ACTIVE = "active"
+KLAVIYO_VAL_CANCELLED = "cancelled"   # British spelling: Ahmed's segment matches
+                                      # this literal string. Our DB uses Stripe's
+                                      # 'canceled' (one L). NEVER pass the DB value
+                                      # straight through.
+KLAVIYO_MAX_PER_JOB = 9000            # Klaviyo's hard cap is 10,000. Headroom left
+                                      # deliberately so growth doesn't silently
+                                      # start truncating.
+
+
+async def _build_klaviyo_population(cancel_months: int = 12):
+    """S39: Resolve subscriptions to one decision per person for the Klaviyo push.
+
+    Returns (profiles, stats). Pure read. Mirrors /api/admin/debug-klaviyo-sweep
+    exactly, so what the diagnostic showed is what this sends.
+
+    Rules:
+      - One entry per lowercased email. Klaviyo matches on email, so two
+        subscription rows for one human must collapse to a single decision.
+      - Any row active or trialing wins -> active. Everything else -> cancelled.
+        past_due resolves to cancelled per Ahmed's spec.
+      - Cancelled people are only included if they canceled within the window.
+        They MUST be included: Klaviyo never changes a value on its own, so the
+        only way to move someone off active is to send them with cancelled on it.
+      - Billing Source is omitted entirely when we don't know it, rather than
+        being sent as 'undetermined'. Will's call.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH base AS (
+                SELECT lower(trim(email)) AS em, status, source, created_at,
+                       COALESCE(effective_canceled_at, canceled_at) AS cxl_at,
+                       CASE WHEN status IN ('active', 'trialing') THEN 1 ELSE 0 END AS act
+                FROM subscriptions
+                WHERE email IS NOT NULL AND trim(email) <> ''
+            ),
+            agg AS (
+                SELECT em, MAX(act) AS is_active, MAX(cxl_at) AS last_cxl
+                FROM base GROUP BY em
+            ),
+            win AS (
+                SELECT DISTINCT ON (em) em, source
+                FROM base ORDER BY em, act DESC, created_at DESC
+            )
+            SELECT a.em, a.is_active, a.last_cxl, w.source AS win_source
+            FROM agg a JOIN win w ON w.em = a.em
+        """)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cancel_months * 31)
+    email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
+
+    profiles = []
+    stats = {"active": 0, "cancelled": 0, "skipped_old": 0,
+             "skipped_malformed": 0, "source_omitted": 0}
+
+    for r in rows:
+        em = r["em"]
+        if not email_re.match(em):
+            # Klaviyo rejects the ENTIRE batch on one bad address, so these are
+            # dropped rather than sent. Counted so a rise is visible.
+            stats["skipped_malformed"] += 1
+            continue
+
+        if r["is_active"] == 1:
+            status_val = KLAVIYO_VAL_ACTIVE
+            stats["active"] += 1
+        else:
+            if r["last_cxl"] is not None and r["last_cxl"] < cutoff:
+                stats["skipped_old"] += 1
+                continue
+            status_val = KLAVIYO_VAL_CANCELLED
+            stats["cancelled"] += 1
+
+        props = {KLAVIYO_PROP_STATUS: status_val}
+        src = (r["win_source"] or "").strip().lower()
+        if src in ("stripe", "apple", "google"):
+            props[KLAVIYO_PROP_SOURCE] = src
+        else:
+            stats["source_omitted"] += 1
+
+        profiles.append({"type": "profile",
+                         "attributes": {"email": em, "properties": props}})
+
+    return profiles, stats
+
+
+async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12):
+    """S39: Push member status to Klaviyo. Designed to run at the tail of the
+    daily shadow sync, once ground truth is settled.
+
+    dry_run=True builds the full payload and returns it WITHOUT contacting
+    Klaviyo. Same code path as the live run, so what gets inspected is what
+    gets sent.
+
+    Deliberately absent from the payload, per Ahmed's constraint:
+      - no "subscriptions" block (that is email marketing consent)
+      - no list relationship (adding to lists can fire flows)
+    Full sweep every run, not a delta. Setting a value is idempotent, so a
+    missed day heals itself on the next run.
+    """
+    started = datetime.now(timezone.utc)
+    profiles, stats = await _build_klaviyo_population(cancel_months)
+
+    batches = [profiles[i:i + KLAVIYO_MAX_PER_JOB]
+               for i in range(0, len(profiles), KLAVIYO_MAX_PER_JOB)] or [[]]
+
+    result = {
+        "ok": True,
+        "dry_run": dry_run,
+        "cancel_window_months": cancel_months,
+        "counts": stats,
+        "total_profiles": len(profiles),
+        "batches": len(batches),
+        "payload_bytes_first_batch": len(json.dumps(batches[0])) if batches[0] else 0,
+        "samples": {
+            "active": [p["attributes"] for p in profiles
+                       if p["attributes"]["properties"][KLAVIYO_PROP_STATUS] == KLAVIYO_VAL_ACTIVE][:5],
+            "cancelled": [p["attributes"] for p in profiles
+                          if p["attributes"]["properties"][KLAVIYO_PROP_STATUS] == KLAVIYO_VAL_CANCELLED][:5],
+        },
+        "jobs": [],
+    }
+
+    if dry_run:
+        result["note"] = ("DRY RUN. Nothing was sent to Klaviyo. "
+                          "Re-run with dry_run=false to push.")
+        return result
+
+    if not KLAVIYO_API_KEY:
+        return {"ok": False, "error": "KLAVIYO_API_KEY is not set on Railway.",
+                "dry_run": False, "counts": stats}
+
+    headers = {
+        "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+        "revision": KLAVIYO_REVISION,
+        "Content-Type": "application/vnd.api+json",
+        "accept": "application/vnd.api+json",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for idx, batch in enumerate(batches):
+            if not batch:
+                continue
+            body = {"data": {"type": "profile-bulk-import-job",
+                             "attributes": {"profiles": {"data": batch}}}}
+            try:
+                resp = await client.post(
+                    "https://a.klaviyo.com/api/profile-bulk-import-jobs/",
+                    headers=headers, json=body)
+                # 202 = accepted. Anything else, capture the body: Klaviyo
+                # returns 400 and imports ZERO profiles if any address in the
+                # batch is malformed, and the reason is in the response.
+                entry = {"batch": idx + 1, "size": len(batch),
+                         "http_status": resp.status_code}
+                if resp.status_code in (200, 201, 202):
+                    data = resp.json().get("data", {})
+                    entry["job_id"] = data.get("id")
+                else:
+                    entry["error"] = resp.text[:500]
+                    result["ok"] = False
+                result["jobs"].append(entry)
+            except Exception as e:
+                result["ok"] = False
+                result["jobs"].append({"batch": idx + 1, "size": len(batch),
+                                       "error": f"{type(e).__name__}: {e}"})
+
+    result["elapsed_seconds"] = round(
+        (datetime.now(timezone.utc) - started).total_seconds(), 1)
+    print(f"[Klaviyo Sync] {'OK' if result['ok'] else 'FAILED'} — "
+          f"{stats['active']} active, {stats['cancelled']} cancelled, "
+          f"{len(batches)} batch(es)")
+    return result
+
+
+@app.post("/api/admin/klaviyo-status-sync")
+async def klaviyo_status_sync(request: Request):
+    """S39: Run the Klaviyo member-status push. Defaults to DRY RUN.
+    Body: {"dry_run": true|false, "cancel_months": 12}
+    dry_run=true contacts nothing and returns the payload it would have sent.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    raw = await request.body()
+    body = json.loads(raw) if raw else {}
+    return await run_klaviyo_status_sync(
+        dry_run=bool(body.get("dry_run", True)),
+        cancel_months=int(body.get("cancel_months", 12)),
+    )
+
 
 @app.post("/api/admin/debug-klaviyo-sweep")
 async def debug_klaviyo_sweep(request: Request):
