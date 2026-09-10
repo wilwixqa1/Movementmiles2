@@ -1543,6 +1543,21 @@ function loadStats() {
     document.getElementById('s-total-subs').textContent = subs.total || 0;
     document.getElementById('s-active-subs').textContent = subs.active || 0;
     document.getElementById('s-active-sub-detail').textContent = (subs.trialing || 0) + ' trialing';
+    // S39: hover tooltip. The card counts subscription rows; this shows the
+    // same population counted by person, so double-counted members are visible
+    // without taking up dashboard space.
+    var uniqEmails = subs.active_unique_emails || 0;
+    var dupes = (subs.active || 0) - uniqEmails;
+    var activeCard = document.getElementById('s-active-subs').parentElement;
+    if (uniqEmails > 0) {
+      activeCard.title = (subs.active || 0) + ' active/trialing subscriptions held by '
+        + uniqEmails + ' people'
+        + (dupes > 0
+            ? '. ' + dupes + ' subscription' + (dupes === 1 ? ' is' : 's are')
+              + ' a second one for someone already counted, usually a member paying on two platforms.'
+            : '. No duplicates.');
+      activeCard.style.cursor = 'help';
+    }
     var conv30 = subs.conversions_30d || 0;
     var conv7 = subs.conversions_7d || 0;
     document.getElementById('s-conversions-30d').textContent = conv30;

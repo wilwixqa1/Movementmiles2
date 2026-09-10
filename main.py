@@ -7784,6 +7784,15 @@ async def admin_stats(request: Request):
         active_subs = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing')"
         )
+        # S39: same population counted by person instead of by row. The card
+        # counts subscription rows, so anyone holding two live subscriptions
+        # (e.g. Apple and Stripe at once) is counted twice. Surfaced as a
+        # hover tooltip on the Active Subscribers card, not as its own card.
+        active_unique_emails = await conn.fetchval(
+            """SELECT COUNT(DISTINCT lower(trim(email))) FROM subscriptions
+               WHERE status IN ('active', 'trialing')
+                 AND email IS NOT NULL AND trim(email) <> ''"""
+        )
         trialing_subs = await conn.fetchval(
             "SELECT COUNT(*) FROM subscriptions WHERE status = 'trialing'"
         )
@@ -8488,6 +8497,7 @@ async def admin_stats(request: Request):
         },
         "subscriptions": {
             "active": active_subs or 0,
+            "active_unique_emails": active_unique_emails or 0,
             "trialing": trialing_subs or 0,
             "canceled": canceled_subs or 0,
             "total": total_subs or 0,
