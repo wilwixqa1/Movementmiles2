@@ -479,6 +479,17 @@ async def startup():
                     replace_existing=True,
                 )
                 print("Weekly cancellation-reason sync scheduled (Mon 4:00 AM ET)")
+            # S39: Daily Klaviyo member-status push. 9:40 AM ET, clear of the
+            # 8:00 shadow sync, 9:00 digest and 9:15 stats snapshot. Skips itself
+            # if today's reconciliation snapshot is missing (see freshness guard).
+            if KLAVIYO_API_KEY and os.environ.get("KLAVIYO_SYNC_ENABLED", "0") == "1":
+                scheduler.add_job(
+                    run_daily_klaviyo_sync,
+                    CronTrigger(hour=9, minute=40, timezone=et),
+                    id="daily_klaviyo_sync",
+                    replace_existing=True,
+                )
+                print("Daily Klaviyo status sync scheduled (9:40 AM ET)")
             scheduler.start()
             ymove_sync_msg = " + shadow sync 8:00 AM ET" if YMOVE_API_KEY else ""
             print(f"Daily digest scheduler started (9:00 AM ET -> {DIGEST_RECIPIENTS}{ymove_sync_msg} + stats snapshot 9:15 AM ET)")
@@ -14580,6 +14591,70 @@ async def klaviyo_job_status(request: Request):
                 "total_count": attrs.get("total_count"),
                 "completed_count": attrs.get("completed_count"),
                 "failed_count": attrs.get("failed_count")}
+
+
+async def run_daily_klaviyo_sync():
+    """S39: Scheduled Klaviyo push. 9:40 AM ET, deliberately clear of the other
+    morning jobs (8:00 shadow sync, 9:00 digest, 9:15 stats snapshot).
+
+    FRESHNESS GUARD: the push is only as good as the reconciliation underneath
+    it. Because this runs on its own schedule rather than chained to the tail of
+    the shadow sync, a failed or missed 8:00 sync would otherwise mean pushing a
+    stale picture to a live email system. If today's reconciliation snapshot is
+    absent, we skip the run entirely. Klaviyo keeps yesterday's values, which are
+    wrong by at most one day; pushing stale data would be worse and harder to notice.
+
+    Gated on KLAVIYO_SYNC_ENABLED=1 so it can be switched off from Railway
+    without a deploy.
+    """
+    if os.environ.get("KLAVIYO_SYNC_ENABLED", "0") != "1":
+        return
+    if not KLAVIYO_API_KEY:
+        print("[Klaviyo Sync] SKIPPED - KLAVIYO_API_KEY not set")
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            fresh = await conn.fetchval(
+                """SELECT COUNT(*) FROM reconciliation_snapshots
+                   WHERE created_at >= NOW() - INTERVAL '18 hours'""")
+        if not fresh:
+            print("[Klaviyo Sync] SKIPPED - no reconciliation snapshot in the last "
+                  "18h, so ground truth is not settled. Klaviyo left unchanged.")
+            return
+    except Exception as e:
+        print(f"[Klaviyo Sync] SKIPPED - freshness check failed: {e}")
+        return
+
+    batch_label = f"s39_klaviyo_auto_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+    run_id = None
+    try:
+        async with db_pool.acquire() as conn:
+            run_id = await conn.fetchval(
+                """INSERT INTO engagement_sync_runs (status, batch, progress_total)
+                   VALUES ('running', $1, 0) RETURNING id""", batch_label)
+        res = await run_klaviyo_status_sync(dry_run=False, cancel_months=12,
+                                            run_id=run_id)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE engagement_sync_runs SET status=$1, completed_at=NOW(),
+                   results=$2, progress_current=$3, progress_total=$4 WHERE id=$5""",
+                "completed" if res.get("ok") else "completed_with_errors",
+                json.dumps(res), res.get("sent", 0) + res.get("failed", 0),
+                res.get("total_profiles", 0), run_id)
+    except Exception as e:
+        # Never let a Klaviyo problem surface as anything other than a Klaviyo
+        # problem. This job owns nothing else.
+        print(f"[Klaviyo Sync] FAILED: {type(e).__name__}: {e}")
+        if run_id:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE engagement_sync_runs SET status='failed',
+                           completed_at=NOW(), error=$1 WHERE id=$2""",
+                        f"{type(e).__name__}: {e}", run_id)
+            except Exception:
+                pass
 
 
 @app.post("/api/admin/klaviyo-status-sync")
