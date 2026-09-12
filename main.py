@@ -48,6 +48,9 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 # deprecation can be handled with an env change instead of a deploy.
 KLAVIYO_API_KEY = os.environ.get("KLAVIYO_API_KEY", "")
 KLAVIYO_REVISION = os.environ.get("KLAVIYO_REVISION", "2024-10-15")
+# Ahmed's "App Members (Live)" segment. Single condition: Subscription
+# Status equals active. No list condition, so our push controls it fully.
+KLAVIYO_SEGMENT_ID = os.environ.get("KLAVIYO_SEGMENT_ID", "UUKzWT")
 DIGEST_RECIPIENTS = os.environ.get("DIGEST_RECIPIENTS", "")
 DIGEST_FROM_EMAIL = os.environ.get("DIGEST_FROM_EMAIL", "onboarding@resend.dev")
 
@@ -14404,6 +14407,106 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12)
           f"{stats['active']} active, {stats['cancelled']} cancelled, "
           f"{len(batches)} batch(es)")
     return result
+
+
+@app.post("/api/admin/klaviyo-scope-test")
+async def klaviyo_scope_test(request: Request):
+    """S39: READ-ONLY. Confirms the Railway key exists and carries the scopes we
+    need, BEFORE a 4,617-profile batch depends on it. Writes nothing anywhere.
+
+    Checks, in order:
+      - is KLAVIYO_API_KEY actually set (catches a mistyped Railway var name)
+      - segments:read  -> can we read Ahmed's segment and its live count
+      - profiles:read  -> can we list bulk-import jobs (needed for status polling)
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+
+    if not KLAVIYO_API_KEY:
+        return {"ok": False,
+                "error": "KLAVIYO_API_KEY is empty. Check the Railway variable "
+                         "name is exactly KLAVIYO_API_KEY (case sensitive) and "
+                         "that the service redeployed after it was added."}
+
+    headers = {"Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+               "revision": KLAVIYO_REVISION,
+               "accept": "application/vnd.api+json"}
+    out = {"ok": True, "key_present": True, "key_prefix": KLAVIYO_API_KEY[:6],
+           "revision": KLAVIYO_REVISION, "checks": {}}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # segments:read -- Ahmed's "App Members (Live)" segment, id UUKzWT
+        try:
+            r = await client.get(
+                f"https://a.klaviyo.com/api/segments/{KLAVIYO_SEGMENT_ID}/"
+                "?additional-fields[segment]=profile_count", headers=headers)
+            chk = {"http_status": r.status_code}
+            if r.status_code == 200:
+                attrs = r.json().get("data", {}).get("attributes", {})
+                chk["segment_name"] = attrs.get("name")
+                chk["live_profile_count"] = attrs.get("profile_count")
+            else:
+                chk["error"] = r.text[:300]
+                out["ok"] = False
+            out["checks"]["segments_read"] = chk
+        except Exception as e:
+            out["ok"] = False
+            out["checks"]["segments_read"] = {"error": f"{type(e).__name__}: {e}"}
+
+        # profiles:read -- needed to poll import job status after a push
+        try:
+            r = await client.get(
+                "https://a.klaviyo.com/api/profile-bulk-import-jobs/?page[size]=1",
+                headers=headers)
+            chk = {"http_status": r.status_code}
+            if r.status_code != 200:
+                chk["error"] = r.text[:300]
+                out["ok"] = False
+            out["checks"]["profiles_read"] = chk
+        except Exception as e:
+            out["ok"] = False
+            out["checks"]["profiles_read"] = {"error": f"{type(e).__name__}: {e}"}
+
+    out["note"] = ("profiles:write is NOT tested here, because testing it means "
+                   "writing a real profile. The live run is its own test, and it "
+                   "fails loudly with the reason in the response.")
+    return out
+
+
+@app.post("/api/admin/klaviyo-job-status")
+async def klaviyo_job_status(request: Request):
+    """S39: Check what actually happened to a bulk-import job. Klaviyo accepts a
+    batch with a 202 and processes it in the BACKGROUND, so a 202 means 'queued',
+    not 'imported'. Body: {"job_id": "..."}
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    raw = await request.body()
+    body = json.loads(raw) if raw else {}
+    job_id = body.get("job_id", "")
+    if not job_id:
+        return {"ok": False, "error": "job_id is required"}
+    if not KLAVIYO_API_KEY:
+        return {"ok": False, "error": "KLAVIYO_API_KEY is not set on Railway."}
+
+    headers = {"Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+               "revision": KLAVIYO_REVISION,
+               "accept": "application/vnd.api+json"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(
+            f"https://a.klaviyo.com/api/profile-bulk-import-jobs/{job_id}/",
+            headers=headers)
+        if r.status_code != 200:
+            return {"ok": False, "http_status": r.status_code,
+                    "error": r.text[:500]}
+        attrs = r.json().get("data", {}).get("attributes", {})
+        return {"ok": True, "job_id": job_id,
+                "status": attrs.get("status"),
+                "started_at": attrs.get("started_at"),
+                "completed_at": attrs.get("completed_at"),
+                "total_count": attrs.get("total_count"),
+                "completed_count": attrs.get("completed_count"),
+                "failed_count": attrs.get("failed_count")}
 
 
 @app.post("/api/admin/klaviyo-status-sync")
