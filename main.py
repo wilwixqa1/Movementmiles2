@@ -14321,7 +14321,8 @@ async def _build_klaviyo_population(cancel_months: int = 12):
     return profiles, stats
 
 
-async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12):
+async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12,
+                                  run_id: int = None):
     """S39: Push member status to Klaviyo. Designed to run at the tail of the
     daily shadow sync, once ground truth is settled.
 
@@ -14367,6 +14368,14 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12)
         return {"ok": False, "error": "KLAVIYO_API_KEY is not set on Railway.",
                 "dry_run": False, "counts": stats}
 
+    # S39: We use the SINGLE-PROFILE endpoint, not bulk import, on purpose.
+    # POST /api/profile-bulk-import-jobs requires the lists:write scope even
+    # when the payload contains no list at all -- Klaviyo gates the endpoint,
+    # not the request. Ahmed's constraint is that this job must never be able
+    # to add anyone to a list (that can fire a flow and email real customers),
+    # so we use POST /api/profile-import, which needs only profiles:write.
+    # Costs ~7 min per run at Klaviyo's steady rate. Worth it: the key is
+    # physically incapable of touching a list, rather than merely instructed not to.
     headers = {
         "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
         "revision": KLAVIYO_REVISION,
@@ -14374,38 +14383,78 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12)
         "accept": "application/vnd.api+json",
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for idx, batch in enumerate(batches):
-            if not batch:
-                continue
-            body = {"data": {"type": "profile-bulk-import-job",
-                             "attributes": {"profiles": {"data": batch}}}}
-            try:
-                resp = await client.post(
-                    "https://a.klaviyo.com/api/profile-bulk-import-jobs/",
-                    headers=headers, json=body)
-                # 202 = accepted. Anything else, capture the body: Klaviyo
-                # returns 400 and imports ZERO profiles if any address in the
-                # batch is malformed, and the reason is in the response.
-                entry = {"batch": idx + 1, "size": len(batch),
-                         "http_status": resp.status_code}
-                if resp.status_code in (200, 201, 202):
-                    data = resp.json().get("data", {})
-                    entry["job_id"] = data.get("id")
-                else:
-                    entry["error"] = resp.text[:500]
-                    result["ok"] = False
-                result["jobs"].append(entry)
-            except Exception as e:
-                result["ok"] = False
-                result["jobs"].append({"batch": idx + 1, "size": len(batch),
-                                       "error": f"{type(e).__name__}: {e}"})
+    sent = 0
+    failed = 0
+    rate_limited = 0
+    errors = []
+    # Klaviyo: burst 75/s, steady 750/m. 10 concurrent with a small pause keeps
+    # us well inside both without needing a token bucket.
+    sem = asyncio.Semaphore(10)
 
+    if run_id:
+        # Set the denominator up front so polling shows "N of 4623", not "N of 0".
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE engagement_sync_runs SET progress_total=$1 WHERE id=$2",
+                    len(profiles), run_id)
+        except Exception:
+            pass
+
+    async def push_one(client, prof):
+        nonlocal sent, failed, rate_limited
+        body = {"data": {"type": "profile", "attributes": prof["attributes"]}}
+        async with sem:
+            for attempt in range(4):
+                try:
+                    r = await client.post("https://a.klaviyo.com/api/profile-import",
+                                          headers=headers, json=body)
+                    if r.status_code in (200, 201, 202):
+                        sent += 1
+                        return
+                    if r.status_code == 429:
+                        rate_limited += 1
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    failed += 1
+                    if len(errors) < 20:
+                        errors.append({"email": prof["attributes"]["email"],
+                                       "status": r.status_code,
+                                       "body": r.text[:200]})
+                    return
+                except Exception as e:
+                    if attempt == 3:
+                        failed += 1
+                        if len(errors) < 20:
+                            errors.append({"email": prof["attributes"]["email"],
+                                           "error": f"{type(e).__name__}: {e}"})
+                        return
+                    await asyncio.sleep(2 ** attempt)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        chunk = 250
+        for i in range(0, len(profiles), chunk):
+            await asyncio.gather(*(push_one(client, p)
+                                   for p in profiles[i:i + chunk]))
+            if run_id:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE engagement_sync_runs SET progress_current=$1 WHERE id=$2",
+                            sent + failed, run_id)
+                except Exception:
+                    pass
+
+    result["ok"] = failed == 0
+    result["sent"] = sent
+    result["failed"] = failed
+    result["rate_limited_retries"] = rate_limited
+    result["error_samples"] = errors
     result["elapsed_seconds"] = round(
         (datetime.now(timezone.utc) - started).total_seconds(), 1)
-    print(f"[Klaviyo Sync] {'OK' if result['ok'] else 'FAILED'} — "
-          f"{stats['active']} active, {stats['cancelled']} cancelled, "
-          f"{len(batches)} batch(es)")
+    print(f"[Klaviyo Sync] {'OK' if result['ok'] else 'PARTIAL'} - "
+          f"{sent} sent, {failed} failed, {stats['active']} active, "
+          f"{stats['cancelled']} cancelled")
     return result
 
 
@@ -14513,16 +14562,83 @@ async def klaviyo_job_status(request: Request):
 async def klaviyo_status_sync(request: Request):
     """S39: Run the Klaviyo member-status push. Defaults to DRY RUN.
     Body: {"dry_run": true|false, "cancel_months": 12}
-    dry_run=true contacts nothing and returns the payload it would have sent.
+
+    dry_run=true runs inline and returns the payload it would have sent.
+    dry_run=false runs in the BACKGROUND and returns a run_id immediately.
+    A live run takes roughly 7 minutes (one request per profile at Klaviyo's
+    rate limit), which is longer than Railway's proxy will hold a connection,
+    so it cannot be returned inline. Poll /api/admin/klaviyo-sync-status.
     """
     pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
     require_admin(pw)
     raw = await request.body()
     body = json.loads(raw) if raw else {}
-    return await run_klaviyo_status_sync(
-        dry_run=bool(body.get("dry_run", True)),
-        cancel_months=int(body.get("cancel_months", 12)),
-    )
+    dry = bool(body.get("dry_run", True))
+    months = int(body.get("cancel_months", 12))
+
+    if dry:
+        return await run_klaviyo_status_sync(dry_run=True, cancel_months=months)
+
+    batch_label = f"s39_klaviyo_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+    async with db_pool.acquire() as conn:
+        run_id = await conn.fetchval(
+            """INSERT INTO engagement_sync_runs (status, batch, progress_total)
+               VALUES ('running', $1, 0) RETURNING id""", batch_label)
+
+    async def _runner():
+        try:
+            res = await run_klaviyo_status_sync(dry_run=False, cancel_months=months,
+                                                run_id=run_id)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE engagement_sync_runs
+                       SET status=$1, completed_at=NOW(), results=$2,
+                           progress_current=$3, progress_total=$4
+                       WHERE id=$5""",
+                    "completed" if res.get("ok") else "completed_with_errors",
+                    json.dumps(res), res.get("sent", 0) + res.get("failed", 0),
+                    res.get("total_profiles", 0), run_id)
+        except Exception as e:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE engagement_sync_runs SET status='failed',
+                       completed_at=NOW(), error=$1 WHERE id=$2""",
+                    f"{type(e).__name__}: {e}", run_id)
+
+    asyncio.create_task(_runner())
+    return {"ok": True, "started": True, "run_id": run_id, "batch": batch_label,
+            "note": "Live run started in the background. Poll "
+                    "/api/admin/klaviyo-sync-status with this run_id. "
+                    "Expect roughly 7 minutes."}
+
+
+@app.post("/api/admin/klaviyo-sync-status")
+async def klaviyo_sync_status(request: Request):
+    """S39: Progress and results for a background Klaviyo push.
+    Body: {"run_id": N}  (omit run_id for the most recent Klaviyo run)
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    raw = await request.body()
+    body = json.loads(raw) if raw else {}
+    run_id = body.get("run_id")
+    async with db_pool.acquire() as conn:
+        if run_id:
+            row = await conn.fetchrow(
+                "SELECT * FROM engagement_sync_runs WHERE id=$1", int(run_id))
+        else:
+            row = await conn.fetchrow(
+                """SELECT * FROM engagement_sync_runs WHERE batch LIKE 's39_klaviyo_%'
+                   ORDER BY id DESC LIMIT 1""")
+    if not row:
+        return {"ok": False, "error": "no matching run"}
+    return {"ok": True, "run_id": row["id"], "status": row["status"],
+            "batch": row["batch"], "started_at": str(row["started_at"]),
+            "completed_at": str(row["completed_at"]) if row["completed_at"] else None,
+            "progress_current": row["progress_current"],
+            "progress_total": row["progress_total"],
+            "error": row["error"],
+            "results": json.loads(row["results"]) if row["results"] else None}
 
 
 @app.post("/api/admin/debug-klaviyo-sweep")
