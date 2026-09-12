@@ -14387,9 +14387,13 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12,
     failed = 0
     rate_limited = 0
     errors = []
-    # Klaviyo: burst 75/s, steady 750/m. 10 concurrent with a small pause keeps
-    # us well inside both without needing a token bucket.
-    sem = asyncio.Semaphore(10)
+    # Klaviyo: burst 75/s, steady 750/m. The STEADY limit is what binds on a
+    # 4,600-profile sweep, and it is the one that is easy to miss: 10 concurrent
+    # with no pacing sails past 750/m and generated 820 rate-limit retries on the
+    # first live run. 5 concurrent with a 0.5s pause each gives ~10 req/s =
+    # 600/m, comfortably under steady, and finishes in about 8 minutes.
+    sem = asyncio.Semaphore(5)
+    PACE_SECONDS = 0.5
 
     if run_id:
         # Set the denominator up front so polling shows "N of 4623", not "N of 0".
@@ -14404,17 +14408,26 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12,
     async def push_one(client, prof):
         nonlocal sent, failed, rate_limited
         body = {"data": {"type": "profile", "attributes": prof["attributes"]}}
+        attempts = 6
         async with sem:
-            for attempt in range(4):
+            for attempt in range(attempts):
                 try:
                     r = await client.post("https://a.klaviyo.com/api/profile-import",
                                           headers=headers, json=body)
                     if r.status_code in (200, 201, 202):
                         sent += 1
+                        await asyncio.sleep(PACE_SECONDS)
                         return
                     if r.status_code == 429:
                         rate_limited += 1
-                        await asyncio.sleep(2 ** attempt)
+                        # Honour Retry-After when Klaviyo sends it; otherwise
+                        # exponential backoff.
+                        wait = r.headers.get("Retry-After")
+                        try:
+                            wait = float(wait) if wait else 2 ** attempt
+                        except ValueError:
+                            wait = 2 ** attempt
+                        await asyncio.sleep(min(wait, 30))
                         continue
                     failed += 1
                     if len(errors) < 20:
@@ -14423,13 +14436,21 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12,
                                        "body": r.text[:200]})
                     return
                 except Exception as e:
-                    if attempt == 3:
+                    if attempt == attempts - 1:
                         failed += 1
                         if len(errors) < 20:
                             errors.append({"email": prof["attributes"]["email"],
                                            "error": f"{type(e).__name__}: {e}"})
                         return
                     await asyncio.sleep(2 ** attempt)
+            # Fell out of the loop without returning: every attempt was a 429.
+            # The first live run had 140 profiles land here and they were counted
+            # as NEITHER sent nor failed, so the job reported ok while silently
+            # skipping 3% of its work. Anything that is not sent is a failure.
+            failed += 1
+            if len(errors) < 20:
+                errors.append({"email": prof["attributes"]["email"],
+                               "error": "rate limited on every attempt"})
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         chunk = 250
@@ -14445,7 +14466,10 @@ async def run_klaviyo_status_sync(dry_run: bool = True, cancel_months: int = 12,
                 except Exception:
                     pass
 
-    result["ok"] = failed == 0
+    # ok requires BOTH no failures AND full accounting. sent+failed must equal
+    # the population; if it does not, something was dropped without being counted.
+    result["ok"] = (failed == 0) and (sent + failed == len(profiles))
+    result["unaccounted"] = len(profiles) - (sent + failed)
     result["sent"] = sent
     result["failed"] = failed
     result["rate_limited_retries"] = rate_limited
