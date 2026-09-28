@@ -479,6 +479,16 @@ async def startup():
                     replace_existing=True,
                 )
                 print("Weekly cancellation-reason sync scheduled (Mon 4:00 AM ET)")
+            # S39: Stripe drift backstop. Wednesdays and Sundays 6:00 AM ET, before
+            # the 8:00 shadow sync so that day's snapshot and Klaviyo push see the fixes.
+            if STRIPE_SECRET_KEY:
+                scheduler.add_job(
+                    run_scheduled_stripe_drift_fix,
+                    CronTrigger(day_of_week="wed,sun", hour=6, minute=0, timezone=et),
+                    id="stripe_drift_fix_wed_sun",
+                    replace_existing=True,
+                )
+                print("Stripe drift check scheduled (Wed + Sun 6:00 AM ET)")
             # S39: Daily Klaviyo member-status push. 9:40 AM ET, clear of the
             # 8:00 shadow sync, 9:00 digest and 9:15 stats snapshot. Skips itself
             # if today's reconciliation snapshot is missing (see freshness guard).
@@ -15043,44 +15053,19 @@ async def verify_stripe_drift(request: Request):
     }
 
 
-@app.post("/api/admin/fix-stripe-drift")
-async def fix_stripe_drift(request: Request):
-    """S38: Remediate stale Stripe actives found by verify-stripe-drift.
-    Flips our-active/trialing rows to 'canceled' ONLY when Stripe confirms the
-    sub is genuinely canceled/unpaid/expired at write time (re-verified live,
-    never trusting an earlier scan).
+async def run_stripe_drift_fix(confirm: bool, batch_label: str = "") -> dict:
+    """S38 logic, extracted in S39 so the manual endpoint and the weekly job
+    share ONE implementation. Flips our-active/trialing Stripe rows to canceled
+    ONLY when Stripe confirms, live at write time, that the sub is genuinely
+    canceled/unpaid/expired. Cancel date comes from Stripe (ended_at, falling
+    back to canceled_at), not NOW(), so churn lands in the right month.
 
-    Cancel date comes from STRIPE, not NOW(): effective_canceled_at uses
-    ended_at (actual termination) coalesced to canceled_at (cancel requested),
-    so churn lands in the correct historical month instead of a fake spike today.
-
-    Two modes (body JSON):
-      {"preview": true}                       -> re-verify + show diff, NO writes
-      {"confirm": true, "batch_label": "..."} -> write, tag every row, emit revert_sql
-
-    Every touched row gets import_batch = batch_label for one-command revert.
-    Auth: X-Admin-Password header. Admin only.
+    Why this exists at all: the daily shadow sync verifies Apple and Google
+    members person by person against ymove, but Stripe members are only
+    COUNTED, never checked. A missed Stripe cancellation webhook therefore sits
+    in the DB as active indefinitely. 22 accumulated by Jul 2026, 18 more by
+    Sep 28 2026 (10 of them in one week). The Wed/Sun job below is the backstop.
     """
-    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
-    require_admin(pw)
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="No database")
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    preview = bool(body.get("preview"))
-    confirm = bool(body.get("confirm"))
-    batch_label = body.get("batch_label") or ""
-    if not preview and not confirm:
-        raise HTTPException(status_code=400, detail="Pass preview:true or confirm:true")
-    if confirm and not batch_label:
-        raise HTTPException(status_code=400, detail="confirm requires a batch_label for reversibility")
-
-    # Stripe statuses meaning 'still a live/paying member' -> leave alone
     live_ok = {"active", "trialing", "past_due"}
 
     async with db_pool.acquire() as conn:
@@ -15117,7 +15102,6 @@ async def fix_stripe_drift(request: Request):
         if res["status"] in live_ok:
             skipped_live += 1
             continue
-        # Genuinely canceled on Stripe. Prefer ended_at, fall back to canceled_at.
         ts = res.get("ended_at") or res.get("canceled_at")
         eff_dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
         to_fix.append({
@@ -15127,35 +15111,37 @@ async def fix_stripe_drift(request: Request):
             "_eff_dt": eff_dt,
         })
 
-    if preview or not confirm:
+    public_rows = [{k: v for k, v in f.items() if k != "_eff_dt"} for f in to_fix]
+
+    if not confirm:
         return {
             "mode": "preview",
             "would_cancel": len(to_fix),
             "skipped_still_live": skipped_live,
             "errors": errors,
-            "rows": [{k: v for k, v in f.items() if k != "_eff_dt"} for f in to_fix],
+            "rows": public_rows,
             "note": "PREVIEW ONLY. No rows modified. Run again with "
                     "{confirm:true, batch_label:'...'} to apply.",
         }
 
-    # confirm path
     updated = 0
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            for f in to_fix:
-                eff = f["_eff_dt"]
-                await conn.execute(
-                    """UPDATE subscriptions
-                       SET status = 'canceled',
-                           canceled_at = COALESCE(canceled_at, $1),
-                           effective_canceled_at = $1,
-                           cancel_state = 'expired',
-                           import_batch = $2,
-                           updated_at = NOW()
-                       WHERE id = $3""",
-                    eff or datetime.now(timezone.utc), batch_label, f["id"]
-                )
-                updated += 1
+    if to_fix:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                for f in to_fix:
+                    eff = f["_eff_dt"]
+                    await conn.execute(
+                        """UPDATE subscriptions
+                           SET status = 'canceled',
+                               canceled_at = COALESCE(canceled_at, $1),
+                               effective_canceled_at = $1,
+                               cancel_state = 'expired',
+                               import_batch = $2,
+                               updated_at = NOW()
+                           WHERE id = $3""",
+                        eff or datetime.now(timezone.utc), batch_label, f["id"]
+                    )
+                    updated += 1
 
     revert_sql = (
         f"UPDATE subscriptions SET status='active', cancel_state=NULL, "
@@ -15168,11 +15154,88 @@ async def fix_stripe_drift(request: Request):
         "skipped_still_live": skipped_live,
         "errors": errors,
         "batch_label": batch_label,
+        "rows": public_rows,
         "revert_sql": revert_sql,
         "note": "Rows flipped to canceled using Stripe cancel dates. "
                 "To fully undo, run the revert_sql (note it does not restore "
                 "prior canceled_at where one already existed).",
     }
+
+
+async def run_scheduled_stripe_drift_fix():
+    """S39: Twice-weekly backstop for missed Stripe cancellation webhooks.
+    Wednesdays and Sundays 6:00 AM ET, deliberately BEFORE the 8:00 shadow
+    sync so that morning's reconciliation snapshot and the 9:40 Klaviyo push
+    both reflect the corrections. Twice weekly rather than daily at Will's
+    request (keeps Stripe API use low; a full pass is ~1,050 lookups, ~90s).
+    Tradeoff accepted: a missed cancellation can sit for up to 4 days.
+
+    Writes automatically (no preview step) because it only ever flips a row
+    when Stripe confirms the cancellation live at write time. Every run is
+    tagged s39_stripe_drift_auto_YYYYMMDD and logged to engagement_sync_runs with
+    its revert_sql, so any week can be undone.
+    """
+    if not STRIPE_SECRET_KEY or not db_pool:
+        return
+    batch_label = f"s39_stripe_drift_auto_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+    run_id = None
+    try:
+        async with db_pool.acquire() as conn:
+            run_id = await conn.fetchval(
+                """INSERT INTO engagement_sync_runs (status, batch, progress_total)
+                   VALUES ('running', $1, 0) RETURNING id""", batch_label)
+        res = await run_stripe_drift_fix(confirm=True, batch_label=batch_label)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE engagement_sync_runs SET status='completed',
+                   completed_at=NOW(), results=$1, progress_current=$2,
+                   progress_total=$2 WHERE id=$3""",
+                json.dumps(res, default=str),
+                res.get("updated", 0) + res.get("skipped_still_live", 0) + res.get("errors", 0),
+                run_id)
+        print(f"[Stripe Drift Check] {res.get('updated', 0)} stale rows canceled, "
+              f"{res.get('skipped_still_live', 0)} still live, {res.get('errors', 0)} unverifiable")
+    except Exception as e:
+        print(f"[Stripe Drift Check] FAILED: {type(e).__name__}: {e}")
+        if run_id:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE engagement_sync_runs SET status='failed',
+                           completed_at=NOW(), error=$1 WHERE id=$2""",
+                        f"{type(e).__name__}: {e}", run_id)
+            except Exception:
+                pass
+
+
+@app.post("/api/admin/fix-stripe-drift")
+async def fix_stripe_drift(request: Request):
+    """S38: Manual remediation of stale Stripe actives. Logic lives in
+    run_stripe_drift_fix (shared with the Wed/Sun scheduled job).
+      {"preview": true}                       -> re-verify + show diff, NO writes
+      {"confirm": true, "batch_label": "..."} -> write, tag every row, emit revert_sql
+    Auth: X-Admin-Password header. Admin only.
+    """
+    pw = request.headers.get("X-Admin-Password", request.query_params.get("pw", ""))
+    require_admin(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preview = bool(body.get("preview"))
+    confirm = bool(body.get("confirm"))
+    batch_label = body.get("batch_label") or ""
+    if not preview and not confirm:
+        raise HTTPException(status_code=400, detail="Pass preview:true or confirm:true")
+    if confirm and not batch_label:
+        raise HTTPException(status_code=400, detail="confirm requires a batch_label for reversibility")
+
+    return await run_stripe_drift_fix(confirm=(confirm and not preview), batch_label=batch_label)
 
 
 @app.get("/api/admin/churn-reasons")
