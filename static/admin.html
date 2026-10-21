@@ -594,6 +594,7 @@
         <div style="display:flex;align-items:center;gap:12px">
           <div style="font-size:.72rem;color:var(--navy-mid)">Direct first, then by trial starts. Click a column header to re-sort.</div>
           <button class="quick-btn admin-only" onclick="exportChannelPerfCsv()" style="padding:4px 12px;font-size:.72rem">Export CSV</button>
+          <button class="quick-btn admin-only" onclick="exportSignupsByPersonCsv()" style="padding:4px 12px;font-size:.72rem" title="One row per tagged signup in the current window: email, campaign, ad, audience, landing page, signup date, current status">Export signups (CSV)</button>
         </div>
       </div>
       <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
@@ -2670,6 +2671,26 @@ function setChannelPerfWindow(days) {
   document.getElementById('channel-perf-title').textContent = 'Channel Performance (last ' + label + ')';
   // Re-fetch stats with new window
   loadStats();
+}
+
+// S40: person-level export (Ahmed). Same window as the card; filename carries
+// the actual date range so the file identifies itself later.
+function exportSignupsByPersonCsv() {
+  var days = window._channelPerfDays || 90;
+  var url = '/api/admin/signups-by-person-csv?cp_days=' + days;
+  fetch(url, {headers: {'X-Admin-Password': adminPw}})
+    .then(function(r) { return r.blob(); })
+    .then(function(blob) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      var end = new Date();
+      var start = new Date(Date.now() - days * 86400000);
+      var fmt = function(d) { return d.toISOString().slice(0, 10); };
+      a.download = 'mm-signups-by-person-' + fmt(start) + '-to-' + fmt(end) + '.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function(e) { console.error('Signups CSV export error:', e); });
 }
 
 function exportChannelPerfCsv() {

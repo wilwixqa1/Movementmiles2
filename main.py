@@ -8696,6 +8696,74 @@ async def admin_leads_csv(request: Request):
     )
 
 
+@app.get("/api/admin/signups-by-person-csv")
+async def admin_signups_by_person_csv(request: Request):
+    """S40 (Ahmed, Oct 2026): person-level export behind the Channel Performance
+    card. One row per TAGGED signup (any UTM present): email, campaign,
+    ad (utm_content), audience (utm_term), landing page, signup date, current
+    status. Window follows the card's cp_days. One row per email: where a
+    person has multiple subscription rows, the live one wins (same
+    any-active-wins rule as the Klaviyo sync), and status uses the same
+    active / trialing / cancelled wording as the Klaviyo segment so Ahmed's
+    numbers reconcile. Untagged signups are excluded, matching what the card
+    counts."""
+    pw = request.headers.get("X-Admin-Password", "")
+    require_viewer(pw)
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="No database")
+
+    cp_days = int(request.query_params.get("cp_days", "90"))
+    if cp_days not in (30, 90, 365):
+        cp_days = 90
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT DISTINCT ON (lower(trim(email)))
+                   lower(trim(email)) AS email,
+                   COALESCE(NULLIF(utm_campaign, ''), 'none') AS campaign,
+                   COALESCE(NULLIF(utm_content, ''), 'none') AS ad,
+                   COALESCE(NULLIF(utm_term, ''), 'none') AS audience,
+                   COALESCE(NULLIF(landing_page, ''), 'none') AS landing_page,
+                   created_at,
+                   status
+                FROM subscriptions
+                WHERE email IS NOT NULL AND trim(email) <> ''
+                  AND created_at > NOW() - INTERVAL '{cp_days} days'
+                  AND NOT (COALESCE(utm_source,'') = '' AND COALESCE(utm_medium,'') = ''
+                       AND COALESCE(utm_campaign,'') = '' AND COALESCE(utm_content,'') = ''
+                       AND COALESCE(utm_term,'') = '')
+                ORDER BY lower(trim(email)),
+                         (status IN ('active','trialing')) DESC,
+                         created_at DESC"""
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["email", "campaign", "ad (utm_content)", "audience (utm_term)",
+                     "landing_page", "signup_date", "current_status"])
+    for r in rows:
+        if r["status"] == "trialing":
+            cur = "trialing"
+        elif r["status"] == "active":
+            cur = "active"
+        else:
+            cur = "cancelled"
+        writer.writerow([
+            r["email"], r["campaign"], r["ad"], r["audience"],
+            r["landing_page"],
+            r["created_at"].strftime("%Y-%m-%d") if r["created_at"] else "",
+            cur,
+        ])
+
+    label = "1yr" if cp_days == 365 else f"{cp_days}d"
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=mm-signups-by-person-{label}.csv"}
+    )
+
+
 @app.get("/api/admin/channel-perf-csv")
 async def admin_channel_perf_csv(request: Request):
     """S34: Export Channel Performance table as CSV. S35: added views with fallback."""
